@@ -2,9 +2,18 @@
  * The node agent's bucket: one bucket of an S3 API, reached by path-style URLs
  * (`<endpoint>/<bucket>/<key>`, as SeaweedFS serves them), every request signed with AWS
  * Signature Version 4 (sigV4Authorization). No SDK: the agent puts objects from files and
- * gets them into files, puts and reads small JSON objects, copies objects within the
- * bucket, says an object's size and ETag, deletes objects, where asked only while each is
- * the one its ETag names, and lists those under a prefix, and nothing else.
+ * gets them into files, puts and reads small JSON objects, where asked only while each is
+ * the one its ETag names, or while there is none, copies objects within the bucket, says an
+ * object's size and ETag, deletes objects, where asked only while each is the one its ETag
+ * names, and lists those under a prefix, and nothing else.
+ *
+ * What it asks only while an object is so, the commits of the snapshots, holds only on a
+ * store that honours the conditions (If-Match, If-None-Match) of a PUT and a DELETE, checking
+ * each with the write it conditions, at once: AWS's S3 does, and the SeaweedFS alasio installs
+ * (4.48: on the key's owner filer, under its per-path lock, where it routes the request there,
+ * and under its own write lock of the object otherwise, which a write routed to the owner does
+ * not take, so that a routed write and one that was not can still interleave; upstream's, not
+ * patched here). A store that ignores them is refused as the agent starts (checkConditions).
  *
  * A file larger than a part (`partBytes`) is put as a multipart upload, its parts sent
  * `parallel` at a time, and got in ranges of a part, as many at a time: one stream of
@@ -19,7 +28,7 @@
  * most `parallel` gets at a time, every get of the bucket's together, each synced to the
  * disk whenever it has `syncBytes` written since (UNSYNCED_DOWNLOAD_BYTES, ./names.ts).
  */
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { type FileHandle, open, stat } from "node:fs/promises";
 import { type ClientRequest, type IncomingMessage, request as httpRequest, type RequestOptions } from "node:http";
@@ -104,6 +113,13 @@ export interface ListedObject {
   readonly writtenAt: number;
 }
 
+/** The store does not honour the conditions of a request: which. */
+export class StoreUnconditional extends Schema.TaggedError<StoreUnconditional>()("StoreUnconditional", { condition: Schema.String }) {
+  override get message(): string {
+    return `the snapshots bucket's store does not honour ${this.condition}: the node agents commit and spend a workspace's snapshots only as the bucket holds them as read, which on a store that ignores it one node's agent would undo another's (sessions.objectStore.external, cli/src/manifests/config.ts)`;
+  }
+}
+
 /** An object of JSON as getTaggedJson reads it: what it holds, and its ETag. */
 export interface TaggedJson {
   readonly value: unknown;
@@ -127,6 +143,12 @@ export interface S3Bucket {
   readonly getFile: (key: string, path: string, bytes: number) => Effect.Effect<Received, S3Error>;
   /** Puts `value` as the object `key`, as JSON. */
   readonly putJson: (key: string, value: unknown) => Effect.Effect<void, S3Error>;
+  /**
+   * Puts `value` as the object `key`, as JSON, where the bucket holds it still as the ETag `etag` names it (`If-Match`), or,
+   * of a null `etag`, holds none (`If-None-Match: *`): whether it did; one written since, or written meanwhile, or gone, is
+   * left as it is.
+   */
+  readonly putJsonIf: (key: string, value: unknown, etag: string | null) => Effect.Effect<boolean, S3Error>;
   /** The object `key`, parsed as JSON, or null when there is none. */
   readonly getJson: (key: string) => Effect.Effect<unknown, S3Error>;
   /** The object `key`, parsed as JSON, and the ETag the bucket holds it by, or null when there is none. */
@@ -146,7 +168,22 @@ export interface S3Bucket {
   readonly list: (prefix: string) => Effect.Effect<readonly ListedObject[], S3Error>;
   /** Aborts every multipart upload begun under `prefix` and neither completed nor aborted, as an uploader that stopped left it: how many. */
   readonly abortUploads: (prefix: string) => Effect.Effect<number, S3Error>;
+  /**
+   * Proves the store honours the conditions putJsonIf and removeIf ask on, with an object of its own under PROBES, which it
+   * removes: a PUT as of an ETag it does not hold, and one of an object it holds, refused, and one as of the ETag it holds
+   * done; a DELETE as of an ETag it does not hold refused, and as of the one it holds done. Fails with StoreUnconditional
+   * where it does not, or says it implements none of them (501). What probes written more than PROBES_GRACE_MS before left
+   * under PROBES, as an agent stopped as it probed leaves one, it removes first.
+   */
+  readonly checkConditions: Effect.Effect<void, S3Error | StoreUnconditional>;
 }
+
+/** Where checkConditions writes its objects: under no environment's name, which is a DNS label. */
+export const PROBES = ".alasio/probes";
+/** How long a probe's object may be left under PROBES before the next probe, of any agent, removes it: an hour, as one takes a few requests. */
+export const PROBES_GRACE_MS = 60 * 60_000;
+/** What a store's refusal of a request it does not implement says: its status (501), or S3's code for it. */
+const UNIMPLEMENTED = /^501\b|\bNotImplemented\b/u;
 
 /** The payload hash of a request whose payload is not signed, as a streamed upload's is. */
 export const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
@@ -455,11 +492,29 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     }
   };
 
+  const putJsonIf = (key: string, value: unknown, etag: string | null): Effect.Effect<boolean, S3Error> =>
+    attempt("upload", key, async (signal) => {
+      const bytes = Buffer.from(JSON.stringify(value));
+      const condition = etag === null ? { "if-none-match": "*" } : { "if-match": etag };
+      const response = await succeeded(await call("PUT", key, { headers: { "content-type": "application/json", ...condition }, body: { bytes } }, signal), REFUSED_CONDITIONS);
+      await bodyText(response, 0);
+      return !REFUSED_CONDITIONS.includes(response.statusCode ?? 0);
+    });
+
+  const removeIf = (key: string, etag: string): Effect.Effect<boolean, S3Error> =>
+    attempt("deletion", key, async (signal) => {
+      // Refused where it is another (412), or none: SeaweedFS answers 412 for one not there too, S3 404; and where a write
+      // of it runs at once (409, S3's ConditionalRequestConflict), which is another once it is through.
+      const response = await succeeded(await call("DELETE", key, { headers: { "if-match": etag } }, signal), REFUSED_CONDITIONS);
+      await bodyText(response, 0);
+      return !REFUSED_CONDITIONS.includes(response.statusCode ?? 0);
+    });
+
   /** The ranges of an object of `size` bytes, a part each: their first byte and their length. */
   const ranges = (size: number): { readonly start: number; readonly length: number }[] =>
     Array.from({ length: Math.ceil(size / partBytes) }, (_, index) => ({ start: index * partBytes, length: Math.min(partBytes, size - index * partBytes) }));
 
-  return {
+  const bucket: Omit<S3Bucket, "checkConditions"> = {
     putFile: (key, path, ready) =>
       attempt("upload", key, async (signal) => {
         const { size } = await stat(path);
@@ -520,6 +575,8 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         await bodyText(await succeeded(await call("PUT", key, { headers: { "content-type": "application/json" }, body: { bytes } }, signal)), 0);
       }),
 
+    putJsonIf,
+
     getJson: (key) => attempt("read", key, (signal) => readJson(key, signal)).pipe(Effect.map((found) => found?.value ?? null)),
 
     getTaggedJson: (key) =>
@@ -561,14 +618,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         await bodyText(await succeeded(await call("DELETE", key, {}, signal), [404]), 0);
       }),
 
-    removeIf: (key, etag) =>
-      attempt("deletion", key, async (signal) => {
-        // Refused where it is another (412), or none: SeaweedFS answers 412 for one not there too, S3 404; and where a write
-        // of it runs at once (409, S3's ConditionalRequestConflict), which is another once it is through.
-        const response = await succeeded(await call("DELETE", key, { headers: { "if-match": etag } }, signal), REFUSED_CONDITIONS);
-        await bodyText(response, 0);
-        return !REFUSED_CONDITIONS.includes(response.statusCode ?? 0);
-      }),
+    removeIf,
 
     list: (prefix) =>
       attempt("listing", `${prefix}*`, async (signal) => {
@@ -609,4 +659,34 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         return begun.length;
       }),
   };
+  return { ...bucket, checkConditions: conditionsOf(bucket) };
 }
+
+/** checkConditions of `bucket`, as S3Bucket says. */
+const conditionsOf = (bucket: Omit<S3Bucket, "checkConditions">): Effect.Effect<void, S3Error | StoreUnconditional> =>
+  Effect.suspend(() => {
+    const key = `${PROBES}/${randomBytes(8).toString("hex")}.json`;
+    const unheld = `"${"0".repeat(32)}"`;
+    const refused = (condition: string) => Effect.fail(new StoreUnconditional({ condition }));
+    /** `asked`, a request on `condition`, as the store answers it: one it says it does not implement (501) refuses the store. */
+    const conditioned = <A>(condition: string, asked: Effect.Effect<A, S3Error>): Effect.Effect<A, S3Error | StoreUnconditional> =>
+      asked.pipe(Effect.catchIf((error) => UNIMPLEMENTED.test(error.reason), () => refused(`${condition}, which it says it does not implement`)));
+    return Effect.gen(function*() {
+      // What the probes of agents stopped as they probed left, gone.
+      const now = Date.now();
+      const left = (yield* bucket.list(`${PROBES}/`)).filter(({ writtenAt }) => now - writtenAt > PROBES_GRACE_MS);
+      yield* Effect.forEach(left, ({ key: stale }) => bucket.remove(stale), { discard: true });
+      yield* bucket.putJson(key, { probe: 1 });
+      const held = yield* bucket.getTaggedJson(key);
+      if (held === null) return yield* new S3Error({ operation: "read", key, reason: "it holds nothing of what was put" });
+      const ifMatch = "a PUT as of an ETag (If-Match)";
+      if (yield* conditioned(ifMatch, bucket.putJsonIf(key, { probe: 2 }, unheld))) return yield* refused("a PUT as of an ETag it does not hold (If-Match)");
+      if (yield* conditioned("a PUT of none (If-None-Match: *)", bucket.putJsonIf(key, { probe: 3 }, null))) return yield* refused("a PUT of an object it holds already (If-None-Match: *)");
+      if (!(yield* conditioned(ifMatch, bucket.putJsonIf(key, { probe: 4 }, held.etag)))) return yield* refused("a PUT as of the ETag it holds (If-Match), which it refuses");
+      const reheld = yield* bucket.getTaggedJson(key);
+      if (reheld === null) return yield* new S3Error({ operation: "read", key, reason: "it holds nothing of what was put" });
+      const ifMatchDelete = "a DELETE as of an ETag (If-Match)";
+      if (yield* conditioned(ifMatchDelete, bucket.removeIf(key, unheld))) return yield* refused("a DELETE as of an ETag it does not hold (If-Match)");
+      if (!(yield* conditioned(ifMatchDelete, bucket.removeIf(key, reheld.etag)))) return yield* refused("a DELETE as of the ETag it holds (If-Match), which it refuses");
+    }).pipe(Effect.ensuring(bucket.remove(key).pipe(Effect.ignore)));
+  });

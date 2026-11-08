@@ -21,7 +21,10 @@
  * of the next; its commit is removed only as the bucket holds it as it was read, by its ETag,
  * so a commit another node's agent writes meanwhile stands. A copy gives a workspace another's
  * current snapshot, as a session forked from another restores what the other was: its images
- * copied in the bucket, then its manifest, then its commit, as a checkpoint writes them.
+ * copied in the bucket, then its manifest, then its commit, as a checkpoint writes them. A
+ * checkpoint's commit, and a copy's, are written whatever the bucket holds, as each is the
+ * workspace's latest, of its one sandbox or of a fork none runs from yet, and read nothing it
+ * holds; a compaction's, which compacts the snapshot it read, only as the bucket holds that one.
  *
  * A snapshot a release's checkpoint commits whose chain of images is due (compactionDue)
  * is compacted, after its commit and beside whatever else the agent does, one at a time on
@@ -1228,18 +1231,61 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const manifest = yield* exclusive(
           [committed],
           Effect.gen(function*() {
-            if ((yield* current(committed))?.snapshot !== committed.snapshot) return null;
+            const key = `${prefixOf(committed)}/${CURRENT_FILE}`;
+            const read = yield* taggedManifestAt(committed, key);
+            if (read?.manifest.snapshot !== committed.snapshot) return null;
             // Checked only now that it holds the workspace, which a collection on this node holds too: one may have taken
             // what it uploaded, which no manifest named, as it waited for it. The cache holds its image, spared meanwhile.
             const layer = yield* layerInBucket(committed, uploaded);
             yield* inTime(committed, snapshot, uploadedAt);
             const compacted: Manifest = { ...committed, snapshot, layers: [layer], bytes: bytesOf([layer]), uploadMs, compactedFrom: committed.snapshot };
-            yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(compacted)));
+            const cached = join(cache.workspace(environment, workspace), MANIFEST_FILE);
+            const sayingVerified = join(cache.workspace(environment, workspace), VERIFIED_FILE);
+            const verifiedBefore = yield* onDisk(() => readFile(sayingVerified, "utf8").catch(() => null));
+            // The cache saying the commit it compacted again, and what of it was verified, as where its own is not committed.
+            const cacheAsBefore = onDisk(() => writeFile(cached, JSON.stringify(committed))).pipe(
+              Effect.andThen(onDisk(() => (verifiedBefore === null ? rm(sayingVerified, { force: true }) : writeFile(sayingVerified, verifiedBefore)))),
+            );
+            yield* onDisk(() => writeFile(cached, JSON.stringify(compacted)));
             if (verified) yield* sayVerified(compacted);
-            yield* bucket.putJson(manifestKey(committed, snapshot), compacted);
+            // Its manifest unwritten, as one that fails or is stopped leaves it, the cache as it was; and its image, which a
+            // failure forgets, left to collection where the manifest may be written all the same, as one whose answer was lost
+            // may be: forgotten only where the bucket says it holds no such manifest.
+            const named = bucket.head(manifestKey(committed, snapshot)).pipe(Effect.map((found) => found !== null), Effect.orElseSucceed(() => true));
+            yield* bucket.putJson(manifestKey(committed, snapshot), compacted).pipe(
+              Effect.onError(() =>
+                cacheAsBefore.pipe(
+                  Effect.ignore,
+                  Effect.andThen(named),
+                  Effect.flatMap((maybe) =>
+                    Effect.sync(() => {
+                      if (maybe) unnamed = null;
+                    })
+                  ),
+                )
+              ),
+            );
+            // Named by its manifest from here, its image is no more one a failure forgets, as its commit may stand.
             unnamed = null;
-            yield* bucket.putJson(`${prefixOf(committed)}/${CURRENT_FILE}`, compacted);
-            return compacted;
+            // Uncommitted: the cache as it was, then its manifest goes.
+            const uncommit = cacheAsBefore.pipe(Effect.andThen(bucket.remove(manifestKey(committed, snapshot))));
+            // Committed only as the bucket holds the commit it read: another node's agent may commit the workspace's next
+            // snapshot meanwhile, a release of its sandbox restored there, which no lock of this agent's holds back, and which
+            // stands; its image is then left to be collected. A commit whose answer was lost, as the store may have written it
+            // all the same, or may yet, is told by the commit read again: committed where that names it. Its image is never
+            // forgotten then, as another node's agent may have restored it, committed and checkpointed it meanwhile, a commit
+            // that names it among its layers: it is left to collection, which keeps what the commit and the latest manifest
+            // name. It is uncommitted only where the commit is another (its ETag another than the one read) that names none
+            // of it, as one asked as of the one read can be written no more; and left be where it is the one read still, or
+            // cannot be read, or is gone, as another node's agent may have spent it once it was written.
+            const put = yield* bucket.putJsonIf(key, compacted, read.etag).pipe(Effect.result);
+            if (put._tag === "Success") return put.success ? compacted : yield* Effect.as(uncommit, null);
+            const after = yield* taggedManifestAt(committed, key).pipe(Effect.result);
+            if (after._tag === "Failure") return yield* put.failure;
+            const now = after.success;
+            if (now?.manifest.snapshot === snapshot) return compacted;
+            if (now !== null && now.etag !== read.etag && !now.manifest.layers.some(({ digest }) => digest === image.digest)) yield* uncommit;
+            return yield* put.failure;
           }),
         );
         if (manifest === null) {

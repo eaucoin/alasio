@@ -144,6 +144,61 @@ test("the bucket takes files and JSON, gives them back, says what it holds, copi
   }
 });
 
+test("JSON is put as of the ETag the bucket holds it by, or of none, and refused otherwise; a store is proved to honour such conditions, and one that ignores them refused, the object it proved them with gone", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
+    const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
+    const key = "main/fs-abc/current.json";
+    // Of none, where there is none, and not again.
+    assert.equal(await run(bucket.putJsonIf(key, { snapshot: "s1" }, null)), true);
+    assert.equal(await run(bucket.putJsonIf(key, { snapshot: "s0" }, null)), false);
+    const read = await run(bucket.getTaggedJson(key));
+    assert.deepEqual(read?.value, { snapshot: "s1" });
+    // As of the ETag it was read with, and not once written over since, nor once gone.
+    await run(bucket.putJson(key, { snapshot: "s2" }));
+    assert.equal(await run(bucket.putJsonIf(key, { snapshot: "s3" }, read?.etag ?? "")), false);
+    assert.deepEqual(await run(bucket.getJson(key)), { snapshot: "s2" });
+    const again = await run(bucket.getTaggedJson(key));
+    assert.equal(await run(bucket.putJsonIf(key, { snapshot: "s3" }, again?.etag ?? "")), true);
+    assert.deepEqual(await run(bucket.getJson(key)), { snapshot: "s3" });
+    await run(bucket.remove(key));
+    assert.equal(await run(bucket.putJsonIf(key, { snapshot: "s4" }, again?.etag ?? "")), false);
+    assert.equal(s3.objects.has(key), false);
+    // A write of it at once (409) is a refusal, to read again.
+    s3.refuse = (method) => (method === "PUT" ? 409 : null);
+    assert.equal(await run(bucket.putJsonIf(key, { snapshot: "s4" }, null)), false);
+    s3.refuse = () => null;
+
+    // What a probe stopped as it probed left, of over an hour ago, goes; one of another agent's probing now stays.
+    await run(bucket.putJson(".alasio/probes/left.json", { probe: 1 }));
+    await run(bucket.putJson(".alasio/probes/probing.json", { probe: 1 }));
+    s3.writtenAt.set(".alasio/probes/left.json", Date.now() - 61 * 60_000);
+    await run(bucket.checkConditions);
+    const probes = () => [...s3.objects.keys()].filter((name) => name.startsWith(".alasio/probes/"));
+    assert.deepEqual(probes(), [".alasio/probes/probing.json"]);
+    await run(bucket.remove(".alasio/probes/probing.json"));
+    assert.ok(s3.requests.some((asked) => asked.startsWith("PUT .alasio/probes/")));
+    // A store that refuses every conditional PUT, or says it implements none (501), is refused too.
+    for (const [status, said] of [[412, /a PUT as of the ETag it holds \(If-Match\), which it refuses/u], [501, /a PUT as of an ETag \(If-Match\), which it says it does not implement/u]] as const) {
+      let puts = 0;
+      s3.refuse = (method, key) => (method === "PUT" && key.startsWith(".alasio/probes/") && ++puts > 1 ? status : null);
+      const unconditional = await Effect.runPromiseExit(bucket.checkConditions);
+      assert.ok(Exit.isFailure(unconditional));
+      assert.match(String(unconditional.cause), said);
+      s3.refuse = () => null;
+      assert.deepEqual(probes(), []);
+    }
+    s3.honoursConditions = false;
+    const refused = await Effect.runPromiseExit(bucket.checkConditions);
+    assert.ok(Exit.isFailure(refused));
+    assert.match(String(refused.cause), /StoreUnconditional[\s\S]*a PUT as of an ETag it does not hold \(If-Match\)/u);
+    assert.deepEqual(probes(), []);
+  } finally {
+    await s3.close();
+  }
+});
+
 test("a file larger than a part is put in parts, some at a time, and got in ranges; one larger than a copy is copied in parts; an upload that fails is aborted", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));

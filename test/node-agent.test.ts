@@ -36,6 +36,7 @@ import {
   type Layer as Image,
   makeNodeAgent,
   type Manifest,
+  MANIFEST_FILE,
   MAX_CHAIN_DEPTH,
   memoryLimitOf,
   NoSnapshot,
@@ -50,6 +51,7 @@ import {
   SnapshotOutlived,
   STATE_FILE_BYTES,
   STATE_READ_TIMEOUT_MS,
+  VERIFIED_FILE,
   type WorkspaceRef,
 } from "../src/node-agent/agent.ts";
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
@@ -955,6 +957,207 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
       })
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
+
+test("a compaction whose workspace another node's agent commits the next snapshot of, between its read of the commit it compacts and its own, commits nothing, the other's standing", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+        yield* here.agent.checkpoint(request("fs-abc"));
+        const { manifest } = yield* preparing(here.agent, workspace);
+        yield* here.agent.spend(workspace, manifest.snapshot);
+        yield* here.agent.resume(resumeRequest(manifest.snapshot));
+        writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const delta = yield* here.agent.checkpoint(request("fs-abc"));
+        const manifests = () => [...s3.objects.keys()].filter((key) => key.startsWith("main/fs-abc/manifests/")).sort();
+        const images = () => new Set([...s3.objects.keys()].filter((key) => key.startsWith("main/fs-abc/layers/")).map((key) => key.split("/")[3]));
+        const before = manifests();
+        const verified = () => readFileSync(join(here.cacheDir, "main", "fs-abc", VERIFIED_FILE), "utf8");
+        const verifiedBefore = verified();
+        // As the compaction writes its manifest, having read the commit it compacts, the sandbox, restored on another node and
+        // released there, commits its next.
+        const next: Manifest = { ...delta, snapshot: "20991231T000000000Z-000000ff" };
+        s3.holdPut = (key) => {
+          if (key.startsWith("main/fs-abc/manifests/") && !before.includes(key)) s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify(next)));
+          return null;
+        };
+        yield* Effect.sync(() => here.releases.calls(RELEASE).some((args) => args.includes("compact"))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }));
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.sync(() => existsSync(join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (compacting) => !compacting }));
+        assert.equal((yield* here.agent.current(workspace))?.snapshot, next.snapshot);
+        // Its manifest gone with it, the cache's back to the commit it compacted, as what it says verified, and its image left to
+        // be collected.
+        assert.deepEqual(manifests(), before);
+        assert.equal((JSON.parse(readFileSync(join(here.cacheDir, "main", "fs-abc", MANIFEST_FILE), "utf8")) as Manifest).snapshot, delta.snapshot);
+        assert.equal(verified(), verifiedBefore);
+        assert.equal(images().size, new Set(delta.layers.map(({ digest }) => digest)).size + 1);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1 })));
+
+/**
+ * A compaction of a chain due on node-1 whose commit's answer the store drops, having written it or not as `dropped` says,
+ * `meanwhile` done as it drops it, `check`ed once it has ended, its outcome counted: the workspace's commit then, the images
+ * and manifests the bucket holds of it, and the compacted chain's delta.
+ */
+const compactionAnswerLost = (
+  dropped: "written" | "unwritten" | "later",
+  check: (after: { readonly current: Manifest | null; readonly images: ReadonlySet<string | undefined>; readonly manifests: readonly string[]; readonly delta: Manifest }) => void,
+  meanwhile: (s3: FakeS3, delta: Manifest) => void = () => {},
+) =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const here = yield* node("node-1");
+      const runscDir = here.releases.dirOf(RELEASE);
+      writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+      yield* here.agent.checkpoint(request("fs-abc"));
+      const { manifest } = yield* preparing(here.agent, workspace);
+      yield* here.agent.spend(workspace, manifest.snapshot);
+      yield* here.agent.resume(resumeRequest(manifest.snapshot));
+      writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+      writeFileSync(join(runscDir, "hold-compact"), "");
+      const delta = yield* here.agent.checkpoint(request("fs-abc"));
+      const counted = Effect.promise(() => collected("alasio.node_agent.compactions")).pipe(Effect.map((points) => points.reduce((sum, { value }) => sum + value, 0)));
+      const before = yield* counted;
+      s3.dropsPut = (key) => (key === "main/fs-abc/current.json" ? (meanwhile(s3, delta), dropped) : null);
+      yield* Effect.sync(() => here.releases.calls(RELEASE).some((args) => args.includes("compact"))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }));
+      rmSync(join(runscDir, "hold-compact"));
+      yield* Effect.sync(() => existsSync(join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (compacting) => !compacting }));
+      // Its outcome counted as the compaction ends, after what says it compacts is gone.
+      yield* counted.pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count > before }));
+      s3.dropsPut = () => null;
+      const images = new Set([...s3.objects.keys()].filter((key) => key.startsWith("main/fs-abc/layers/")).map((key) => key.split("/")[3]));
+      check({ current: yield* here.agent.current(workspace), images, delta, manifests: [...s3.objects.keys()].filter((key) => key.startsWith("main/fs-abc/manifests/")) });
+    })
+  );
+
+test("a compaction whose commit's answer is lost, the store having written it, reads it again, and stands, its image kept", () =>
+  added("alasio.node_agent.compactions", () =>
+    compactionAnswerLost("written", ({ current, images, delta }) => {
+      assert.equal(current?.compactedFrom, delta.snapshot);
+      for (const { digest } of current?.layers ?? []) assert.ok(images.has(digest), `its image ${digest} is not in the bucket`);
+    })
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=compacted": 1 })));
+
+test("a compaction whose commit's answer is lost, the store writing it only once the commit is read again, leaves its image and its manifest be, which the commit names once written", () =>
+  added("alasio.node_agent.compactions", () =>
+    compactionAnswerLost("later", ({ current, images, delta, manifests }) => {
+      assert.equal(current?.compactedFrom, delta.snapshot);
+      for (const { digest } of current?.layers ?? []) assert.ok(images.has(digest), `its image ${digest} is not in the bucket`);
+      assert.ok(manifests.some((key) => key.endsWith(`/${current?.snapshot}.json`)), manifests.join(", "));
+    })
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=S3Error": 1 })));
+
+test("a compaction whose commit's answer is lost, the store having written none, leaves its image and its manifest be for collection, as the commit it compacted stands as it was read, which a commit asked as of may yet be written over", () =>
+  added("alasio.node_agent.compactions", () =>
+    compactionAnswerLost("unwritten", ({ current, images, delta, manifests }) => {
+      assert.equal(current?.snapshot, delta.snapshot);
+      assert.equal(images.size, new Set(delta.layers.map(({ digest }) => digest)).size + 1);
+      assert.equal(manifests.length, 3, manifests.join(", "));
+    })
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=S3Error": 1 })));
+
+test("a compaction whose commit's answer is lost, another node's agent committing the workspace's next meanwhile, takes its manifest back, as its commit can be written no more, and leaves its image to collection", () =>
+  added("alasio.node_agent.compactions", () =>
+    compactionAnswerLost(
+      "unwritten",
+      ({ current, images, delta, manifests }) => {
+        assert.equal(current?.snapshot, "20991231T000000000Z-000000fe");
+        assert.equal(images.size, new Set(delta.layers.map(({ digest }) => digest)).size + 1);
+        assert.equal(manifests.length, 2, manifests.join(", "));
+      },
+      (s3, delta) => void s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify({ ...delta, snapshot: "20991231T000000000Z-000000fe" }))),
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=S3Error": 1 })));
+
+test("a compaction whose commit's answer is lost, the store having written it, and another node's agent spending it before it is read again, keeps its image and its manifest, as a commit gone may have been its own", () =>
+  added("alasio.node_agent.compactions", () =>
+    compactionAnswerLost(
+      "written",
+      ({ current, images, delta, manifests }) => {
+        assert.equal(current, null);
+        assert.equal(images.size, new Set(delta.layers.map(({ digest }) => digest)).size + 1);
+        assert.equal(manifests.length, 3, manifests.join(", "));
+      },
+      (s3) => {
+        // The other's restore of the compacted snapshot, as the store wrote its commit, spends it before the commit is read again.
+        const key = "main/fs-abc/current.json";
+        s3.holdGet = (got) => {
+          if (got !== key) return null;
+          s3.holdGet = () => null;
+          s3.objects.delete(key);
+          return null;
+        };
+      },
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=S3Error": 1 })));
+
+test("a compaction whose commit's answer is lost, the store having written it, and another node's agent restoring it and committing its next before it is read again, keeps its image and its manifest, the chain of the commit whole", () =>
+  added("alasio.node_agent.compactions", () =>
+    compactionAnswerLost(
+      "written",
+      ({ current, images, manifests }) => {
+        assert.equal(current?.snapshot, "20991231T000000000Z-000000fd");
+        for (const { digest } of current?.layers ?? []) assert.ok(images.has(digest), `its image ${digest} is not in the bucket`);
+        assert.equal(manifests.length, 3, manifests.join(", "));
+      },
+      (s3) => {
+        // The other's checkpoint, of a sandbox restored from the compacted snapshot as the store wrote its commit: its own
+        // image, then the compacted one. It commits unconditionally, as a checkpoint does, before the commit is read again.
+        const key = "main/fs-abc/current.json";
+        const own = "e".repeat(64);
+        s3.holdGet = (got) => {
+          if (got !== key) return null;
+          s3.holdGet = () => null;
+          const { compactedFrom: _, ...compacted } = JSON.parse(String(s3.objects.get(key))) as Manifest;
+          s3.objects.set(`main/fs-abc/layers/${own}/checkpoint.img`, Buffer.from("its own"));
+          s3.objects.set(key, Buffer.from(JSON.stringify({ ...compacted, snapshot: "20991231T000000000Z-000000fd", layers: [{ digest: own, files: [] }, ...compacted.layers] })));
+          return null;
+        };
+      },
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=S3Error": 1 })));
+
+test("a compaction whose manifest cannot be written leaves the cache saying the commit it compacted, and what of it was verified, as it was; its image forgotten where the manifest is not written, and left to collection where its answer was lost, the manifest written", async () => {
+  for (const dropped of ["unwritten", "written"] as const) {
+    await withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+        yield* here.agent.checkpoint(request("fs-abc"));
+        const { manifest } = yield* preparing(here.agent, workspace);
+        yield* here.agent.spend(workspace, manifest.snapshot);
+        yield* here.agent.resume(resumeRequest(manifest.snapshot));
+        writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const delta = yield* here.agent.checkpoint(request("fs-abc"));
+        const said = (file: string) => readFileSync(join(here.cacheDir, "main", "fs-abc", file), "utf8");
+        const [manifestBefore, verifiedBefore] = [said(MANIFEST_FILE), said(VERIFIED_FILE)];
+        const manifests = () => [...s3.objects.keys()].filter((key) => key.startsWith("main/fs-abc/manifests/"));
+        const before = manifests();
+        s3.dropsPut = (key) => (key.startsWith("main/fs-abc/manifests/") && !before.includes(key) ? dropped : null);
+        yield* Effect.sync(() => here.releases.calls(RELEASE).some((args) => args.includes("compact"))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }));
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.sync(() => existsSync(join(here.cacheDir, "main", "fs-abc", COMPACTING_FILE))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (compacting) => !compacting }));
+        s3.dropsPut = () => null;
+        assert.equal((yield* here.agent.current(workspace))?.snapshot, delta.snapshot);
+        assert.equal(said(MANIFEST_FILE), manifestBefore);
+        assert.equal(said(VERIFIED_FILE), verifiedBefore);
+        const images = new Set([...s3.objects.keys()].filter((key) => key.startsWith("main/fs-abc/layers/")).map((key) => key.split("/")[3]));
+        const chained = new Set(delta.layers.map(({ digest }) => digest)).size;
+        assert.equal(manifests().length, before.length + (dropped === "written" ? 1 : 0), `${dropped}: ${manifests().join(", ")}`);
+        assert.equal(images.size, chained + (dropped === "written" ? 1 : 0), dropped);
+      })
+    );
+  }
+});
 
 test("a compaction checks its image in the bucket once it holds the workspace, and puts back from the cache what a collection took of it as it waited, before it commits it", () =>
   withBucket(({ s3, node }) =>

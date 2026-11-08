@@ -143,7 +143,7 @@ import { createServer } from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import type { V1Pod } from "@kubernetes/client-node";
-import { Cause, Config, Deferred, Effect, Option, Redacted, Schema, type Scope, Stream } from "effect";
+import { Cause, Config, Deferred, Effect, Option, Redacted, Schedule, Schema, type Scope, Stream } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { INITIAL_EVENTS_END, type KubeApiError, KubeClient } from "../kube/client.ts";
@@ -194,7 +194,7 @@ import {
 } from "./names.ts";
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
-import { makeS3Bucket } from "./s3.ts";
+import { makeS3Bucket, type StoreUnconditional } from "./s3.ts";
 import { makeStoreProxy, type StoreProxyError } from "./store-proxy.ts";
 import { observeStorageUsage } from "./storage-usage.ts";
 
@@ -527,6 +527,8 @@ const NODE_ROOT = "/proc/1/root";
 const DEFAULT_CACHE_BYTES = 5 * 1024 ** 3;
 /** How long a snapshot used is kept in the cache whatever its budget: a restore on this node reads it meanwhile. */
 const EVICTION_GRACE_MS = 10 * 60_000;
+/** How its store's conditions are asked again while it cannot be reached: a second after, then twice as long each time, a minute at most. */
+const CONDITIONS_TRIES = Schedule.min([Schedule.exponential("1 second"), Schedule.spaced("1 minute")]);
 
 /**
  * The node agent of the node it runs on (NODE_NAME), as its environment configures it:
@@ -541,10 +543,12 @@ const EVICTION_GRACE_MS = 10 * 60_000;
  * (BACKGROUND_READ_SECONDS_VARIABLE). What a
  * stopped agent left half written in the cache is removed first; what is attached on the node
  * is kept to the pods the cluster has on it (./attachments.ts), which it reads as its
- * ServiceAccount, of no other right. What stops it is logged,
+ * ServiceAccount, of no other right. Once it serves, the bucket's store is proved to honour
+ * conditional writes and deletes (./s3.ts checkConditions), asked again while it cannot be
+ * reached, the agent stopping on one that does not. What stops it is logged,
  * and its stop waits on its restores' reads, as the module says.
  */
-export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError.ServeError | CacheError | StoreProxyError, Scope.Scope> = Effect.gen(function*() {
+export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError.ServeError | CacheError | StoreProxyError | StoreUnconditional, Scope.Scope> = Effect.gen(function*() {
   const node = yield* Config.String("NODE_NAME");
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
   const budget = yield* Config.Int(SNAPSHOT_CACHE_BYTES_VARIABLE).pipe(Config.withDefault(DEFAULT_CACHE_BYTES));
@@ -563,12 +567,13 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT, current });
   const host = makeHostCommands();
   const kube = yield* Effect.provide(Effect.service(KubeClient), KubeClient.layer);
+  const store = makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) });
   const agent = yield* makeNodeAgent({
     node,
     nodeRoot: NODE_ROOT,
     runsc,
     cache,
-    bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
+    bucket: store,
     storeProxy,
     host,
     restoresFromBucketSince,
@@ -594,6 +599,13 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     })
   );
   yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, and the snapshots bucket to its node on ${new URL(storeProxy.endpoint).host}, its cache within ${budget} bytes`);
+  // Its store proved to honour the conditions its snapshots' commits are written and removed on, once it answers: an agent of
+  // one that ignores them stops, its node's restores and saves with it, rather than have a node's agent undo another's.
+  yield* store.checkConditions.pipe(
+    Effect.as(true),
+    Effect.catchTag("S3Error", (error) => Effect.logWarning(`could not yet prove the snapshots bucket's store honours conditional writes, so it is asked again: ${error.message}`).pipe(Effect.as(false))),
+    Effect.repeat({ schedule: CONDITIONS_TRIES, until: (proved) => proved }),
+  );
 }).pipe(
   Effect.tapCause((cause) => Effect.logError(`Fatal error: ${Cause.pretty(cause)}`)),
   withLogScope("node-agent"),

@@ -1,6 +1,6 @@
 /**
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
- * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), HeadObject, DeleteObject (as of an ETag too),
+ * SeaweedFS does: PutObject (as of an ETag, or of none, too), CopyObject, GetObject (of a range too), HeadObject, DeleteObject (as of an ETag too),
  * ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
  * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), every
  * request's Signature Version 4 checked against the credentials it is given, with every
@@ -39,6 +39,14 @@ export interface FakeS3 {
   getDelayMs: number;
   /** Whether a get of a whole object is answered with its ETag, as S3 does; a test's to unset, as of a store that does not. */
   getsTagged: boolean;
+  /** Whether a put or a delete honours its conditions (If-Match, If-None-Match), as S3 does; a test's to unset, as of a store that ignores them. */
+  honoursConditions: boolean;
+  /**
+   * Whether a put of the object `key` is answered: "written" writes it and drops the connection unanswered, as a store whose
+   * answer is lost does; "unwritten" drops it before writing; "later" drops it unwritten, and writes it, as of its conditions
+   * then, once the object's next get is answered, as a store does a write it took and had not done yet; null answers it.
+   */
+  dropsPut: (key: string) => "written" | "unwritten" | "later" | null;
   /** What a get of the object `key` waits on before it is answered, where it gives one, as one of a large image waits on the network: a test's to settle. */
   holdGet: (key: string) => Promise<void> | null;
   /**
@@ -96,6 +104,8 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     return written?.bytes === object ? written.etag : etagOf(object);
   };
   const requests: string[] = [];
+  /** The puts taken and not yet written, by key, each written once its object's next get is answered (dropsPut). */
+  const writtenLater = new Map<string, () => void>();
   const uploads = new Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>();
   let getting = 0;
   let mostGetting = 0;
@@ -242,8 +252,25 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       );
       return;
     }
+    // As of the ETag it was read with, or of none, where asked: refused where it is another, or none, or one, as SeaweedFS refuses it.
+    const unmet = (): boolean => {
+      if (!fake.honoursConditions) return false;
+      const object = objects.get(key);
+      const ifMatch = request.headers["if-match"];
+      const ifNoneMatch = request.headers["if-none-match"];
+      if (ifMatch !== undefined && (object === undefined || etagHeld(key, object).replaceAll('"', "") !== ifMatch.replaceAll('"', ""))) return true;
+      return ifNoneMatch === "*" && object !== undefined;
+    };
     if (method === "PUT") {
+      const dropped = fake.dropsPut(key);
+      if (dropped === "unwritten") return void request.socket.destroy();
+      if (dropped === "later") {
+        writtenLater.set(key, () => void (unmet() ? undefined : write(key, body, etagOf(body))));
+        return void request.socket.destroy();
+      }
+      if (unmet()) return error(response, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
       write(key, body, etagOf(body));
+      if (dropped === "written") return void request.socket.destroy();
       response.writeHead(200, { etag: etagOf(body) }).end();
       return;
     }
@@ -259,6 +286,8 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
         return;
       }
       response.writeHead(200, { "content-length": object.length, ...(fake.getsTagged ? { etag: etagHeld(key, object) } : {}) }).end(object);
+      writtenLater.get(key)?.();
+      writtenLater.delete(key);
       return;
     }
     if (key && method === "HEAD") {
@@ -268,12 +297,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       return;
     }
     if (method === "DELETE") {
-      // As of the ETag it was read with, where asked: refused where it is another, or none, as SeaweedFS refuses it.
-      const ifMatch = request.headers["if-match"];
-      const object = objects.get(key);
-      if (ifMatch !== undefined && (object === undefined || etagHeld(key, object).replaceAll('"', "") !== ifMatch.replaceAll('"', ""))) {
-        return error(response, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
-      }
+      if (unmet()) return error(response, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
       objects.delete(key);
       etags.delete(key);
       writtenAt.delete(key);
@@ -296,6 +320,8 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     refuse: () => null,
     getDelayMs: 0,
     getsTagged: true,
+    honoursConditions: true,
+    dropsPut: () => null,
     holdGet: () => null,
     holdPut: () => null,
     mostGetting: () => mostGetting,

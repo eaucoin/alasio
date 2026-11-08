@@ -716,7 +716,15 @@ const ObjectStore = Schema.Struct({
    * `accessKey` and `secretKey`; and a Secret of the same
    * keys for a key of the store's that reaches the snapshots bucket alone, which only the
    * node agents hold, as what writes that bucket writes what they restore as root: the
-   * first key may not write it, and Neon's setup, which tries, refuses one that can.
+   * first key may not write it, and Neon's setup, which tries, refuses one that can. The
+   * store must honour conditional requests, `If-Match` on a PUT and a DELETE and
+   * `If-None-Match: *` on a PUT, each checked with its write, as AWS's S3 does: the node agents
+   * commit and spend a workspace's snapshots only as the bucket holds them as read. Each agent
+   * proves its store does once it serves, with an object of its own under `.alasio/probes/`, and
+   * stops, saying so, on a store that ignores them or says it implements none (501)
+   * (src/node-agent/s3.ts checkConditions); one whose probe fails otherwise, as a key refused
+   * the bucket (403) or a store not reached, serves on, warning, and proves it again later, its
+   * commits and spends failing meanwhile as that store answers them.
    */
   external: defaulted(
     Schema.Struct({
