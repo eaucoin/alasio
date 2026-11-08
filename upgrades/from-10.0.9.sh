@@ -36,8 +36,7 @@
 # through, after it. Each change's steps are a section of their own below, between its BEGIN
 # and END lines, which the flow at the end of the script calls. None changes, before the
 # point of no return, what a run that fails there would have to make again: a step that does
-# brings what makes it again, for the flow to run as such a run ends. None has any yet: the
-# upgrade alone takes an installation of 10.0.9 to this release.
+# brings what makes it again, for the flow to run as such a run ends.
 #
 # Run again, it goes on from where it stopped: a run that failed before the point of no
 # return starts over. Once past it (OUT/point-of-no-return), a run again goes on from there,
@@ -53,6 +52,47 @@ fail() {
 }
 # Whether UPGRADE_CHECK passes now, what it said in OUT/upgrade-check.log.
 accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
+
+# BEGIN the sandbox gateway stopped.
+#
+# This release's node agents answer the sandbox gateway as 10.0.9's did not: a restore's prepare
+# is given the manifest the gateway read, and its resume is asked as its pod is made, with the
+# port its bayma serves on; and this release's gateway asks the agents of its own release alone
+# (cli/src/manifests/sandbox-gateway.ts). The upgrade rolls the agents node by node beside the
+# gateway, so 10.0.9's gateway, asking an agent rolled already, would have its restore's prepare
+# refused, and forget the snapshot it restores. So, past the point of no return, before the
+# upgrade, the gateway is stopped, its pods gone, so that no bind runs until the upgrade starts
+# this release's, which asks none of 10.0.9's agents left: a turn that binds meanwhile fails to,
+# as one does as the gateway rolls. Once, as OUT/gateway-stopped says it was: a run again after the
+# upgrade failed finds the gateway the release's, or stopped still. Its pods' end is waited for
+# STOP_WAIT_SECONDS (10 min) at most, looking every POLL_SECONDS (5).
+
+NS=alasio
+GATEWAY=alasio-sandbox-gateway
+STOP_WAIT_SECONDS=${STOP_WAIT_SECONDS:-600}
+POLL_SECONDS=${POLL_SECONDS:-5}
+k() { kubectl -n "$NS" "$@"; }
+# Whether alasio's namespace has no pod of the selector `$1` within `$2` seconds, looking every
+# POLL_SECONDS; the run failing where its pods cannot be listed, as nothing can be told then.
+gone() {
+  local waited=0 listed
+  while :; do
+    listed=$(k get pod -l "$1" -o name) || fail "the pods of $1 in $NS could not be listed"
+    [ -n "$listed" ] || return 0
+    [ "$waited" -lt "$2" ] || return 1
+    sleep "$POLL_SECONDS"
+    waited=$((waited + POLL_SECONDS))
+  done
+}
+gateway_stopped_past() {
+  [ ! -e "$OUT/gateway-stopped" ] || return 0
+  log "stopping the sandbox gateway, so that no bind runs as the node agents roll"
+  k scale deployment "$GATEWAY" --replicas=0 >/dev/null || fail "the sandbox gateway could not be stopped"
+  gone app.kubernetes.io/component=sandbox-gateway "$STOP_WAIT_SECONDS" || fail "the sandbox gateway did not stop within ${STOP_WAIT_SECONDS} s"
+  date -u +%FT%TZ >"$OUT/gateway-stopped"
+  log "the sandbox gateway stopped, to be started again by the upgrade"
+}
+# END the sandbox gateway stopped.
 
 command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
 [ -r "$CONFIG" ] || fail "CONFIG $CONFIG cannot be read"
@@ -77,9 +117,11 @@ fi
 
 if [ ! -e "$OUT/upgraded" ]; then
   [ "${FAIL_AT:-}" != past-the-point-of-no-return ] || fail "a failure injected past the point of no return, before the upgrade"
+  gateway_stopped_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
-  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
+  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
+    fail "the upgrade failed (upgrade.log): the sandbox gateway stays stopped until an upgrade gets as far as starting it; the cut-over run again goes on with it"
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"

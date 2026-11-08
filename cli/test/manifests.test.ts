@@ -3658,7 +3658,8 @@ describe("the sandbox service", () => {
       // A new session's volume's size, 10Gi by default.
       quotaBytes: 10 * 1024 ** 3,
       pools: { none: "sandboxes-none", full: "sandboxes-full" },
-      nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
+      // This release's node agents alone, by its version.
+      nodeAgents: { namespace: "alasio", selector: `app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent,app.kubernetes.io/version=${VERSION}`, port: 8484 },
       // Where bound pods' bayma exports its telemetry: the receiver's Service.
       receiver: { host: "alasio-receiver.alasio.svc.cluster.local", port: 4318 },
       // No folder workspaces, of no host profile.

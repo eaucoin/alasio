@@ -665,6 +665,20 @@ if (inShard("upgrade")) {
       upgraded = Date.now();
     });
 
+    // No restore spans the two releases' APIs: the release before's sandbox gateway was stopped before the upgrade rolled the
+    // node agents, and the gateway it started asks this release's agents alone.
+    test(`the cut-over from ${PREVIOUS} stopped its sandbox gateway before the upgrade rolled the node agents, and the gateway after asks this release's agents alone`, async () => {
+      const stopped = Date.parse((await inCutOverRecord("cat gateway-stopped")).trim());
+      assert.ok(Number.isFinite(stopped), "the cut-over did not record the sandbox gateway stopped");
+      const made = (pod: V1Pod) => new Date(pod.metadata?.creationTimestamp ?? 0).getTime();
+      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=node-agent" });
+      const gateways = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `app.kubernetes.io/component=${GATEWAY_COMPONENT}` });
+      assert.ok(agents.length > 0 && gateways.length > 0, "no node agent or sandbox gateway runs");
+      for (const pod of [...agents, ...gateways]) assert.ok(made(pod) >= stopped, `${pod.metadata?.name} was made before the sandbox gateway stopped`);
+      const config = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", GATEWAY, NAMESPACE)))?.data?.["config.json"] ?? "{}") as { nodeAgents?: { selector?: string } };
+      assert.match(config.nodeAgents?.selector ?? "", /(^|,)app\.kubernetes\.io\/version=[^,]+(,|$)/u);
+    });
+
     // Upgraded to the default scale, as the release before's installation has none of its own, KEDA's. Then fixed at one, as the
     // suites after reach its pod as one.
     test(`upgraded from ${PREVIOUS} to the default scale, KEDA's; then fixed at one`, { timeout: 30 * 60_000 }, async () => {

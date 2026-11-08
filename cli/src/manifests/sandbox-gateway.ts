@@ -60,6 +60,7 @@ import {
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, NET_MODE_LABEL, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
+import { VERSION } from "../release.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
@@ -320,9 +321,11 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
       }
       : null,
     pools: { none: POOLS.none, full: POOLS.full },
+    // This release's node agents alone, by its version: those of another speak another API, as the release before's do as
+    // the agents roll, node by node, and no call of the gateway's goes to one.
     nodeAgents: {
       namespace: NAMESPACE,
-      selector: Object.entries(selectorLabels("node-agent")).map(([label, value]) => `${label}=${value}`).join(","),
+      selector: Object.entries({ ...selectorLabels("node-agent"), "app.kubernetes.io/version": VERSION }).map(([label, value]) => `${label}=${value}`).join(","),
       port: NODE_AGENT_PORT,
     },
     receiver: { host: `${RECEIVER}.${NAMESPACE}.svc.cluster.local`, port: config.telemetry.receiverPort },
