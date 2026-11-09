@@ -223,7 +223,7 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
 }
 
 /** The labels of the RuntimeClasses alasio makes, which tell them from others'. */
-const GVISOR_RUNTIME_CLASS_LABELS = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
+export const GVISOR_RUNTIME_CLASS_LABELS = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
 
 /** The annotation of a RuntimeClass of alasio's naming the gVisor release it runs, as `alasio up` reads what the cluster keeps (../kept-releases.ts). */
 export const GVISOR_RELEASE_ANNOTATION = "alasio.dev/gvisor-release";

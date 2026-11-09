@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -43,9 +43,9 @@ import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
-import { NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
+import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
+import { gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
+import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -88,6 +88,7 @@ import {
   paths,
   PREVIOUS,
   recordSession,
+  releasesSnapshotsName,
   ref,
   restartNodeContainer,
   RELEASE_AFTER_SECONDS,
@@ -379,6 +380,11 @@ if (inShard("upgrade")) {
     let counted: number;
     let spans: number;
     let upgraded: number;
+    /** The gVisor releases the cluster keeps, as its RuntimeClasses of alasio's say, sorted. */
+    const releasesKept = async () =>
+      [...new Set((await kube.list<V1RuntimeClass>("RuntimeClass", { labelSelector: selectorOf(GVISOR_RUNTIME_CLASS_LABELS) })).map(({ metadata }) => metadata?.annotations?.[GVISOR_RELEASE_ANNOTATION] ?? ""))].sort();
+    /** Those it kept on the release before, before the cut-over. */
+    let releasesBefore: readonly string[] = [];
     /** The users main's bot allows, as its Secret says them. */
     const allowed = async () => Buffer.from((await kube.get<V1Secret>(ref("Secret", `${RELEASE}-telegram`, NAMESPACE)))?.data?.["allowedUserIds"] ?? "", "base64").toString("utf8");
     let allowedBefore: string;
@@ -610,6 +616,7 @@ if (inShard("upgrade")) {
     // A branch environment another release made does not run on what an upgrade changes,
     // so the cut-over refuses while one exists, as its first checks find it.
     test(`on ${PREVIOUS}: a branch environment, which the cut-over refuses to go past, before it changes anything, until it is deleted`, { timeout: 60 * 60_000 }, async () => {
+      releasesBefore = await releasesKept();
       await createBranch(branchTelegram?.base, {});
       const applied = await alasioApplied();
       const refused = await cutOver();
@@ -665,18 +672,29 @@ if (inShard("upgrade")) {
       upgraded = Date.now();
     });
 
-    // No restore spans the two releases' APIs: the release before's sandbox gateway was stopped before the upgrade rolled the
-    // node agents, and the gateway it started restores through this release's agents alone, asking every release's the rest.
-    test(`the cut-over from ${PREVIOUS} stopped its sandbox gateway before the upgrade rolled the node agents, and the gateway after restores through this release's agents alone`, async () => {
-      const stopped = Date.parse((await inCutOverRecord("cat gateway-stopped")).trim());
-      assert.ok(Number.isFinite(stopped), "the cut-over did not record the sandbox gateway stopped");
-      const made = (pod: V1Pod) => new Date(pod.metadata?.creationTimestamp ?? 0).getTime();
-      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=node-agent" });
-      const gateways = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `app.kubernetes.io/component=${GATEWAY_COMPONENT}` });
-      assert.ok(agents.length > 0 && gateways.length > 0, "no node agent or sandbox gateway runs");
-      for (const pod of [...agents, ...gateways]) assert.ok(made(pod) >= stopped, `${pod.metadata?.name} was made before the sandbox gateway stopped`);
+    // The upgrade restarted the cluster for the gVisor releases this release pins, the release before's sandbox gateway running
+    // throughout, as it restores through its own release's node agents alone and counts the others' unanswered: so the upgrade
+    // read of it which releases the snapshots name, and the conversations' harnesses the restart waited for were released by
+    // it. A release the release before kept that this one does not pin is kept on while a snapshot names it, as the shard's,
+    // taken on the release before under its current release, do; every other is removed.
+    test(`the cut-over from ${PREVIOUS} keeps the gVisor releases this release pins and those a snapshot names, the upgrade itself removing, with its RuntimeClass, every other the release before kept; and the gateway after restores through this release's agents alone`, async () => {
+      const said = await inCutOverRecord("cat upgrade.log");
+      assert.doesNotMatch(said, /what the snapshots name could not be read|stayed bound for/u, said);
+      const pinned = gvisorReleases(NODE_PINS);
+      const named = await releasesSnapshotsName();
+      assert.ok(named, "the sandbox gateway did not say which releases the snapshots name");
+      const expected = [...new Set([...pinned, ...releasesBefore.filter((release) => named.has(release))])].sort();
+      assert.deepEqual(await releasesKept(), expected, `the snapshots name ${[...named].join(", ")}`);
+      const removed = releasesBefore.filter((release) => !expected.includes(release));
+      assert.ok(removed.length > 0, `the upgrade removed none of ${releasesBefore.join(", ")}, the releases kept before it`);
+      for (const release of removed) {
+        assert.ok(said.includes(`stop the sandboxes of gVisor ${release}, which alasio no longer keeps`), `the upgrade did not remove gVisor ${release}: ${said}`);
+        assert.ok(!existsSync(gvisorDirectory(release)), `gVisor ${release} is installed still`);
+      }
       const config = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", GATEWAY, NAMESPACE)))?.data?.["config.json"] ?? "{}") as { nodeAgents?: { selector?: string; release?: string } };
       assert.doesNotMatch(config.nodeAgents?.selector ?? "", /app\.kubernetes\.io\/version/u);
+      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=node-agent" });
+      assert.ok(agents.length > 0, "no node agent runs");
       for (const pod of agents) assert.equal(pod.metadata?.labels?.["app.kubernetes.io/version"], config.nodeAgents?.release, `${pod.metadata?.name} is not of the gateway's release`);
     });
 
@@ -758,7 +776,7 @@ describe("alasio's command line, on the alasio it installed", () => {
     if (TARGET === "host") {
       assert.match(
         said,
-        /^k3s v\S+ on this machine, with gVisor \S+( and \S+)?, stargz-snapshotter v\S+:\n {2}service k3s: active, enabled\n {2}service stargz-snapshotter, which k3s pulls images through: active\n {2}node \S+: ready\n/u,
+        /^k3s v\S+ on this machine, with gVisor \S+( and \S+)*, stargz-snapshotter v\S+:\n {2}service k3s: active, enabled\n {2}service stargz-snapshotter, which k3s pulls images through: active\n {2}node \S+: ready\n/u,
       );
     } else {
       assert.match(said, new RegExp(`^cluster ${CLUSTER}, in Docker `, "u"));

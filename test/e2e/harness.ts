@@ -63,6 +63,7 @@ import { type Duration, Effect, Stream } from "effect";
 
 import { cpuMillis, cpuText } from "../../cli/src/capacity.ts";
 import { subnetAddress } from "../../cli/src/cluster/docker.ts";
+import { snapshotReleases } from "../../cli/src/kept-releases.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { GATEWAY_COMPONENT as COLLECTOR_COMPONENT } from "../../cli/src/manifests/collector.ts";
@@ -344,6 +345,10 @@ const kubeApi = (): KubeApi["Service"] => {
   if (!api) throw new Error("the end-to-end run has no cluster yet");
   return api;
 };
+
+/** The gVisor releases the snapshots name, of every workspace, as the sandbox gateway says, as the command line asks it (../../cli/src/kept-releases.ts); null where it cannot be read. */
+export const releasesSnapshotsName = (): Promise<ReadonlySet<string> | null> =>
+  Effect.runPromise(Effect.provideService(snapshotReleases, KubeApi, kubeApi())).then((named) => (named === null ? null : new Set(named.keys())));
 
 /** The reference of the object of `kindName` named `name`, in `namespace` unless it is cluster-scoped. */
 export const ref = (kindName: KindName, name: string, namespace?: string): ObjectRef => ({ ...kind(kindName), namespace, name });
@@ -699,7 +704,7 @@ async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly 
  * previous release, its own images, which its package pins, but for alasio's, the stand-in
  * built on it, and the settings it has, as its alasio init writes them. A setting the
  * previous release does not have is given to this checkout's alone, as that release refuses
- * a configuration with a setting it does not know: 10.0.9 has every setting this checkout
+ * a configuration with a setting it does not know: 10.0.10 has every setting this checkout
  * has, so far.
  */
 function installation(of: "previous" | "release"): Record<string, unknown> {
