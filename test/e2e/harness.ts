@@ -63,7 +63,7 @@ import { type Duration, Effect, Stream } from "effect";
 
 import { cpuMillis, cpuText } from "../../cli/src/capacity.ts";
 import { subnetAddress } from "../../cli/src/cluster/docker.ts";
-import { snapshotReleases } from "../../cli/src/kept-releases.ts";
+import { releasesInUse, snapshotReleases } from "../../cli/src/kept-releases.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { GATEWAY_COMPONENT as COLLECTOR_COMPONENT } from "../../cli/src/manifests/collector.ts";
@@ -349,6 +349,10 @@ const kubeApi = (): KubeApi["Service"] => {
 /** The gVisor releases the snapshots name, of every workspace, as the sandbox gateway says, as the command line asks it (../../cli/src/kept-releases.ts); null where it cannot be read. */
 export const releasesSnapshotsName = (): Promise<ReadonlySet<string> | null> =>
   Effect.runPromise(Effect.provideService(snapshotReleases, KubeApi, kubeApi())).then((named) => (named === null ? null : new Set(named.keys())));
+
+/** The gVisor releases the cluster's pods may run, as the command line reads them (../../cli/src/kept-releases.ts), each with those pods; null where they cannot be told. */
+export const releasesPodsRun = (): Promise<ReadonlyMap<string, readonly string[]> | null> =>
+  Effect.runPromise(Effect.provideService(releasesInUse, KubeApi, kubeApi())).then((runs) => runs?.pods ?? null);
 
 /** The reference of the object of `kindName` named `name`, in `namespace` unless it is cluster-scoped. */
 export const ref = (kindName: KindName, name: string, namespace?: string): ObjectRef => ({ ...kind(kindName), namespace, name });

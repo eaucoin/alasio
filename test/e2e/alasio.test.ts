@@ -88,6 +88,7 @@ import {
   paths,
   PREVIOUS,
   recordSession,
+  releasesPodsRun,
   releasesSnapshotsName,
   ref,
   restartNodeContainer,
@@ -400,6 +401,21 @@ if (inShard("upgrade")) {
     /** A session of main's released into its snapshot on the release before, its record of it that release's, and its REPL there. */
     const RELEASED_SESSION = "fs-e2eupgradereleased";
     let releasedRepl: string;
+    /**
+     * A session of main's restored, on the release before, from a snapshot taken under a gVisor release this one no longer pins
+     * nor any snapshot names, and left running: the release, its RuntimeClass, the session's pod as it ran, and the session's
+     * REPLs, one restored and one set live after the restore, which no snapshot holds.
+     */
+    const RUNNING_SESSION = "fs-e2eupgraderunning";
+    let running: { readonly release: string; readonly pod: string; readonly restored: ReplSet; readonly live: ReplSet };
+    /** The install configuration in the config file, `change`d, as alasio up applies it, by the alasio the run runs then. */
+    const configured = async (change: (sessions: { runtimeClassName?: string; snapshots: Record<string, string> }) => void) => {
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      change(config.install.sessions);
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+    };
     const scenarios: readonly Scenario[] = [
       {
         seeds: "a session released into its snapshot, its REPL holding a value, its record of its release written as the release before writes one",
@@ -611,9 +627,71 @@ if (inShard("upgrade")) {
           await tg.waitFor((call) => answered(call));
         },
       },
+      {
+        // Last, as it gives the sessions a release of their own for a while, and then keeps them bound.
+        seeds: "a session restored from its snapshot, taken under a gVisor release this release no longer pins, and running on unsaved, a REPL set live after the restore, no snapshot naming that release",
+        seed: async () => {
+          // The release before's releases, but its current one, which its RuntimeClass gvisor runs; of those, one this release does not pin.
+          const current = (await kube.get<V1RuntimeClass>(ref("RuntimeClass", "gvisor")))?.metadata?.annotations?.[GVISOR_RELEASE_ANNOTATION];
+          const pinned = gvisorReleases(NODE_PINS);
+          const release = (await releasesKept()).find((kept) => kept !== current && !pinned.includes(kept)) ?? assert.fail(`${PREVIOUS} keeps no release beside ${current} that this release does not pin`);
+          // Its sessions run under that release, saved live only after hours: a snapshot of the session taken under it.
+          await configured((sessions) => {
+            sessions.runtimeClassName = gvisorRuntimeClass(release);
+            sessions.snapshots["liveEvery"] = "4h";
+          });
+          const token = await mainToken(RUNNING_SESSION);
+          await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+          await bindSession(RUNNING_SESSION);
+          assert.equal((await sessionPod(RUNNING_SESSION)).spec?.runtimeClassName, gvisorRuntimeClass(release));
+          const restored = await repl.set(RUNNING_SESSION, `restored under ${release}`);
+          await untilReleased(RUNNING_SESSION, Date.now());
+          assert.ok((await releasesSnapshotsName())?.has(release), `the snapshot of ${RUNNING_SESSION} does not name ${release}`);
+          // Restored under it, and a REPL set live, which no snapshot holds.
+          const bound = await bindSession(RUNNING_SESSION);
+          assert.match(bound.name, /-restore-/u);
+          const pod = await sessionPod(RUNNING_SESSION);
+          assert.equal(pod.spec?.runtimeClassName, gvisorRuntimeClass(release));
+          const live = await repl.set(RUNNING_SESSION, `set live under ${release}`);
+          // Its sessions back on the current release, the session never released again as idle: held by an exec meanwhile.
+          const went = "/workspace/upgrade/went";
+          await repl.hold(RUNNING_SESSION, went);
+          await configured((sessions) => {
+            delete sessions.runtimeClassName;
+            sessions.snapshots["releaseAfter"] = "4h";
+          });
+          await inSession(RUNNING_SESSION, `const f=require("fs");f.mkdirSync(require("path").dirname(${JSON.stringify(went)}),{recursive:true});f.writeFileSync(${JSON.stringify(went)},"")`);
+          // Its snapshot spent, the record of its release cleared: nothing names the release, which its pod runs.
+          const named = await releasesSnapshotsName();
+          assert.ok(named && !named.has(release), `a snapshot names ${release}: ${[...(named ?? [])].join(", ")}`);
+          assert.deepEqual((await releasesPodsRun())?.get(release), [`${SESSIONS}/${bound.name}`]);
+          running = { release, pod: bound.name, restored, live };
+        },
+        keeps: "the session restored and running on under a release this one no longer pins, never stopped unsaved: running on, its REPLs live, the one set after the restore among them, or saved whole as the upgrade's k3s ended its pod; the release kept as a pod ran it, which the upgrade said",
+        check: async () => {
+          if (await boundPodOf(RUNNING_SESSION)) {
+            // Its pod ran on through the upgrade.
+            for (const [set, value] of [[running.restored, `restored under ${running.release}`], [running.live, `set live under ${running.release}`]] as const) {
+              const seen = await repl.read(RUNNING_SESSION, set.sessionId);
+              assert.equal(seen.live, value, JSON.stringify(seen));
+              assert.doesNotMatch(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+            }
+          } else {
+            // Its pod ended by the k3s the upgrade installed, the gateway saved its sandbox first, under the release, as it
+            // could not have one the upgrade stopped with its release: its snapshot is of after the seed, which left none.
+            const saved = await snapshotOf(RUNNING_SESSION);
+            assert.equal(saved?.release, running.release, JSON.stringify(saved));
+          }
+          assert.ok((await releasesKept()).includes(running.release), `gVisor ${running.release} is not kept`);
+          assert.ok(existsSync(gvisorDirectory(running.release)), `gVisor ${running.release} is not installed`);
+          const said = await inCutOverRecord("cat upgrade.log");
+          assert.ok(said.includes(`keeping gVisor ${running.release}, which no snapshot names, as pods may run it: ${SESSIONS}/${running.pod}`), said);
+          assert.ok(!said.includes(`stop the sandboxes of gVisor ${running.release}`), said);
+        },
+      },
     ];
 
-    for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
+    for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, { timeout: 60 * 60_000 }, seed);
 
     // A branch environment another release made does not run on what an upgrade changes,
     // so the cut-over refuses while one exists, as its first checks find it.
@@ -678,18 +756,19 @@ if (inShard("upgrade")) {
     // throughout, as it restores through its own release's node agents alone and counts the others' unanswered: so the upgrade
     // read of it which releases the snapshots name, and the conversations' harnesses the restart waited for were released by
     // it. A release the release before kept that this one does not pin is kept on while a snapshot names it, as the shard's,
-    // taken on the release before under its current release, do; every other is removed.
-    test(`the cut-over from ${PREVIOUS} keeps the gVisor releases this release pins and those a snapshot names, the upgrade itself removing, with its RuntimeClass, every other the release before kept; and the gateway after restores through this release's agents alone`, async () => {
+    // taken on the release before under its current release, do, or while a pod runs it, as the session restored and left
+    // running does; every other is removed, as a later up does once that session is gone.
+    test(`the cut-over from ${PREVIOUS} keeps the gVisor releases this release pins, those a snapshot names and those a pod runs, the upgrade itself removing, with its RuntimeClass, every other the release before kept; and the gateway after restores through this release's agents alone`, async () => {
       const said = await inCutOverRecord("cat upgrade.log");
-      assert.doesNotMatch(said, /what the snapshots name could not be read|stayed bound for/u, said);
+      assert.doesNotMatch(said, /what the snapshots name could not be read|which gVisor releases the cluster's pods run could not be read|cannot be told|stayed bound for/u, said);
       const pinned = gvisorReleases(NODE_PINS);
       const named = await releasesSnapshotsName();
       assert.ok(named, "the sandbox gateway did not say which releases the snapshots name");
-      const expected = [...new Set([...pinned, ...releasesBefore.filter((release) => named.has(release))])].sort();
-      assert.deepEqual(await releasesKept(), expected, `the snapshots name ${[...named].join(", ")}`);
-      const removed = releasesBefore.filter((release) => !expected.includes(release));
-      assert.ok(removed.length > 0, `the upgrade removed none of ${releasesBefore.join(", ")}, the releases kept before it`);
-      for (const release of removed) {
+      // Those it kept as pods ran them, or gvisor the pods made next, as it said.
+      const used = new Set([...said.matchAll(/keeping gVisor (\S+), which no snapshot names, as (?:pods may run it|the RuntimeClass gvisor runs the pods made next with it)/gu)].map(([, release]) => release));
+      const expected = [...new Set([...pinned, ...releasesBefore.filter((release) => named.has(release) || used.has(release))])].sort();
+      assert.deepEqual(await releasesKept(), expected, `the snapshots name ${[...named].join(", ")}; pods ran ${[...used].join(", ")}`);
+      for (const release of releasesBefore.filter((release) => !expected.includes(release))) {
         assert.ok(said.includes(`stop the sandboxes of gVisor ${release}, which alasio no longer keeps`), `the upgrade did not remove gVisor ${release}: ${said}`);
         assert.ok(!existsSync(gvisorDirectory(release)), `gVisor ${release} is installed still`);
       }
@@ -768,6 +847,31 @@ if (inShard("upgrade")) {
       const instance = (await kube.list<V1Pod>("Pod", { namespace: HOST_NAMESPACE, labelSelector: "alasio.dev/pool=folder" }))
         .find((pod) => pod.metadata?.annotations?.["alasio.dev/binding-key"] === folderInstance.key);
       assert.match(instance?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "", new RegExp(`@${OTHER_BAYMA.digest}$`, "u"));
+    });
+
+    // The release the session restored before the upgrade runs, kept as it does, is removed by the next up once nothing runs it
+    // and no snapshot names it: the session released, as idle sessions are again, and its workspace deleted, its snapshots
+    // forgotten with it.
+    test("upgraded: the gVisor release kept as a pod ran it is removed, with its RuntimeClass, by the next up once none runs it and no snapshot names it", { timeout: 60 * 60_000 }, async () => {
+      await configured((sessions) => {
+        sessions.snapshots["releaseAfter"] = `${RELEASE_AFTER_SECONDS}s`;
+        delete sessions.snapshots["liveEvery"];
+      });
+      // Kept by that up too, as the session runs it still.
+      assert.ok((await releasesKept()).includes(running.release), `gVisor ${running.release} is not kept`);
+      await untilReleased(RUNNING_SESSION, Date.now());
+      assert.equal((await gatewayCall(await mainToken(RUNNING_SESSION), "DELETE", "/workspace")).status, 204);
+      assert.ok(!(await releasesSnapshotsName())?.has(running.release), `a snapshot names ${running.release}`);
+      // Its pod gone, and every pod's release told, as pods made before the upgrade made gvisor anew have ended.
+      await until(`no pod running gVisor ${running.release}, and every pod's release told`, async () => {
+        const used = await releasesPodsRun();
+        return used !== null && !used.has(running.release) ? true : undefined;
+      }, 600_000);
+      const up = await alasio("up", "--timeout", "20m");
+      assert.equal(up.code, 0, `${up.stdout}${up.stderr}`);
+      assert.ok(`${up.stdout}${up.stderr}`.includes(`stop the sandboxes of gVisor ${running.release}, which alasio no longer keeps`), `${up.stdout}${up.stderr}`);
+      assert.ok(!(await releasesKept()).includes(running.release), `gVisor ${running.release} is kept still`);
+      assert.ok(!existsSync(gvisorDirectory(running.release)), `gVisor ${running.release} is installed still`);
     });
   });
 }

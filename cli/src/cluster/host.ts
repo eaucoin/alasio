@@ -24,12 +24,13 @@ import { KubeConfig, type V1ConfigMap, type V1Node, type V1Pod, type V1RuntimeCl
 import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schema } from "effect";
 
 import type { Registries } from "../config.ts";
-import { keptReleases, snapshotReleases } from "../kept-releases.ts";
+import { keptReleases, releasesInUse, snapshotReleases } from "../kept-releases.ts";
 import { kind, KubeApi, type KubeApiError, type KubeconfigUnusable } from "../kube/api.ts";
 import {
   awaitReady,
   clusterKubeconfig,
   type ClusterNotReady,
+  GVISOR_RUNTIME_CLASS,
   gvisorRuntimeClasses,
   type HostAlias,
   nodeHostsWith,
@@ -278,7 +279,10 @@ export class HostCluster extends Context.Service<HostCluster, {
    * Makes this machine a node, or what of it is not as it should be, as root, and starts
    * it; writes a kubeconfig that reaches it to `kubeconfig` (0600) when there is a new one
    * to; waits until the node is ready; then gives CoreDNS the host aliases and applies
-   * gVisor's RuntimeClasses, deleting those of releases no longer kept. Of a k3s that runs,
+   * gVisor's RuntimeClasses, deleting those of releases no longer kept: those it pins, and
+   * every other installed that a snapshot names, a pod may run, or `gvisor` runs the pods
+   * made next with, as read as it begins and again just before root removes one, are kept
+   * (../kept-releases.ts), the others removed, their sandboxes stopped. Of a k3s that runs,
    * which it would install anew or restart, stopping the cluster's pods, it runs `beforeRestart`
    * first, on the cluster's API, as an upgrade waits on it for what those pods hold.
    */
@@ -394,20 +398,40 @@ const makeHostCluster = Effect.fnUntraced(function*({
     // Made by the operator, whose it stays, though k3s makes the volumes in it as root.
     yield* fs.makeDirectory(storagePath, { recursive: true });
     const copy = (yield* fs.exists(kubeconfig)) ? yield* fs.readFileString(kubeconfig) : null;
-    // What the snapshots name, of a cluster that runs, read before anything of it changes.
+    // What the snapshots name, and what the cluster may run, of a cluster that runs, read before anything of it changes, and
+    // again just before root removes a release (below); neither known of one that does not, whose sandboxes may run on
+    // without k3s.
     const installedReleases = stamp?.gvisor ?? [];
-    const named = installedReleases.length === 0
-      ? new Map<string, readonly string[]>()
-      : unit.active === "active" && copy !== null
-      ? yield* snapshotReleases.pipe(Effect.provide(KubeApi.layer({ path: kubeconfig })), Effect.catch(() => Effect.succeed(null)))
-      : null;
-    const kept = keptReleases(gvisorReleases(pins), installedReleases, named);
-    const config = configOf(kept);
-    const files = nodeFiles(config);
-    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall: yield* activeFirewall, kept });
+    const read = <A>(what: Effect.Effect<A | null, never, KubeApi>, none: A) =>
+      installedReleases.length === 0
+        ? Effect.succeed(none)
+        : unit.active === "active" && copy !== null
+        ? what.pipe(Effect.provide(KubeApi.layer({ path: kubeconfig })), Effect.catch(() => Effect.succeed(null)))
+        : Effect.succeed(null);
+    const pinned = gvisorReleases(pins);
+    /** The releases kept now, as keptReleases says, each kept only as the cluster may run it said so. */
+    const keptNow = Effect.gen(function*() {
+      const named = yield* read(snapshotReleases, new Map<string, readonly string[]>());
+      const runs = yield* read(releasesInUse, { pods: new Map<string, readonly string[]>(), current: null });
+      const now = keptReleases(pinned, installedReleases, named, runs);
+      for (const release of now.filter((release) => !pinned.includes(release) && named !== null && !named.has(release))) {
+        const pods = runs?.pods.get(release);
+        if (pods) yield* Effect.logInfo(`keeping gVisor ${release}, which no snapshot names, as pods may run it: ${pods.join(", ")}`);
+        else if (runs?.current === release) yield* Effect.logInfo(`keeping gVisor ${release}, which no snapshot names, as the RuntimeClass ${GVISOR_RUNTIME_CLASS} runs the pods made next with it, until this up makes it anew`);
+      }
+      return now;
+    });
+    const kept = yield* keptNow;
+    const firewall = yield* activeFirewall;
+    const planOf = (releases: readonly string[]) => {
+      const config = configOf(releases);
+      return { config, plan: planNode(pins, { stamp, config: filesDigest(nodeFiles(config)), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall, kept: releases }) };
+    };
+    const first = planOf(kept);
     const raise = yield* onMachine(inotifyStep);
-    const started = plan.k3s === null && !plan.renew ? 0 : Date.now();
-    const outcome = yield* Effect.scoped(Effect.gen(function*() {
+    const started = first.plan.k3s === null && !first.plan.renew ? 0 : Date.now();
+    const { outcome, releases } = yield* Effect.scoped(Effect.gen(function*() {
+      const { plan } = first;
       // Downloaded as the operator, and read by root, which checks them again.
       const directory = plan.gvisor.install.length > 0 || plan.stargz || plan.k3s === "install" ? yield* fs.makeTempDirectoryScoped({ prefix: "alasio-node-" }) : "";
       const from = downloads(pins);
@@ -418,22 +442,27 @@ const makeHostCluster = Effect.fnUntraced(function*({
       const stargz = plan.stargz ? yield* fetched(directory, "stargz-snapshotter.tar.gz", from.stargz) : null;
       const binary = plan.k3s === "install" ? yield* fetched(directory, "k3s", from.k3s) : null;
       const script = plan.k3s === "install" ? yield* fetched(directory, "install.sh", from.installScript) : null;
-      const steps: RootStep[] = [
-        ...(raise ? [raise] : []),
-        ...(plan.firewall ? [OpenFirewall.make({ firewall: plan.firewall, networks: CLUSTER_NETWORKS })] : []),
-        ...(plan.configure ? [ConfigureNode.make({ config })] : []),
-        ...installs,
-        ...plan.gvisor.remove.map((release) => RemoveGvisor.make({ release })),
-        ...(stargz ? [InstallStargz.make({ version: pins.stargz.version, ...(stamp?.stargz ? { previous: stamp.stargz } : {}), archive: stargz })] : []),
-        ...(binary && script ? [InstallK3s.make({ version: pins.k3s.version, ...(stamp?.k3s ? { previous: stamp.k3s } : {}), role: config.role, binary, script })] : []),
-        ...(plan.k3s === "restart" || plan.k3s === "start" ? [StartK3s.make({ restart: plan.k3s === "restart" })] : []),
-        ...(plan.kubeconfig ? [ReadKubeconfig.make({ renew: plan.renew })] : []),
-      ];
       // Its pods stopped with k3s, once all it needs is downloaded, so as little as can be starts on them meanwhile.
       if (beforeRestart && unit.active === "active" && copy !== null && (plan.k3s === "install" || plan.k3s === "restart")) {
         yield* Effect.provide(beforeRestart, KubeApi.layer({ path: kubeconfig }));
       }
-      return yield* root.run(steps);
+      // Read again just before a release is removed, as the downloads and the wait may have taken long: a pod made
+      // meanwhile, under the RuntimeClass gvisor, which runs the current release until this up makes it anew, or a
+      // snapshot taken meanwhile, keeps its release; none planned to be kept is removed for a read that cannot tell.
+      const releases = plan.gvisor.remove.length === 0 ? kept : [...new Set([...kept, ...(yield* keptNow)])];
+      const { config, plan: final } = releases.length === kept.length ? first : planOf(releases);
+      const steps: RootStep[] = [
+        ...(raise ? [raise] : []),
+        ...(final.firewall ? [OpenFirewall.make({ firewall: final.firewall, networks: CLUSTER_NETWORKS })] : []),
+        ...(final.configure ? [ConfigureNode.make({ config })] : []),
+        ...installs,
+        ...final.gvisor.remove.map((release) => RemoveGvisor.make({ release })),
+        ...(stargz ? [InstallStargz.make({ version: pins.stargz.version, ...(stamp?.stargz ? { previous: stamp.stargz } : {}), archive: stargz })] : []),
+        ...(binary && script ? [InstallK3s.make({ version: pins.k3s.version, ...(stamp?.k3s ? { previous: stamp.k3s } : {}), role: config.role, binary, script })] : []),
+        ...(final.k3s === "restart" || final.k3s === "start" ? [StartK3s.make({ restart: final.k3s === "restart" })] : []),
+        ...(final.kubeconfig ? [ReadKubeconfig.make({ renew: final.renew })] : []),
+      ];
+      return { outcome: yield* root.run(steps), releases };
     }));
     if (outcome.kubeconfig) {
       // k3s's own wrote it, a kubeconfig with a cluster and a user.
@@ -445,7 +474,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
       // Started anew, its kubelet takes its pods back after it reports itself ready.
       if (started > 0) yield* waitFor("its node's pods", podsServed(nodes));
       yield* waitFor("CoreDNS's NodeHosts", applyHostAliases(nodes));
-      yield* waitFor("gVisor's RuntimeClasses", applyRuntimeClasses(kept));
+      yield* waitFor("gVisor's RuntimeClasses", applyRuntimeClasses(releases));
     }).pipe(Effect.provide(KubeApi.layer({ path: kubeconfig })));
     yield* Effect.logInfo(`${CLUSTER} is up`);
   });

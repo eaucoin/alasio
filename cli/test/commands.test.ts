@@ -1661,8 +1661,30 @@ test("upgrade installs this version's k3s, its gVisor release beside the one bef
   succeeded(unread);
   assert.deepEqual(rootSteps(unread), []);
   assert.ok(unread.progress.some((line) => line.startsWith("what the snapshots name could not be read of the sandbox gateway, so every gVisor release installed is kept")), unread.progress.join("\n"));
-  // Named by none, it is removed.
+  // Named by none, but run by a pod, as a session restored from a snapshot it took and not saved since: kept, as removing it
+  // would stop the pod's sandbox, and its session's live state with it, and said so.
   await gatewayReleases(t, kube, () => ({ releases: {} }));
+  const restored = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "fs-abc123-restore-1", namespace: "alasio-sessions", creationTimestamp: new Date().toISOString() },
+    spec: { runtimeClassName: "gvisor-20990101-0", containers: [] },
+    status: { phase: "Running" },
+  };
+  kube.put("pods", restored);
+  const keptForPod = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(keptForPod);
+  assert.deepEqual(rootSteps(keptForPod), []);
+  assert.ok(keptForPod.progress.includes("keeping gVisor 20990101.0, which no snapshot names, as pods may run it: alasio-sessions/fs-abc123-restore-1"), keptForPod.progress.join("\n"));
+  assert.ok((await runAlasio(["status"], { env, machine, releases: latest })).printed.includes("  gVisor 20990101.0, kept: 0 snapshots name it, and 1 pod runs it"));
+  // A pod whose release cannot be told, its RuntimeClass made after it: every release kept, and it said so.
+  kube.put("pods", { ...restored, metadata: { ...restored.metadata, name: "older", creationTimestamp: "2000-01-01T00:00:00Z" }, spec: { ...restored.spec, runtimeClassName: "gvisor" } });
+  const untold = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(untold);
+  assert.deepEqual(rootSteps(untold), []);
+  assert.ok(untold.progress.includes("the gVisor release of alasio-sessions/older cannot be told, so every gVisor release installed is kept"), untold.progress.join("\n"));
+  // Named by none, and run by none, the pods ended, it is removed.
+  for (const name of ["fs-abc123-restore-1", "older"]) kube.objects.delete(`/api/v1/namespaces/alasio-sessions/pods/${name}`);
   const pruned = await runAlasio(["upgrade"], { env, machine, releases: latest });
   succeeded(pruned);
   assert.deepEqual(rootSteps(pruned), [
@@ -1674,6 +1696,46 @@ test("upgrade installs this version's k3s, its gVisor release beside the one bef
   assert.equal(machine.has("/usr/local/lib/alasio/gvisor/20990101.0"), false);
   assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-21000101-0 runsc-21000101-0"]);
   assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: latest })), []);
+});
+
+test("an upgrade keeps, as it removes the releases it no longer keeps, the one gvisor runs new pods with until it makes it anew, and one a pod made since it first looked runs, read again just before; a later one removes them once neither holds", async (t) => {
+  const { env, kube, machine } = await onHost(t);
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"], stargz: "v10.0.0" });
+  succeeded(await runAlasio(["upgrade"], { env, machine, releases: newer }));
+  // gvisor runs 21000101.0, which the next upgrade pins no more, nor 20990101.0; no snapshot names either, and no pod runs
+  // either as it first looks. As it looks again, a pod made meanwhile, as a restore's, runs 20990101.0.
+  let asked = 0;
+  const late = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "fs-late-restore-1", namespace: "alasio-sessions", creationTimestamp: new Date(Date.now() + 2_000).toISOString() },
+    spec: { runtimeClassName: "gvisor-20990101-0", containers: [] },
+    status: { phase: "Running" },
+  };
+  await gatewayReleases(t, kube, () => {
+    if ((asked += 1) === 2) kube.put("pods", late);
+    return { releases: {} };
+  });
+  const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21010101.0"], stargz: "v10.0.0" });
+  const held = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(held);
+  assert.equal(asked, 2);
+  assert.deepEqual(rootSteps(held), [
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtimes runsc-21010101-0 and runsc-21000101-0 and runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
+    "install gVisor 21010101.0 in /usr/local/lib/alasio/gvisor/21010101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "restart the service k3s, with its new configuration",
+    "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
+  ]);
+  assert.ok(held.progress.includes("keeping gVisor 21000101.0, which no snapshot names, as the RuntimeClass gvisor runs the pods made next with it, until this up makes it anew"), held.progress.join("\n"));
+  assert.ok(held.progress.includes("keeping gVisor 20990101.0, which no snapshot names, as pods may run it: alasio-sessions/fs-late-restore-1"), held.progress.join("\n"));
+  for (const release of ["21000101.0", "20990101.0"]) assert.equal(machine.read(`/usr/local/lib/alasio/gvisor/${release}/runsc`), `runsc ${release}\n`);
+  // gvisor made anew, for 21010101.0, and the pod gone: both removed.
+  kube.objects.delete("/api/v1/namespaces/alasio-sessions/pods/fs-late-restore-1");
+  const pruned = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(pruned);
+  for (const release of ["21000101.0", "20990101.0"]) {
+    assert.ok(rootSteps(pruned).includes(`stop the sandboxes of gVisor ${release}, which alasio no longer keeps, and remove /usr/local/lib/alasio/gvisor/${release}`), rootSteps(pruned).join("\n"));
+  }
 });
 
 test("an upgrade that restarts k3s refuses while a conversation's harness stays bound on it for its timeout, changing nothing of the machine, and goes on at once with --now", async (t) => {

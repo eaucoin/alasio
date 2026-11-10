@@ -4,6 +4,7 @@
  * which waits for the node reported ready since k3s started anew, and its kubelet serving
  * its pods, and which, when root's work failed halfway, does the rest of it the next time.
  */
+import type { V1Pod, V1RuntimeClass } from "@kubernetes/client-node";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,8 +17,9 @@ import { Effect, Layer, Logger } from "effect";
 import { BINDING_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../src/binder/names.ts";
 import { untilHarnessesReleased } from "../src/bound-harnesses.ts";
 import { HostCluster, kubeconfigState, planNode } from "../src/cluster/host.ts";
+import { GVISOR_RELEASE_ANNOTATION } from "../src/cluster/k3s.ts";
 import type { KubeApi } from "../src/kube/api.ts";
-import { describeKept, keptReleases, type SnapshotReleases, snapshotReleasesFrom } from "../src/kept-releases.ts";
+import { describeKept, keptReleases, releasesInUseOf, type SnapshotReleases, snapshotReleasesFrom } from "../src/kept-releases.ts";
 import { Machine } from "../src/cluster/machine.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
@@ -28,6 +30,8 @@ import { fakeReleases } from "./support/fake-releases.ts";
 
 const INSTALLED = { k3s: NODE_PINS.k3s.version, gvisor: gvisorReleases(NODE_PINS), stargz: NODE_PINS.stargz.version, config: "digest" };
 const RUNNING = { loaded: true, active: "active", enabled: true };
+/** A cluster that runs nothing, as keptReleases reads it. */
+const NOTHING_RUNS = { pods: new Map<string, readonly string[]>(), current: null };
 
 test("planNode asks for nothing once all is as alasio installed it, and for what is not", () => {
   const plan = (changes: Partial<Parameters<typeof planNode>[1]>) =>
@@ -73,7 +77,7 @@ test("planNode installs a newly pinned gVisor release beside the one before it, 
       unit: RUNNING,
       kubeconfig: "current",
       firewall: null,
-      kept: keptReleases(releases, installed, named),
+      kept: keptReleases(releases, installed, named, NOTHING_RUNS),
     });
   assert.deepEqual(plan(["21000101.0", "20990101.0"], ["20990101.0"]).gvisor, { install: ["21000101.0"], remove: [] });
   assert.deepEqual(plan(["21000101.0", "20990101.0"], ["20990101.0", "21000101.0"]).gvisor, { install: [], remove: [] });
@@ -91,7 +95,7 @@ test("planNode, upgraded once where what the snapshots name is not known, keeps 
   const pins = fakeReleases({ gvisor: pinned }).pins;
   /** The plan against `gvisor` installed, its configuration that of the releases kept then, as up writes it, given what the snapshots name. */
   const plan = (gvisor: readonly string[], configured: readonly string[], named: SnapshotReleases | null) => {
-    const kept = keptReleases(pinned, gvisor, named);
+    const kept = keptReleases(pinned, gvisor, named, NOTHING_RUNS);
     return planNode(pins, { stamp: { k3s: pins.k3s.version, stargz: pins.stargz.version, gvisor: [...gvisor], config: configured.join(",") }, config: kept.join(","), unit: RUNNING, kubeconfig: "current", firewall: null, kept });
   };
   const none = { firewall: null, configure: false, gvisor: { install: [], remove: [] }, stargz: false, k3s: null, kubeconfig: false, renew: false };
@@ -103,21 +107,61 @@ test("planNode, upgraded once where what the snapshots name is not known, keeps 
   assert.deepEqual(plan(pinned, pinned, new Map()), none);
 });
 
-test("the releases kept are the pinned ones first, then those installed that a snapshot names, as the sandbox gateway says, and every one installed where it cannot be read", async () => {
+test("the releases kept are the pinned ones first, then those installed that a snapshot names, as the sandbox gateway says, or a pod may run, and every one installed where either cannot be read", async () => {
   const read = (asked: Effect.Effect<unknown, { readonly message: string }>) => Effect.runPromise(snapshotReleasesFrom(asked).pipe(Effect.provide(Logger.layer([]))));
   const named = await read(Effect.succeed({ releases: { "20990101.0": ["alasio-sessions/fs-a/s-1", "alasio-sessions/fs-c/s-2"], "21000101.0": ["alasio-branch-one-sessions/fs-d/s-3"] } }));
   assert.deepEqual(named, new Map([["20990101.0", ["alasio-sessions/fs-a/s-1", "alasio-sessions/fs-c/s-2"]], ["21000101.0", ["alasio-branch-one-sessions/fs-d/s-3"]]]));
   // The gateway not reached, refusing, or answering what is not what it says: unknown, every release installed kept.
   for (const unread of [Effect.fail({ message: "no pod of sandbox-gateway runs" }), Effect.succeed({ releases: { "20990101.0": "fs-a" } }), Effect.succeed("not json")]) assert.equal(await read(unread), null);
-  assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0", "21010101.0"], named), ["21010101.0", "20990101.0"]);
-  assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0"], null), ["21010101.0", "20980101.0", "20990101.0"]);
-  // As status says them: each kept, with the snapshots naming it, then those named and not kept.
-  assert.deepEqual(describeKept(["21010101.0", "20990101.0"], named), [
+  const used = new Map([["20970101.0", ["alasio-sessions/fs-e-restore-1"]]]);
+  const runs = { pods: used, current: null };
+  assert.deepEqual(keptReleases(["21010101.0"], ["20970101.0", "20980101.0", "20990101.0", "21010101.0"], named, NOTHING_RUNS), ["21010101.0", "20990101.0"]);
+  // A release a pod runs, which no snapshot names, as a session restored and not saved since runs the release that took its snapshot.
+  assert.deepEqual(keptReleases(["21010101.0"], ["20970101.0", "20980101.0", "20990101.0", "21010101.0"], named, runs), ["21010101.0", "20970101.0", "20990101.0"]);
+  // And the release gvisor runs the pods made next with, as before this up makes it anew.
+  assert.deepEqual(keptReleases(["21010101.0"], ["20970101.0", "20980101.0", "20990101.0", "21010101.0"], named, { ...runs, current: "20980101.0" }), ["21010101.0", "20970101.0", "20980101.0", "20990101.0"]);
+  assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0"], null, runs), ["21010101.0", "20980101.0", "20990101.0"]);
+  assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0"], named, null), ["21010101.0", "20980101.0", "20990101.0"]);
+  // As status says them: each kept, with the snapshots naming it and the pods running it, then those named and not kept.
+  assert.deepEqual(describeKept(["21010101.0", "20970101.0", "20990101.0"], named, used), [
     "gVisor 21010101.0, kept, which new sessions run: 0 snapshots name it",
+    "gVisor 20970101.0, kept: 0 snapshots name it, and 1 pod runs it",
     "gVisor 20990101.0, kept: 2 snapshots name it",
     "gVisor 21000101.0, not kept: 1 snapshot names it, restored from bayma's checkpoints instead",
   ]);
-  assert.deepEqual(describeKept(["21010101.0"], null), ["gVisor 21010101.0, kept, which new sessions run: what snapshots name it is not seen"]);
+  assert.deepEqual(describeKept(["21010101.0"], null, null), ["gVisor 21010101.0, kept, which new sessions run: what snapshots name it is not seen"]);
+});
+
+test("the releases pods may run are those of the RuntimeClasses of alasio's they name, made in a second before them, of the pods not ended, and gvisor's, which the pods made next run; a pod whose class is gone, newer than it or of its second may run any", () => {
+  const at = (minute: number) => new Date(Date.UTC(2026, 10, 10, 12, minute));
+  const runtimeClass = (name: string, release: string | null, made: number): V1RuntimeClass => ({
+    metadata: { name, creationTimestamp: at(made), ...(release === null ? {} : { annotations: { [GVISOR_RELEASE_ANNOTATION]: release } }) },
+    handler: name,
+  });
+  const pod = (name: string, runtimeClassName: string | undefined, made: number, phase = "Running"): V1Pod => ({
+    metadata: { name, namespace: "alasio-sessions", creationTimestamp: at(made) },
+    spec: { containers: [], ...(runtimeClassName === undefined ? {} : { runtimeClassName }) },
+    status: { phase },
+  });
+  const classes = [runtimeClass("gvisor", "21010101.0", 10), runtimeClass("gvisor-21010101-0", "21010101.0", 10), runtimeClass("gvisor-20990101-0", "20990101.0", 0), runtimeClass("kata", null, 0)];
+  assert.deepEqual(releasesInUseOf(classes, [
+    pod("fresh", "gvisor", 11),
+    pod("restored", "gvisor-20990101-0", 5),
+    pod("pending", "gvisor-20990101-0", 6, "Pending"),
+    pod("ended", "gvisor-21010101-0", 12, "Succeeded"),
+    pod("failed", "gvisor-20990101-0", 12, "Failed"),
+    pod("runc", undefined, 1),
+    pod("kata", "kata", 1),
+  ]), { pods: new Map([["21010101.0", ["alasio-sessions/fresh"]], ["20990101.0", ["alasio-sessions/restored", "alasio-sessions/pending"]]]), untold: [], current: "21010101.0" });
+  // Made before its class was made anew, of another handler maybe, or within the same second, which the API server's times
+  // cannot order; its class gone, as of a release removed before.
+  assert.deepEqual(releasesInUseOf(classes, [pod("older", "gvisor", 9), pod("same", "gvisor", 10), pod("gone", "gvisor-20980101-0", 1)]), {
+    pods: new Map(),
+    untold: ["alasio-sessions/older", "alasio-sessions/same", "alasio-sessions/gone"],
+    current: "21010101.0",
+  });
+  // No gvisor yet, as before the first up applies it.
+  assert.equal(releasesInUseOf(classes.filter(({ metadata }) => metadata?.name !== "gvisor"), []).current, null);
 });
 
 /** A kubeconfig whose client certificate is `certificate`. */

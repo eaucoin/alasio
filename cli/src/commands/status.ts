@@ -10,7 +10,7 @@ import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocal
 import { gvisorReleases, NODE_PINS, SERVICE, STARGZ_SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
 import { describeBaseline, recordedBaseline, standingOf, surveyCpu } from "../cpu-baseline.ts";
-import { clusterReleases, describeKept, snapshotReleases } from "../kept-releases.ts";
+import { clusterReleases, describeKept, releasesInUse, snapshotReleases } from "../kept-releases.ts";
 import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
@@ -433,8 +433,8 @@ export const status = Command.make("status", {}, () =>
             onSome: ([{ baseline }, survey]) => describeBaseline(standingOf(survey, baseline)),
           });
           for (const line of lines) yield* Console.log(`  ${line}`);
-          // The gVisor releases kept, and the snapshots naming each.
-          const releases = describeKept(yield* clusterReleases(gvisorReleases(NODE_PINS)), yield* snapshotReleases);
+          // The gVisor releases kept, the snapshots naming each, and the pods running each.
+          const releases = describeKept(yield* clusterReleases(gvisorReleases(NODE_PINS)), yield* snapshotReleases, (yield* releasesInUse)?.pods ?? null);
           for (const line of releases) yield* Console.log(`  ${line}`);
         }
         // Where the sandbox gateway serves folder instances, as alasio is told it does: each, and its binds' last failure.
