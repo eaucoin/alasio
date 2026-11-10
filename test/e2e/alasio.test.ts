@@ -213,6 +213,8 @@ function operator(base: string) {
     const markup = call.payload.reply_markup;
     return (markup && "inline_keyboard" in markup ? markup.inline_keyboard : []).flat();
   };
+  /** What `call` sent, as a failed wait says it: its method and the start of its text, a rich message's markdown for one. */
+  const sent = (call: RecordedCall) => [call.method, (call.payload.text ?? call.payload.rich_message?.markdown)?.slice(0, 240)];
   return {
     buttons,
     /** Says `text` as the operator, or as `user`, another the bot is for, each in their own chat. */
@@ -229,7 +231,7 @@ function operator(base: string) {
         if (hit) return hit;
         await sleep(500);
       }
-      throw new Error(`alasio sent nothing that matched; it sent ${JSON.stringify(got.map((call) => [call.method, call.payload.text?.slice(0, 120)]))}`);
+      throw new Error(`alasio sent nothing that matched; it sent ${JSON.stringify(got.map(sent))}`);
     },
     /**
      * What alasio sends until each of `predicates` holds for one of it, which may come together,
@@ -244,7 +246,7 @@ function operator(base: string) {
         if (hits.every((hit) => hit !== undefined)) return hits as RecordedCall[];
         await sleep(500);
       }
-      throw new Error(`alasio sent nothing that matched each; it sent ${JSON.stringify(got.map((call) => [call.method, call.payload.text?.slice(0, 120)]))}`);
+      throw new Error(`alasio sent nothing that matched each; it sent ${JSON.stringify(got.map(sent))}`);
     },
     /** Presses the button labelled like `label` in what alasio sends next. */
     async choose(label: RegExp) {
