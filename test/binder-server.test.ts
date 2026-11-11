@@ -1042,6 +1042,64 @@ test("a binding is stamped active as its bind is through, so one whose bind took
   }
 });
 
+test("a binding is stamped active as its Lease names its pod, so one bound to a pod made long before, as a standby is, whose bayma restored says it has been idle since the binding before, is not idle before its bind is through", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  // Its pod's bayma, idle since long before, as a sandbox restored from a snapshot says it is.
+  const status = createServer((_incoming, outgoing) => void outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 300_000 })));
+  status.listen(0, "127.0.0.1");
+  await once(status, "listening");
+  const statusPort = (status.address() as AddressInfo).port;
+  try {
+    const key = "sessionfs:standby";
+    // Bound by the binder alone, as a sweep may read its Lease before any front stamps it as its bind is through.
+    const asked = Date.now();
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => binder.bind(of, key)), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
+    const lease = await run(readLease(of, key));
+    assert.ok(lease?.spec?.holderIdentity);
+    const heldAt = activeAt(lease);
+    assert.ok(heldAt !== null && heldAt >= asked && heldAt <= Date.now(), `stamped as it was held: ${heldAt}`);
+    const pod = await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, lease.spec?.holderIdentity ?? ""))) as V1Pod;
+    // Its pod made two minutes before it was held, as a standby is, made ahead of the restore that claims it.
+    const madeEarlier: V1Pod = { ...pod, metadata: { ...pod.metadata, creationTimestamp: new Date(heldAt - 120_000) } };
+    const idleness = baymaIdleness({ podPort: statusPort, releaseAfterMs: 60_000, bindingKey });
+    assert.equal((await Effect.runPromise(idleness(lease, madeEarlier, heldAt + 1_000))).idle, false, "found idle as it was bound");
+    assert.equal((await Effect.runPromise(idleness(lease, madeEarlier, heldAt + 60_000))).idle, true, "kept past its release's wait from its hold");
+  } finally {
+    status.close();
+  }
+});
+
+test("a warm bind of a pool's free pod made long before releaseAfter, its bayma idle since it started, is not idle as its Lease names it, as a sweep reading the Lease before its bind is through would otherwise find it", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  // Its pod's bayma, which never ran an exec, idle since it started, ten minutes before its bind, as a pool's free pod waits.
+  const started = Date.now() - 600_000;
+  const status = createServer((_incoming, outgoing) => void outgoing.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ execsRunning: 0, execsQueued: 0, idleSinceMs: started })));
+  status.listen(0, "127.0.0.1");
+  await once(status, "listening");
+  const statusPort = (status.address() as AddressInfo).port;
+  try {
+    const key = "sessionfs:warm";
+    const asked = Date.now();
+    // A warm bind, by the binder alone: a free pod claimed, no pod made.
+    await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => binder.bind(of, key)), Layer.provideMerge(Binder.layer({ waitMs: 5_000 }), Layer.fresh(KubeClient.layer))));
+    const lease = await run(readLease(of, key));
+    assert.equal(lease?.spec?.holderIdentity, "free-0");
+    const heldAt = activeAt(lease);
+    assert.ok(heldAt !== null && heldAt >= asked, `stamped as it was held: ${heldAt}`);
+    const pod = await run(withKube((kube) => kube.read("v1", "Pod", of.namespace, "free-0"))) as V1Pod;
+    const madeLongBefore: V1Pod = { ...pod, metadata: { ...pod.metadata, creationTimestamp: new Date(started) } };
+    const idleness = baymaIdleness({ podPort: statusPort, releaseAfterMs: 60_000, bindingKey });
+    assert.equal((await Effect.runPromise(idleness(lease, madeLongBefore, heldAt + 1_000))).idle, false, "found idle as it was bound");
+    // Its Lease as it was held before its hold was stamped too: idle at once, as a sweep between the hold and the front's stamp found it.
+    const heldUnstamped = { ...lease, metadata: { ...lease.metadata, annotations: Object.fromEntries(Object.entries(lease.metadata?.annotations ?? {}).filter(([name]) => name !== ACTIVE_ANNOTATION)) } };
+    assert.equal((await Effect.runPromise(idleness(heldUnstamped, madeLongBefore, heldAt + 1_000))).idle, true);
+  } finally {
+    status.close();
+  }
+});
+
 test("a request on a route the front knew of, whose binding was released before its watch said so, binds its key anew and is passed there, its caller never told the pod was not reached", async () => {
   const of = await pool();
   const gone = await podAt("127.0.0.2");
@@ -1149,21 +1207,23 @@ test("a request that may bind, of a key another replica bound anew within the st
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
     const first = await run(readLease(of, key));
     assert.ok(first && activeAt(first) !== null);
-    // Released and bound anew by another replica, which stamps nothing of it, within this one's stamp's interval.
+    // Released and bound anew by another replica, which stamps nothing of it but its hold, within this one's stamp's interval.
     await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (binder) => Effect.andThen(binder.release(of, key), binder.bind(of, key))), elsewhere));
     const rebound = await run(readLease(of, key));
     assert.ok(rebound && rebound.metadata?.uid !== first.metadata?.uid, "bound anew");
-    assert.equal(activeAt(rebound), null);
+    const heldAt = activeAt(rebound);
+    assert.ok(heldAt !== null, "the new binding stamped as it was held");
     // A request that binds nothing asks how the key is bound now, and so routes it to the new binding, stamping nothing.
     const read = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
     assert.equal(read.status, 200);
-    assert.equal(activeAt((await run(readLease(of, key)))!), null, "a request that binds nothing stamped");
+    assert.equal(activeAt((await run(readLease(of, key)))!), heldAt, "a request that binds nothing stamped");
     // The next, which may bind, on that route, within the stamp's interval of the binding gone.
+    await new Promise((resolve) => setTimeout(resolve, 10));
     const passed = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });
     assert.equal(passed.status, 200);
     const stamped = await run(readLease(of, key));
     assert.equal(stamped?.metadata?.uid, rebound.metadata?.uid);
-    assert.ok(stamped && activeAt(stamped) !== null, "the new binding's first request stamped");
+    assert.ok(stamped && (activeAt(stamped) ?? 0) > heldAt, "the new binding's first request stamped");
   } finally {
     await served.close();
     stand.close();

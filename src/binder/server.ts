@@ -43,7 +43,7 @@
  *   it is not (./proxy.ts), but for a request that says it must bind nothing (NO_BIND_HEADER
  *   `never`), as one that reads what a binding has, answered 409 `{ "bound": false }` where the
  *   key has no binding serving, its Lease untaken and no pod claimed; with the binding's token for the caller's, the key's Lease
- *   stamped active as each bind of it is through and as its requests that may bind come, now and
+ *   stamped active as it names its pod, as each bind of it is through and as its requests that may bind come, now and
  *   then, as what releases it reads; passed again, where a route the front knew of was of a binding
  *   gone, released by another replica or its sweep before its watch said so, to the key
  *   bound anew, within its bind's own wait, where the request's body was one the front could
@@ -341,8 +341,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
    * Stamps the binding `binding` of `key`'s Lease in `pool` active now, so whatever releases it
    * sees it so: as a request comes, at most every ACTIVE_STAMP_MS a binding from this replica;
    * or, `bound`, as a bind of it is through, whatever was stamped before, so a binding is idle
-   * from when it was bound at the earliest, not from when its pod was made, which a restore
-   * makes some while before.
+   * from when its bind was through at the earliest. Its Lease was stamped as it named its pod
+   * already (./bindings.ts holdLease), as a sweep may find it held before this stamp is.
    */
   const active = (key: string, pool: Pool, binding: string, { bound = false }: { readonly bound?: boolean } = {}): Effect.Effect<void> =>
     Effect.gen(function*() {

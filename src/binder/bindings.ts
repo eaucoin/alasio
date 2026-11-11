@@ -135,10 +135,21 @@ export const takeLease = Effect.fnUntraced(function*(pool: Pool, key: string, bi
   }
 });
 
-/** Names `pod` the holder of the Lease `lease`, by an update conditioned on its version: the Lease, or null where another binder took it over meanwhile. */
+/**
+ * Names `pod` the holder of the Lease `lease`, stamped active now (ACTIVE_ANNOTATION) in the same
+ * update, conditioned on its version: the Lease, or null where another binder took it over
+ * meanwhile. So a binding is never found idle from before it was held: its pod may have been made
+ * long before, as a standby or a free pod is, and its bayma, restored, says it has been idle since
+ * the binding before it, while a sweep may read the Lease before any request of it is stamped.
+ */
 export const holdLease = Effect.fnUntraced(function*(lease: BindingLease, pod: string): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
-  return yield* kube.replace({ ...lease, spec: { ...lease.spec, holderIdentity: pod } }).pipe(
+  const now = yield* Clock.currentTimeMillis;
+  return yield* kube.replace({
+    ...lease,
+    metadata: { ...lease.metadata, annotations: { ...lease.metadata?.annotations, [ACTIVE_ANNOTATION]: String(now) } },
+    spec: { ...lease.spec, holderIdentity: pod },
+  }).pipe(
     Effect.catchIf((error) => hasStatus(409)(error) || hasStatus(404)(error), () => Effect.succeed(null)),
   );
 });
@@ -152,7 +163,7 @@ export const markReleasing = Effect.fnUntraced(function*(lease: BindingLease, bi
   );
 });
 
-/** The annotation of a binding's Lease saying when a request of its key last came, in ms: stamped by its binders, now and then. */
+/** The annotation of a binding's Lease saying when it was last active, in ms: stamped as it names its pod (holdLease), and by its binders as requests of its key come, now and then. */
 export const ACTIVE_ANNOTATION = "alasio.dev/active-at";
 
 /** Stamps the Lease of `key`'s binding with a request of it at `now`; one gone, or changed meanwhile, is left. */
@@ -164,7 +175,7 @@ export const touchLease = Effect.fnUntraced(function*(pool: Pool, key: string, n
   );
 });
 
-/** When a request of the binding `lease` last came, as its binders stamped it; null where none ever did. */
+/** When the binding `lease` was last active, as it was held or a request of it came, as its binders stamped it; null where none ever did. */
 export const activeAt = (lease: BindingLease): number | null => {
   const at = Number(lease.metadata?.annotations?.[ACTIVE_ANNOTATION]);
   return Number.isFinite(at) && at > 0 ? at : null;

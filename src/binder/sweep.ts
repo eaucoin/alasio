@@ -6,8 +6,9 @@
  *
  * How bayma says it is idle (baymaIdleness): its `GET /status`, with the binding's token, at
  * most once every `idlePollMs` a pod, and not before it could be idle for long enough, as the
- * last exec it ran, the last request of it (the Lease's active stamp), and its binding say
- * (lingered, which whatever else binds through the binder asks its pods by too).
+ * last exec it ran, its binding's Lease's active stamp (written as the Lease names its pod, and
+ * as requests of it come), and its pod's making say (lingered, which whatever else binds through
+ * the binder asks its pods by too).
  */
 import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
@@ -35,9 +36,11 @@ export const notIdle = (now: number, idlePollMs: number): Idleness => ({ idle: f
 /**
  * Whether the binding `lease`, of its pod `pod`, which says nothing goes on in it since
  * `idleSinceMs`, is idle at `now`: once nothing has gone on in it for `releaseAfterMs`, as
- * that, the last request of it (the Lease's active stamp), and its binding (its pod's making)
+ * that, the Lease's active stamp (its hold, or the last request of it), and its pod's making
  * say, whichever was last; where not, asked again no sooner than `idlePollMs` from now, nor
- * than it could be idle.
+ * than it could be idle. A pod restored from a snapshot says it is idle since its binding
+ * before, and one made long before it is held, as a standby is, says nothing of its binding:
+ * the stamp of its hold does.
  */
 export function lingered(idleSinceMs: number, lease: BindingLease, pod: V1Pod | null, now: number, { releaseAfterMs, idlePollMs }: { readonly releaseAfterMs: number; readonly idlePollMs: number }): Idleness {
   const bound = Date.parse(String(pod?.metadata?.creationTimestamp ?? "")) || 0;
