@@ -235,11 +235,15 @@ export const claim = Effect.fnUntraced(function*(pool: Pool, key: string): Effec
   return null;
 });
 
-/** The pod bound to `key` in `pool`, serving or not, being deleted or not; null where there is none. */
+/**
+ * The pod bound to `key` in `pool`, serving or not: one not being deleted, where there is one, as the pod of the
+ * key's binding before, released, may still be ending, with the key's labels, beside the one bound since; else one
+ * being deleted; null where there is none.
+ */
 export const boundPod = Effect.fnUntraced(function*(pool: Pool, key: string): Effect.fn.Return<V1Pod | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
-  const pods = (yield* kube.list("v1", "Pod", pool.namespace, selector(boundLabels(pool, key)))) as V1Pod[];
-  return pods.find((pod) => pod.metadata?.annotations?.[KEY_ANNOTATION] === key) ?? null;
+  const pods = ((yield* kube.list("v1", "Pod", pool.namespace, selector(boundLabels(pool, key)))) as V1Pod[]).filter((pod) => pod.metadata?.annotations?.[KEY_ANNOTATION] === key);
+  return pods.find((pod) => !pod.metadata?.deletionTimestamp) ?? pods[0] ?? null;
 });
 
 /** Lets the Lease `lease` go, as it is: one changed since, by another binder, is kept (409). */

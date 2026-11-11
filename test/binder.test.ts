@@ -233,6 +233,35 @@ test("a bind that makes its own pod makes it bound to the key from the first, gi
   assert.deepEqual(bindings, [bound.binding]);
 });
 
+test("a key bound again while the pod of its binding before is still ending, its name listed first, is bound to its new pod, as a look at its binding and a bind again find it", async () => {
+  const of = await pool();
+  const layer = binderOf();
+  const key = "sessionfs:again";
+  /** A bind of the key that makes its pod, `name`, on a node, so that the API server keeps it until its kubelet, which there is none of, says it ended. */
+  const bindTo = (name: string) =>
+    bindIn(layer, (each) =>
+      each.bind(of, key, {
+        make: (labels, annotations) =>
+          withKube((client) =>
+            Effect.gen(function*() {
+              const pod = yield* client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace: of.namespace, labels: { ...labels }, annotations: { ...annotations } }, spec: { nodeName: "node-a", containers: [{ name: "bayma", image: "agent" }] } });
+              yield* serve(client, of, name);
+              return pod;
+            })
+          ).pipe(Effect.provide(binder())),
+      })
+    );
+  await bindTo("a-before");
+  await bindIn(layer, (each) => each.release(of, key));
+  const ending = (await run(binder(), withKube((client) => client.read("v1", "Pod", of.namespace, "a-before")))) as V1Pod | null;
+  assert.ok(ending?.metadata?.deletionTimestamp, "the pod of the binding before is not ending");
+  const again = await bindTo("b-after");
+  assert.equal(again.pod, "b-after");
+  assert.deepEqual(await bindIn(layer, (each) => each.bound(of, key)), again);
+  assert.deepEqual(await bindIn(binderOf(), (each) => each.bind(of, key)), again);
+  assert.equal((await run(binder(), readLease(of, key)))?.spec?.holderIdentity, "b-after");
+});
+
 test("a pod gated on a condition serves once the condition holds, whatever kubelet said of its containers before it was set, before kubelet says it ready, to a bind and to a look at its binding alike, and not before, nor once its containers are unready since", async () => {
   const of = await pool();
   const layer = binderOf({ waitMs: 3_000 });
