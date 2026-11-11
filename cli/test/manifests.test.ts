@@ -3658,6 +3658,12 @@ describe("the sandbox service", () => {
     assert.equal(restoresIntoStandby("20261102.0-eaucoin.4", ""), false);
   });
 
+  test("this version's pins name the fork's 20261102.0-eaucoin.4 the first release whose shim restores into a standby soundly, as it closes a standby container's I/O as it stops it", () => {
+    assert.equal(NODE_PINS.gvisor.restoresIntoStandbySince, "20261102.0-eaucoin.4");
+    // The current release, which new sessions run, so that their restores are restored into standbys.
+    assert.equal(restoresIntoStandby(NODE_PINS.gvisor.releases[0]?.release ?? "", NODE_PINS.gvisor.restoresIntoStandbySince), true);
+  });
+
 
   test("binds through a gateway of alasio's image, configured with its pools and the node agents, its keys the stack's, which may claim and delete its pools' pods and hold their Leases alone", () => {
     const objects = install();
