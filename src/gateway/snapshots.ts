@@ -67,7 +67,7 @@
 import { randomBytes } from "node:crypto";
 import { posix } from "node:path";
 
-import type { V1Container, V1Deployment, V1LabelSelector, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
+import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Effect, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { BindStepFailed, type MakePod } from "../binder/binder.ts";
@@ -379,6 +379,22 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
   const baymaId = (pod: V1Pod | null) => pod?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.containerID?.replace(/^[a-z]+:\/\//u, "");
 
   /**
+   * The pool's template `pod` was made of, which a snapshot of its sandbox records for its restore, as runsc restores a
+   * sandbox only into containers of the image and arguments it ran: the configuration's, current or the one before it,
+   * whose hash the pod carries (SESSION_TEMPLATE_ANNOTATION), as a restore's pod and a pool's do; else one of that hash, of
+   * the pod's own spec, as of a template kept no more, which no restore takes, so that the snapshot falls back. Not the
+   * pool's Deployment's now, which an update changes under the pods made before it, whose sandboxes a restore onto it
+   * would refuse.
+   */
+  const templateOfPod = (pod: V1Pod): V1PodTemplateSpec => {
+    const hash = pod.metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION];
+    const kept = hash === undefined ? undefined : Object.values(snapshots?.templates ?? {}).flatMap(({ current, previous }) => [current, previous]).find((template) =>
+      (template as V1PodTemplateSpec | null)?.metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION] === hash
+    );
+    return (kept as V1PodTemplateSpec | undefined) ?? { metadata: { annotations: hash === undefined ? {} : { [SESSION_TEMPLATE_ANNOTATION]: hash } }, ...(pod.spec ? { spec: pod.spec } : {}) };
+  };
+
+  /**
    * Saves the bound pod's sandbox whole by its node's agent, which ends it: snapshotted, into
    * the snapshot it took; kept, as its pod runs no bayma under gVisor; lost, its sandbox ended
    * by a save that failed; unsaveable, as the agent says no save of it will be taken; or
@@ -398,8 +414,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         yield* Effect.logWarning(`${pool.namespace}/${workspace} is not snapshotted: its pod runs no bayma under gVisor`);
         return { outcome: "kept" } as const;
       }
-      const deployment = (yield* kube.read("apps/v1", "Deployment", pool.namespace, pool.name)) as V1Deployment | null;
-      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...deployment?.spec?.template } }).pipe(Effect.result);
+      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...templateOfPod(pod) } }).pipe(Effect.result);
       if (taken._tag === "Success") {
         const { snapshot, release, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted ${pool.namespace}/${workspace} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
@@ -1000,9 +1015,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const stateDir = bayma ? stateDirOf(bayma) : null;
       const node = pod.spec?.nodeName;
       if (!node || !containerId || pod.spec?.runtimeClassName === undefined || !hook || !stateDir) return null;
-      const deployment = (yield* kube.read("apps/v1", "Deployment", pool.namespace, pool.name)) as V1Deployment | null;
       const name = pod.metadata?.name ?? "";
-      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...deployment?.spec?.template }, live: { stateDir } }).pipe(Effect.result);
+      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...templateOfPod(pod) }, live: { stateDir } }).pipe(Effect.result);
       if (taken._tag === "Failure" && unsaveable(taken.failure)) {
         yield* counted("unsaveable");
         return "unsaveable" as const;

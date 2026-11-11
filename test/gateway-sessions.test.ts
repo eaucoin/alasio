@@ -149,7 +149,7 @@ async function environment(count: number, { gvisor = false, holdsStop = false, m
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: none.name, namespace }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(none) } }, template } });
       for (let n = 0; n < count; n += 1) {
         const name = `none-${n}`;
-        yield* kube.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace, labels: { ...freeLabels(none) } }, spec: { nodeName: "node-a", ...template.spec } as V1PodSpec });
+        yield* kube.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace, labels: { ...freeLabels(none) }, annotations: { ...template.metadata?.annotations } }, spec: { nodeName: "node-a", ...template.spec } as V1PodSpec });
         yield* kube.patchPodStatus(namespace, name, {
           status: { phase: "Running", podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: true, restartCount: 0, containerID: `containerd://c-${n}`, state: { running: {} } }] },
         });
@@ -340,6 +340,39 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     assert.equal((saved?.podTemplate as { spec?: { runtimeClassName?: string } }).spec?.runtimeClassName, "gvisor");
   } finally {
     stand.close();
+  }
+});
+
+test("a bound pod is saved as of the pool's template it was made of, the one before the current kept as it is, or, of one kept no more, as of none a restore takes, never as of its Deployment's now", async () => {
+  for (const made of ["t-previous", "t-gone"]) {
+    const env = await environment(1, { gvisor: true });
+    // Made of a template before the Deployment's now, whose bayma is another's.
+    await run(withKube((kube) => kube.patch("v1", "Pod", env.namespace, "none-0", { metadata: { annotations: { "alasio.dev/session-template": made } } })));
+    const previous: V1PodTemplateSpec = {
+      metadata: { ...env.template.metadata, annotations: { "alasio.dev/session-template": "t-previous" } },
+      spec: { ...env.template.spec, containers: (env.template.spec?.containers ?? []).map((container) => ({ ...container, image: "agent-before" })) },
+    };
+    const stand = await bayma();
+    const recorded = agents();
+    try {
+      const given = options(env, stand.port);
+      assert.ok(given.snapshots);
+      const snapshots = { ...given.snapshots, templates: { none: { current: { ...env.template }, previous: { ...previous } }, full: { current: { ...env.template }, previous: null } } };
+      const { binder, sessions } = await sessionsOf({ ...given, snapshots, releaseAfterMs: 0 }, recorded.agents);
+      const key = sessionKey("fs-made");
+      const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+      const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+      const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound.pod)))) as V1Pod;
+      stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
+      assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
+      await letGo(env.none, key);
+      const [saved] = recorded.saved;
+      if (made === "t-previous") assert.deepEqual(saved?.podTemplate, previous);
+      // Of its own spec, by its hash, which no restore takes: its snapshot falls back.
+      else assert.deepEqual(JSON.parse(JSON.stringify(saved?.podTemplate)), JSON.parse(JSON.stringify({ metadata: { annotations: { "alasio.dev/session-template": "t-gone" } }, spec: pod.spec })));
+    } finally {
+      stand.close();
+    }
   }
 });
 
