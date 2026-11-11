@@ -20,7 +20,7 @@ import { request as httpsRequest } from "node:https";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, afterEach, before, describe, test } from "node:test";
+import { after, afterEach, before, describe, test, type TestContext } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
 import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
@@ -267,10 +267,10 @@ function operator(base: string) {
 interface Scenario {
   /** What the seed makes, on the release before. */
   readonly seeds: string;
-  readonly seed: () => Promise<void>;
+  readonly seed: (t: TestContext) => Promise<void>;
   /** What the check proves is kept, upgraded. */
   readonly keeps: string;
-  readonly check: () => Promise<void>;
+  readonly check: (t: TestContext) => Promise<void>;
 }
 
 /** Whether `call` asks Telegram who the bot is, as alasio does as it starts, and nothing else of it does after. */
@@ -407,7 +407,10 @@ if (inShard("upgrade")) {
      * REPLs, one restored and one set live after the restore, which no snapshot holds.
      */
     const RUNNING_SESSION = "fs-e2eupgraderunning";
-    let running: { readonly release: string; readonly pod: string; readonly restored: ReplSet; readonly live: ReplSet };
+    /** Null where the release before keeps no release this one does not pin, as one this release pins too: nothing to drop. */
+    let running: { readonly release: string; readonly pod: string; readonly restored: ReplSet; readonly live: ReplSet } | null = null;
+    /** Why the scenario of the release dropped is skipped, where it is. */
+    const NOTHING_DROPPED = `${PREVIOUS} keeps no gVisor release beside its current one that this release does not pin`;
     /** The install configuration in the config file, `change`d, as alasio up applies it, by the alasio the run runs then. */
     const configured = async (change: (sessions: { runtimeClassName?: string; snapshots: Record<string, string> }) => void) => {
       const { configFile } = paths();
@@ -630,11 +633,13 @@ if (inShard("upgrade")) {
       {
         // Last, as it gives the sessions a release of their own for a while, and then keeps them bound.
         seeds: "a session restored from its snapshot, taken under a gVisor release this release no longer pins, and running on unsaved, a REPL set live after the restore, no snapshot naming that release",
-        seed: async () => {
+        seed: async (t) => {
           // The release before's releases, but its current one, which its RuntimeClass gvisor runs; of those, one this release does not pin.
           const current = (await kube.get<V1RuntimeClass>(ref("RuntimeClass", "gvisor")))?.metadata?.annotations?.[GVISOR_RELEASE_ANNOTATION];
           const pinned = gvisorReleases(NODE_PINS);
-          const release = (await releasesKept()).find((kept) => kept !== current && !pinned.includes(kept)) ?? assert.fail(`${PREVIOUS} keeps no release beside ${current} that this release does not pin`);
+          const release = (await releasesKept()).find((kept) => kept !== current && !pinned.includes(kept));
+          // None where this release pins what the release before did: nothing it drops for a pod to keep.
+          if (release === undefined) return void t.skip(NOTHING_DROPPED);
           // Its sessions run under that release, saved live only after hours: a snapshot of the session taken under it.
           await configured((sessions) => {
             sessions.runtimeClassName = gvisorRuntimeClass(release);
@@ -668,7 +673,8 @@ if (inShard("upgrade")) {
           running = { release, pod: bound.name, restored, live };
         },
         keeps: "the session restored and running on under a release this one no longer pins, never stopped unsaved: running on, its REPLs live, the one set after the restore among them, or saved whole as the upgrade's k3s ended its pod; the release kept as a pod ran it, which the upgrade said",
-        check: async () => {
+        check: async (t) => {
+          if (running === null) return void t.skip(NOTHING_DROPPED);
           if (await boundPodOf(RUNNING_SESSION)) {
             // Its pod ran on through the upgrade.
             for (const [set, value] of [[running.restored, `restored under ${running.release}`], [running.live, `set live under ${running.release}`]] as const) {
@@ -852,26 +858,28 @@ if (inShard("upgrade")) {
     // The release the session restored before the upgrade runs, kept as it does, is removed by the next up once nothing runs it
     // and no snapshot names it: the session released, as idle sessions are again, and its workspace deleted, its snapshots
     // forgotten with it.
-    test("upgraded: the gVisor release kept as a pod ran it is removed, with its RuntimeClass, by the next up once none runs it and no snapshot names it", { timeout: 60 * 60_000 }, async () => {
+    test("upgraded: the gVisor release kept as a pod ran it is removed, with its RuntimeClass, by the next up once none runs it and no snapshot names it", { timeout: 60 * 60_000 }, async (t) => {
+      const dropped = running;
+      if (dropped === null) return void t.skip(NOTHING_DROPPED);
       await configured((sessions) => {
         sessions.snapshots["releaseAfter"] = `${RELEASE_AFTER_SECONDS}s`;
         delete sessions.snapshots["liveEvery"];
       });
       // Kept by that up too, as the session runs it still.
-      assert.ok((await releasesKept()).includes(running.release), `gVisor ${running.release} is not kept`);
+      assert.ok((await releasesKept()).includes(dropped.release), `gVisor ${dropped.release} is not kept`);
       await untilReleased(RUNNING_SESSION, Date.now());
       assert.equal((await gatewayCall(await mainToken(RUNNING_SESSION), "DELETE", "/workspace")).status, 204);
-      assert.ok(!(await releasesSnapshotsName())?.has(running.release), `a snapshot names ${running.release}`);
+      assert.ok(!(await releasesSnapshotsName())?.has(dropped.release), `a snapshot names ${dropped.release}`);
       // Its pod gone, and every pod's release told, as pods made before the upgrade made gvisor anew have ended.
-      await until(`no pod running gVisor ${running.release}, and every pod's release told`, async () => {
+      await until(`no pod running gVisor ${dropped.release}, and every pod's release told`, async () => {
         const used = await releasesPodsRun();
-        return used !== null && !used.has(running.release) ? true : undefined;
+        return used !== null && !used.has(dropped.release) ? true : undefined;
       }, 600_000);
       const up = await alasio("up", "--timeout", "20m");
       assert.equal(up.code, 0, `${up.stdout}${up.stderr}`);
-      assert.ok(`${up.stdout}${up.stderr}`.includes(`stop the sandboxes of gVisor ${running.release}, which alasio no longer keeps`), `${up.stdout}${up.stderr}`);
-      assert.ok(!(await releasesKept()).includes(running.release), `gVisor ${running.release} is kept still`);
-      assert.ok(!existsSync(gvisorDirectory(running.release)), `gVisor ${running.release} is installed still`);
+      assert.ok(`${up.stdout}${up.stderr}`.includes(`stop the sandboxes of gVisor ${dropped.release}, which alasio no longer keeps`), `${up.stdout}${up.stderr}`);
+      assert.ok(!(await releasesKept()).includes(dropped.release), `gVisor ${dropped.release} is kept still`);
+      assert.ok(!existsSync(gvisorDirectory(dropped.release)), `gVisor ${dropped.release} is installed still`);
     });
   });
 }
