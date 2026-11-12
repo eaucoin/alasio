@@ -429,11 +429,18 @@ async function loggedOf(node: string, workspace: string): Promise<{ readonly age
   return { agent: await of((await nodeAgents()).get(node) ?? "", "node-agent"), gateway: await of(await kube.runningPod(NAMESPACE, GATEWAY), "sandbox-gateway") };
 }
 
-/** What the agent of `node` logged of preparing the snapshot `snapshot`: its last line of it. */
-async function preparedLine(node: string, snapshot: string): Promise<string> {
+/**
+ * What the agent of `node` logged of preparing a snapshot of `workspace`: its last line of it, and
+ * the snapshot it names, which is the one restored: the release's `snapshot`, or the one a
+ * compaction since made of it, which the workspace's current snapshot is then
+ * (src/node-agent/agent.ts compactNow). The release's where none is logged.
+ */
+async function preparedLine(node: string, workspace: string, snapshot: string): Promise<{ readonly line: string; readonly snapshot: string }> {
   const pod = (await nodeAgents()).get(node) ?? "";
-  const line = (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").findLast((each) => each.includes(`prepared the snapshot ${snapshot} `));
-  return line ? line.slice(line.indexOf("prepared")) : "not logged";
+  const line = (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").findLast((each) => each.includes("prepared the snapshot ") && each.includes(` of ${SESSIONS}/${workspace} `));
+  if (!line) return { line: "not logged", snapshot };
+  const said = line.slice(line.indexOf("prepared"));
+  return { line: said, snapshot: /^prepared the snapshot (\S+) /u.exec(said)?.[1] ?? snapshot };
 }
 
 /**
@@ -507,8 +514,8 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
   // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
   const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
-  const prepared = await preparedLine(node, manifest.snapshot);
-  const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${manifest.snapshot}`);
+  const { line: prepared, snapshot: restoredSnapshot } = await preparedLine(node, workspace, manifest.snapshot);
+  const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${restoredSnapshot}`);
   const logs = await loggedOf(node, workspace);
   const spike = await tracedRestore(node, workspace, probed as unknown as Record<string, unknown>);
   const resident = residentNs === null ? null : msBetween(BigInt(probed.t0_ns), residentNs);
@@ -543,7 +550,7 @@ async function restore(node: string, workspace: string, sessionId: string, fixtu
     page_cache: kind === "cold" ? "dropped" : PAGE_CACHE,
     compaction_at_t0: compactionAtT0(spike.steps),
   };
-  const details = { pod: name, node, standby, source, prepared, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
+  const details = { pod: name, node, standby, source, prepared, restored_snapshot: restoredSnapshot, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said, memory_stat: memory.stat, resident_error: error, logs, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(), spike };
   return { probed, metrics, details, pod: name };
 }
 
