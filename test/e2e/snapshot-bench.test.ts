@@ -39,7 +39,7 @@ import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.t
 import { BINDING_LABEL, FREE_LABEL, keyHash, leaseName, POOL_LABEL } from "../../src/binder/names.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { LAYERS_DIR } from "../../src/node-agent/cache.ts";
-import { BAYMA_CONTAINER, RESTORE_ANNOTATION, STANDBY_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, RESTORE_ANNOTATION, STANDBY_ANNOTATION, STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import { compactionDue, type Manifest } from "../../src/node-agent/agent.ts";
 import { CONTAINERD, gvisorDirectory, gvisorHandler, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, RUNSC_ROOT, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
@@ -434,6 +434,44 @@ async function preparedLine(node: string, snapshot: string): Promise<string> {
   const pod = (await nodeAgents()).get(node) ?? "";
   const line = (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").findLast((each) => each.includes(`prepared the snapshot ${snapshot} `));
   return line ? line.slice(line.indexOf("prepared")) : "not logged";
+}
+
+/**
+ * Whether a run's restores find a standby on their node (src/gateway/standbys.ts): an even run's
+ * do, as a restore does that comes after the one before it on the node by more than the standby's
+ * making, which is how the gateway serves most; an odd run's do not, as the first restore on a
+ * node, or one that comes within the standby's making after another there (10 s, STANDBY_AFTER_MS), does not.
+ */
+function standbyArm(run: number): "standby" | "none" {
+  return run % 2 === 0 ? "standby" : "none";
+}
+
+/** How long a restore waits for the standby the gateway makes after the restore before it, before it goes on without. */
+const STANDBY_WAIT_MS = 120_000;
+
+/** Whether `pod` runs, with its address, each of its containers started, and is not being deleted: a standby a restore claims (src/gateway/standbys.ts standing). */
+function standing(pod: V1Pod): boolean {
+  return !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" && (pod.status.podIPs?.length ?? 0) > 0 &&
+    (pod.status.containerStatuses ?? []).length > 0 && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running !== undefined);
+}
+
+/**
+ * The node's standby made ready for a restore of `arm`: where a restore ran on `node` before, the
+ * standby the gateway makes 10 s after it waited for until it stands; then, for
+ * `none`, deleted, and gone, so the restore makes its pod. What was found and done, for the
+ * restore's details.
+ */
+async function standbyFor(node: string, arm: "standby" | "none"): Promise<Record<string, unknown>> {
+  const t0 = Date.now();
+  const on = async () => (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).filter((pod) => !pod.metadata?.deletionTimestamp);
+  let found = await on();
+  // None is made before the job's first restore on the node: nothing to wait for.
+  for (const deadline = t0 + (lastRestoreAt === 0 ? 0 : STANDBY_WAIT_MS); !found.some(standing) && Date.now() < deadline; found = await on()) await sleep(500);
+  const stood = found.filter(standing).map((pod) => pod.metadata?.name ?? "");
+  const deleted = arm === "none" ? found.map((pod) => pod.metadata?.name ?? "") : [];
+  for (const name of deleted) await kube.remove(ref("Pod", name, SESSIONS));
+  for (const name of deleted) await gone(name);
+  return { arm, standing: stood, deleted, waited_ms: Date.now() - t0, since_last_restore_ms: lastRestoreAt === 0 ? null : t0 - lastRestoreAt };
 }
 
 /**
@@ -983,9 +1021,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     // Spike: a mixed run's warm restore beside the background session's release, its checkpoint, upload and compaction, begun half a second before.
     const warmBeside = behind === null ? null : settledFrom(release(behind.workspace), Date.now());
     if (warmBeside !== null) await sleep(500);
+    const warmStandby = await standbyFor(node, standbyArm(run));
     const warm = await restore(node, workspace, sessionId, fixture, runId, manifest, "warm");
     const mixedWarm = warmBeside === null ? null : { beside: "release", ...(await warmBeside) };
-    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, compaction_sent_bytes: compactionSent, mixed: mixedWarm, spike: { ...warm.details.spike, compaction } });
+    emit(fixture, sizeMib, run, "restore-warm", restoreOutcome(warm, "cache"), warm.metrics, warm.probed.correctness, { ...warm.details, standby_before: warmStandby, compaction_sent_bytes: compactionSent, mixed: mixedWarm, spike: { ...warm.details.spike, compaction } });
     done.add(phase);
     await endUnsaved(workspace, warm.pod);
 
@@ -998,9 +1037,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const cacheRemoved = await coldCaches(workspace);
     // Spike: a mixed run's cold restore beside the background session's restore, from the node's cache, begun as it is.
     const coldBeside = behind === null ? null : settledFrom(driver(behind.workspace, "probe", "--session", behind.sessionId, "--fixture", BACKGROUND.fixture, "--run-id", `${runId}-background`), Date.now());
+    const coldStandby = await standbyFor(node, standbyArm(run));
     const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
     const mixedCold = coldBeside === null ? null : { beside: "restore", ...(await coldBeside) };
-    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, { ...cold.details, cache_removed: cacheRemoved, mixed: mixedCold });
+    emit(fixture, sizeMib, run, "restore-cold", restoreOutcome(cold, "bucket"), cold.metrics, cold.probed.correctness, { ...cold.details, standby_before: coldStandby, cache_removed: cacheRemoved, mixed: mixedCold });
     done.add(phase);
     await endUnsaved(workspace, cold.pod);
   } catch (error) {
