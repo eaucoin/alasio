@@ -106,7 +106,9 @@ export const goferOf = (release: string, since: string): Gofer | null => (releas
  * first release that does, as cluster/node/pins.json says it (gvisor.restoresIntoStandbySince).
  * One before it runs a standby's containers as it would any pod's, and takes no restore into it;
  * or, as the fork's .3, takes one, but leaves a standby's container it stops with its I/O open,
- * which CRI waits on the end of, to stop it and as containerd starts again.
+ * which CRI waits on the end of, to stop it and as containerd starts again; or, as .4, takes one
+ * on a socket wherever its annotation names it, as root, without the rules of the directory
+ * alasio names it in (../kube/sandbox-shape.ts STANDBY_SOCKETS), which only a shim of .5 on holds to.
  */
 export const restoresIntoStandby = (release: string, since: string): boolean => releaseAtOrPast(release, since);
 

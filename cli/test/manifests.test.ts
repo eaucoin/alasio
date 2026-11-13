@@ -3658,8 +3658,10 @@ describe("the sandbox service", () => {
     assert.equal(restoresIntoStandby("20261102.0-eaucoin.4", ""), false);
   });
 
-  test("this version's pins name the fork's 20261102.0-eaucoin.4 the first release whose shim restores into a standby soundly, as it closes a standby container's I/O as it stops it", () => {
-    assert.equal(NODE_PINS.gvisor.restoresIntoStandbySince, "20261102.0-eaucoin.4");
+  test("this version's pins name the fork's 20261102.0-eaucoin.5 the first release whose shim restores into a standby soundly, as it takes a standby's socket in the one directory alasio names it in, by that directory's rules", () => {
+    assert.equal(NODE_PINS.gvisor.restoresIntoStandbySince, "20261102.0-eaucoin.5");
+    // The release before it, kept beside it, whose sandboxes are restored into pods made for them alone.
+    assert.equal(restoresIntoStandby("20261102.0-eaucoin.4", NODE_PINS.gvisor.restoresIntoStandbySince), false);
     // The current release, which new sessions run, so that their restores are restored into standbys.
     assert.equal(restoresIntoStandby(NODE_PINS.gvisor.releases[0]?.release ?? "", NODE_PINS.gvisor.restoresIntoStandbySince), true);
   });

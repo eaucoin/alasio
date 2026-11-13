@@ -12,15 +12,15 @@
   "gvisor": {
     "restoresFromBucketSince": "20260921.0-eaucoin.7",
     "restoresThroughSocketSince": "20260921.0-eaucoin.9",
-    "restoresIntoStandbySince": "20261102.0-eaucoin.4",
+    "restoresIntoStandbySince": "20261102.0-eaucoin.5",
     "releases": [
+      {
+        "release": "20261102.0-eaucoin.5",
+        "sha512": "e750660f703254aaab206f0268f349ebadd149525b9e84a44e126af93b6e763b551d087ab322ec98d55380dbe76b417f63d1d523d0297b9d9667d99d90432722"
+      },
       {
         "release": "20261102.0-eaucoin.4",
         "sha512": "d7a33d651137ad903b6e9627b589c14115c554b63b9bbc78420bb80280717b32032a4484e97bc9a1db4088d0ce42304e223aaeb37bb75cef216d427678477664"
-      },
-      {
-        "release": "20261102.0-eaucoin.3",
-        "sha512": "9839f9d0c967c88ca3088cf6a4c574fb94c6f9d6486a05bd488ad39a8ef900801c780d420cd4dedb22ea87cb648dfe515a2cc0b1b57150621e554b63a04855d0"
       }
     ]
   },
