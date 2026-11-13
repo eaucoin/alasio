@@ -708,7 +708,7 @@ async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly 
  * previous release, its own images, which its package pins, but for alasio's, the stand-in
  * built on it, and the settings it has, as its alasio init writes them. A setting the
  * previous release does not have is given to this checkout's alone, as that release refuses
- * a configuration with a setting it does not know: 10.0.11 has every setting this checkout
+ * a configuration with a setting it does not know: 10.0.12 has every setting this checkout
  * has, so far.
  */
 function installation(of: "previous" | "release"): Record<string, unknown> {
