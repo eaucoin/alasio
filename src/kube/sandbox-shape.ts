@@ -64,8 +64,19 @@ export const SPENT_REASON = "SnapshotSpent";
 export const STANDBY_ANNOTATION = "dev.gvisor.internal.restore.standby";
 /** The label of a standby pod of a pool, its node's name, which the restore that claims it takes off. */
 export const STANDBY_LABEL = "alasio.dev/standby";
-/** Where a standby pod's shims listen on its node, as `<namespace>/<pod>.sock`, and each of its containers' own beside it. */
-export const STANDBY_SOCKETS = "/run/alasio/standby";
+/**
+ * Where a standby pod's shims listen on its node (standbySocket), each of its containers' own
+ * beside it: the one directory the fork's shim takes a standby's socket in, root's, as the shims
+ * are, which it makes and which none but root may write to.
+ */
+export const STANDBY_SOCKETS = "/run/gvisor/standby";
+/**
+ * The socket of the standby pod `pod` of the namespace `namespace` on its node, as its
+ * STANDBY_ANNOTATION names it: `<namespace>.<pod>.sock` in STANDBY_SOCKETS, as the shim takes
+ * a name of letters, digits, '_', '.' and '-' there, which two DNS labels joined by a '.' are,
+ * one of no other pod's.
+ */
+export const standbySocket = (namespace: string, pod: string): string => `${STANDBY_SOCKETS}/${namespace}.${pod}.sock`;
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /**

@@ -2045,7 +2045,7 @@ if (inShard("snapshots")) {
           ), 300_000);
       const standby = await standbyOn();
       assert.match(standby.metadata?.name ?? "", /^sandboxes-none-restore-/u);
-      assert.equal(standby.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/alasio/standby/${SESSIONS}/${standby.metadata?.name}.sock`);
+      assert.equal(standby.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/gvisor/standby/${SESSIONS}.${standby.metadata?.name}.sock`);
       // A file of its workspace written before it is released again, which the sandbox restored into the standby, whose
       // workspace is attached after it booted, is to find whole.
       const before = await inSession(standing, writeRandom("/workspace/standby/before"));

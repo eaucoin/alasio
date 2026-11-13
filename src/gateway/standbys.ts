@@ -48,7 +48,7 @@ import { Effect, FiberMap, Schedule, Schema, type Scope } from "effect";
 
 import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { hasStatus, KubeClient } from "../kube/client.ts";
-import { RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION, STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS } from "../kube/sandbox-shape.ts";
+import { RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION, STANDBY_ANNOTATION, STANDBY_LABEL, standbySocket } from "../kube/sandbox-shape.ts";
 import { withLogScope } from "../shared/log.ts";
 import { ATTACH_VOLUME, ownDirectory, restorePodName } from "./names.ts";
 
@@ -191,7 +191,7 @@ export const makeStandbys = Effect.fnUntraced(function*(namespace: string, { aft
         name,
         namespace,
         labels: { ...own, [STANDBY_LABEL]: node },
-        annotations: { ...template.metadata?.annotations, [STANDBY_ANNOTATION]: `${STANDBY_SOCKETS}/${namespace}/${name}.sock` },
+        annotations: { ...template.metadata?.annotations, [STANDBY_ANNOTATION]: standbySocket(namespace, name) },
       },
       spec: {
         ...spec,

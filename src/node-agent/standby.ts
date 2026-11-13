@@ -3,8 +3,8 @@
  * makes ahead of a restore (../gateway/standbys.ts), annotated so (STANDBY_ANNOTATION) that
  * the fork's shim boots its sandbox with its containers created and none started: kubelet
  * sees it running, with its address, while runsc runs nothing of it. The shim listens on the
- * Unix socket the annotation names, under the node's STANDBY_SOCKETS, for the one restore it
- * takes: `POST /restore`, `{ imagePath, paused }`, answered `{ containers, milliseconds }`
+ * Unix socket the annotation names, `<namespace>.<pod>.sock` in the node's STANDBY_SOCKETS
+ * (standbySocket), for the one restore it takes: `POST /restore`, `{ imagePath, paused }`, answered `{ containers, milliseconds }`
  * once each of its containers is restored from the image, in the order they were created,
  * paused, until the agent resumes them as it resumes a restore's pod (./agent.ts resume). A
  * second request is refused (409), and the socket goes once its request is answered; a
@@ -12,11 +12,15 @@
  *
  * Where each container has a shim of its own, as containerd runs runsc's without shim
  * grouping, the pod's socket restores its sandbox's own container alone, and each other
- * container's shim listens on `<pod>.<container>.sock` beside it for its own: each is asked
- * in turn, the pod's first. Every one of them listens once kubelet has started its container,
- * which a standby claimed has had, as it is claimed only once each runs.
+ * container's shim listens on `<namespace>.<pod>.<container>.sock` beside it for its own: each
+ * is asked in turn, the pod's first. Every one of them listens once kubelet has started its
+ * container, which a standby claimed has had, as it is claimed only once each runs.
+ *
+ * The agent asks a shim only as the shim listens: on a socket, nothing else in its place, in
+ * a directory of the shims' user, root, that no other may write to, as the shim takes one
+ * only there; a standby whose sockets are not so takes no restore.
  */
-import { readdir } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 
@@ -117,22 +121,41 @@ const post = (socket: string, body: string): Promise<ShimAnswer> =>
     asked.end(body);
   });
 
-/** Restores into standby pods on this node, whose shims listen under `sockets`; see the module. */
+/** Restores into standby pods on this node; see the module. */
 export interface StandbyRestores {
   /** Restores `request`'s image into its standby, paused: its containers, and how long each took. */
   readonly restore: (request: StandbyRestoreRequest) => Effect.Effect<StandbyRestored, StandbyRestoreError>;
 }
 
-/** The standby restores of the node whose shims listen under `sockets`, STANDBY_SOCKETS unless given. */
-export const makeStandbyRestores = (sockets: string = STANDBY_SOCKETS): StandbyRestores => {
-  /** The sockets of the standby `namespace`/`pod`: its own, then each of its containers' that has a shim of its own, by name; none where it has no socket. */
-  const socketsOf = (namespace: string, pod: string): Effect.Effect<readonly string[]> =>
-    Effect.promise(async () => {
-      const names = await readdir(join(sockets, namespace)).catch((): string[] => []);
-      if (!names.includes(`${pod}.sock`)) return [];
-      const own = names.filter((name) => name.startsWith(`${pod}.`) && name.endsWith(".sock") && name !== `${pod}.sock`).sort();
-      return [`${pod}.sock`, ...own].map((name) => join(sockets, namespace, name));
-    });
+/** A container's name, as the shim names a container's own socket after one (`<namespace>.<pod>.<container>.sock`). */
+const CONTAINER = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/u;
+
+/** Where the shims of a node's standbys listen: their directory, STANDBY_SOCKETS unless given, and their user's id, root's unless given. */
+export interface StandbySockets {
+  readonly directory?: string;
+  readonly owner?: number;
+}
+
+/** The standby restores of the node whose shims listen as `sockets` says; see the module. */
+export const makeStandbyRestores = ({ directory = STANDBY_SOCKETS, owner = 0 }: StandbySockets = {}): StandbyRestores => {
+  /**
+   * The sockets of the standby `namespace`/`pod`, as the module says: its own, then each of its containers' that has a shim
+   * of its own, by name; or why it takes no restore.
+   */
+  const socketsOf = (namespace: string, pod: string): Effect.Effect<readonly string[], StandbyUnavailable> =>
+    Effect.promise(async (): Promise<readonly string[] | string> => {
+      const held = await lstat(directory).catch(() => null);
+      if (held === null) return `no shim of it listens: ${directory} is not there`;
+      if (!held.isDirectory() || held.uid !== owner || (held.mode & 0o022) !== 0) return `${directory} is not a directory of the shims' user that only it may write to`;
+      const prefix = `${namespace}.${pod}.`;
+      const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+      // Its own and its containers' names, whatever is there in their places.
+      const its = entries.filter(({ name }) => name === `${prefix}sock` || (name.startsWith(prefix) && name.endsWith(".sock") && CONTAINER.test(name.slice(prefix.length, -".sock".length))));
+      if (!its.some(({ name }) => name === `${prefix}sock`)) return `no shim of it listens in ${directory}`;
+      const other = its.find((entry) => !entry.isSocket());
+      if (other) return `${join(directory, other.name)} is not a socket`;
+      return [`${prefix}sock`, ...its.map(({ name }) => name).filter((name) => name !== `${prefix}sock`).sort()].map((name) => join(directory, name));
+    }).pipe(Effect.flatMap((found) => (typeof found === "string" ? Effect.fail(new StandbyUnavailable({ namespace, pod, reason: found })) : Effect.succeed(found))));
 
   /** Asks the shim on `socket` to restore `body`: what it says it restored. */
   const ask = (request: StandbyRestoreRequest, socket: string, body: string): Effect.Effect<StandbyRestored, StandbyUnavailable | StandbyRestoreFailed> =>
@@ -157,7 +180,6 @@ export const makeStandbyRestores = (sockets: string = STANDBY_SOCKETS): StandbyR
         return yield* new StandbyImageRefused({ imagePath: request.imagePath });
       }
       const found = yield* socketsOf(request.namespace, request.pod);
-      if (found.length === 0) return yield* new StandbyUnavailable({ namespace: request.namespace, pod: request.pod, reason: `no shim of it listens under ${sockets}` });
       const started = yield* Clock.currentTimeMillis;
       const body = JSON.stringify({ imagePath: request.imagePath, paused: true });
       const restored = yield* Effect.forEach(found, (socket) => ask(request, socket, body));

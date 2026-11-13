@@ -395,8 +395,8 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
   return `(${pinned("object.spec", restoring)} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
 }
 
-/** A standby's socket on its node: its namespace's and its own name's, under the standbys', its name a restore's pod's. */
-const STANDBY_SOCKET = new Check((expression) => `${expression} == ${JSON.stringify(`${STANDBY_SOCKETS}/`)} + object.metadata.namespace + "/" + object.metadata.name + ".sock" && object.metadata.name.matches(${JSON.stringify(RESTORE_POD.source)})`);
+/** A standby's socket on its node, as standbySocket names it: its namespace's and its own name's, in the standbys' directory, its name a restore's pod's. */
+const STANDBY_SOCKET = new Check((expression) => `${expression} == ${JSON.stringify(`${STANDBY_SOCKETS}/`)} + object.metadata.namespace + "." + object.metadata.name + ".sock" && object.metadata.name.matches(${JSON.stringify(RESTORE_POD.source)})`);
 
 /**
  * A standby of the pool template `template`, as the gateway makes it (src/gateway/standbys.ts) and

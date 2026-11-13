@@ -1082,7 +1082,7 @@ test("a workspace restored on a node is restored next into the standby kept ther
   const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
   assert.equal(standby?.spec?.runtimeClassName, "gvisor-r1");
   assert.equal(standby?.spec?.restartPolicy, "Never");
-  assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/alasio/standby/${env.namespace}/${name}.sock`);
+  assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.standby"], `/run/gvisor/standby/${env.namespace}.${name}.sock`);
   assert.equal(standby?.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], undefined);
   assert.deepEqual([standby?.metadata?.labels?.["alasio.dev/binding"], standby?.metadata?.labels?.["alasio.dev/free"], standby?.metadata?.labels?.["alasio.dev/pool"]], [undefined, undefined, "sandboxes-none"]);
   // Its own directory, which kubelet makes as it starts.

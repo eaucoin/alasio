@@ -63,7 +63,9 @@ const NODE_AGENT_ACCOUNT = componentName("node-agent");
 
 /** The node's paths the agent has at the same paths: each one's volume, what must be there, and whether the agent only reads it. */
 const HOST_PATHS: readonly { readonly name: string; readonly path: string; readonly type: string; readonly readOnly?: true }[] = [
-  // The shims' runsc root (/run/containerd/runsc) and, where systemd runs the node, its bus.
+  // The shims' runsc root (/run/containerd/runsc), the sockets the standbys' shims listen on
+  // (/run/gvisor/standby, src/kube/sandbox-shape.ts STANDBY_SOCKETS), which they make as they
+  // start, and, where systemd runs the node, its bus.
   { name: "run", path: "/run", type: "Directory" },
   { name: "gvisor", path: GVISOR_RELEASES, type: "DirectoryOrCreate", readOnly: true },
   { name: "containerd", path: CONTAINERD, type: "DirectoryOrCreate", readOnly: true },

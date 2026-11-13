@@ -214,7 +214,7 @@ export interface NodeAgentServerOptions {
   readonly token: string;
   readonly agent: NodeAgent;
   readonly workspaces: Workspaces;
-  /** The restores into standby pods on the node, whose shims listen under STANDBY_SOCKETS unless given. */
+  /** The restores into standby pods on the node, whose shims listen in STANDBY_SOCKETS, as root, unless given. */
   readonly standbys?: StandbyRestores;
 }
 
