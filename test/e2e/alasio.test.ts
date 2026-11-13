@@ -43,7 +43,8 @@ import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
+import { STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS, standbySocket } from "../../src/kube/sandbox-shape.ts";
+import { STANDBY_AFTER_MS } from "../../src/gateway/standbys.ts";
 import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
@@ -412,6 +413,22 @@ if (inShard("upgrade")) {
     let running: { readonly release: string; readonly pod: string; readonly restored: ReplSet; readonly live: ReplSet } | null = null;
     /** Why the scenario of the release dropped is skipped, where it is. */
     const NOTHING_DROPPED = `${PREVIOUS} keeps no gVisor release beside its current one that this release does not pin`;
+    /**
+     * A session of main's released on the release before into a snapshot taken under its current gVisor release, and restored
+     * from it there last before the cut-over, which keeps a standby on its node, as that release's shim restores into one: the
+     * session's REPL, and the standby, as the release before made it.
+     */
+    const STANDBY_SESSION = "fs-e2eupgradestandby";
+    let standbyRepl: string;
+    let standbyBefore: { readonly name: string; readonly node: string; readonly runtimeClassName: string; readonly socket: string } | null = null;
+    /** Why the scenario of the release before's standby is skipped, where it is. */
+    const NO_STANDBY = `${PREVIOUS}'s current gVisor release restores into no standby`;
+    /** The standbys of main's sessions that run, each of its containers started, on `node` where named. */
+    const standbysRunning = async (node?: string) =>
+      (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: node === undefined ? STANDBY_LABEL : `${STANDBY_LABEL}=${node}` })).filter((pod) =>
+        !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" &&
+        (pod.status.containerStatuses ?? []).length > 0 && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running !== undefined)
+      );
     /** The install configuration in the config file, `change`d, as alasio up applies it, by the alasio the run runs then. */
     const configured = async (change: (sessions: { runtimeClassName?: string; snapshots: Record<string, string> }) => void) => {
       const { configFile } = paths();
@@ -632,6 +649,34 @@ if (inShard("upgrade")) {
         },
       },
       {
+        seeds: "a session released into its snapshot, taken under the current gVisor release, which the bind last before the cut-over restores, keeping a standby on its node",
+        seed: async () => {
+          const token = await mainToken(STANDBY_SESSION);
+          await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+          await bindSession(STANDBY_SESSION);
+          standbyRepl = (await repl.set(STANDBY_SESSION, `restored on ${PREVIOUS}`)).sessionId;
+          await untilReleased(STANDBY_SESSION, Date.now());
+          assert.ok(await snapshotOf(STANDBY_SESSION), `${STANDBY_SESSION} was released into no snapshot on ${PREVIOUS}`);
+        },
+        keeps: "nothing of the release before's standby, which a gateway of this release deletes as it starts, never restored into, as the release before's gateway restores through its own release's node agents alone and this one's through this release's; no standby but one of a gVisor release whose shim takes its socket in /run/gvisor/standby, named there",
+        check: async (t) => {
+          if (standbyBefore === null) return void t.skip(NO_STANDBY);
+          const { name, node } = standbyBefore;
+          await until(`the standby ${name} of ${PREVIOUS} gone`, async () => ((await kube.get<V1Pod>(ref("Pod", name, SESSIONS))) === null ? true : undefined), 600_000);
+          assert.ok(!(await gatewayLogs()).some((line) => line.includes(`into the standby ${name} `)), `the gateway restored into the standby ${name}`);
+          const agent = (await nodeAgents()).get(node);
+          assert.ok(agent, `no node agent runs ready on ${node}`);
+          // What it says of a restore into a standby, as it restores into one, finds it takes none, or fails it.
+          const said = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n").filter((line) => line.includes(`the standby ${SESSIONS}/${name}`));
+          assert.deepEqual(said, [], `the node agent on ${node} was asked to restore into the standby ${name}`);
+          for (const standby of await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: STANDBY_LABEL })) {
+            const release = gvisorReleases(NODE_PINS).find((pinned) => gvisorRuntimeClass(pinned) === standby.spec?.runtimeClassName);
+            assert.ok(release !== undefined && restoresIntoStandby(release, NODE_PINS.gvisor.restoresIntoStandbySince ?? ""), `the standby ${standby.metadata?.name} runs under ${standby.spec?.runtimeClassName}`);
+            assert.equal(standby.metadata?.annotations?.[STANDBY_ANNOTATION], standbySocket(SESSIONS, standby.metadata?.name ?? ""));
+          }
+        },
+      },
+      {
         // Last, as it gives the sessions a release of their own for a while, and then keeps them bound.
         seeds: "a session restored from its snapshot, taken under a gVisor release this release no longer pins, and running on unsaved, a REPL set live after the restore, no snapshot naming that release",
         seed: async (t) => {
@@ -718,6 +763,36 @@ if (inShard("upgrade")) {
       // Main's alasio answers as it did, its branch gone.
       await tg.say("after the branch");
       await tg.waitFor((call) => answered(call));
+    });
+
+    // Last before the cut-over, as a gateway that starts deletes every standby there, and the seeds' and the branch's ups
+    // make the gateway anew: the session released into its snapshot restored, which keeps a standby on its node as the
+    // release before makes one, its socket where that release names one, standing through the cut-over.
+    test(`on ${PREVIOUS}: a session restored, which keeps a standby on its node, of the template and gVisor release it was restored under`, { timeout: 30 * 60_000 }, async (t) => {
+      const current = (await kube.get<V1RuntimeClass>(ref("RuntimeClass", "gvisor")))?.metadata?.annotations?.[GVISOR_RELEASE_ANNOTATION];
+      const config = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", GATEWAY, NAMESPACE)))?.data?.["config.json"] ?? "{}") as { snapshots?: { releases?: { release: string; standby?: boolean }[] } | null };
+      if (!config.snapshots?.releases?.some(({ release, standby }) => release === current && standby === true)) return void t.skip(NO_STANDBY);
+      // The gateway rolled out, none of another template of its about to start and delete the standby.
+      await until("the sandbox gateway rolled out", async () => {
+        const deployment = await kube.get<V1Deployment>(ref("Deployment", GATEWAY, NAMESPACE));
+        const { replicas = 0, updatedReplicas, readyReplicas, observedGeneration } = deployment?.status ?? {};
+        return observedGeneration === deployment?.metadata?.generation && replicas === deployment?.spec?.replicas && updatedReplicas === replicas && readyReplicas === replicas ? true : undefined;
+      }, 600_000);
+      const { name: restored, node } = await bindSession(STANDBY_SESSION);
+      assert.match(restored, /-restore-/u);
+      const [standby] = await until(`a standby running on ${node}`, async () => {
+        const running = await standbysRunning(node);
+        return running.length > 0 ? running : undefined;
+      }, 300_000);
+      assert.ok(standby);
+      standbyBefore = {
+        name: standby.metadata?.name ?? "",
+        node,
+        runtimeClassName: standby.spec?.runtimeClassName ?? "",
+        socket: standby.metadata?.annotations?.[STANDBY_ANNOTATION] ?? "",
+      };
+      t.diagnostic(`${PREVIOUS} keeps the standby ${standbyBefore.name} on ${node}, under ${standbyBefore.runtimeClassName}, its socket ${standbyBefore.socket}`);
+      assert.equal(standbyBefore.runtimeClassName, gvisorRuntimeClass(current ?? ""));
     });
 
     test(`the cut-over from ${PREVIOUS}, failing before its point of no return, once every step before it has run, changes nothing, and a run again starts over`, { timeout: 60 * 60_000 }, async () => {
@@ -881,6 +956,55 @@ if (inShard("upgrade")) {
       assert.ok(`${up.stdout}${up.stderr}`.includes(`stop the sandboxes of gVisor ${dropped.release}, which alasio no longer keeps`), `${up.stdout}${up.stderr}`);
       assert.ok(!(await releasesKept()).includes(dropped.release), `gVisor ${dropped.release} is kept still`);
       assert.ok(!existsSync(gvisorDirectory(dropped.release)), `gVisor ${dropped.release} is installed still`);
+    });
+
+    // The session restored on the release before, under a gVisor release whose shim this release restores into no standby
+    // with, is restored into a pod of its own, and keeps none on its node; a session saved under the current release, whose
+    // shim takes its socket in /run/gvisor/standby alone, is restored into the standby its node keeps after a restore there,
+    // whole, its socket there, its shim's.
+    test("upgraded: a session saved under the release before's gVisor release is restored into a pod of its own, keeping no standby; one saved under the current release is restored into the standby its node keeps, its socket in /run/gvisor/standby", { timeout: 60 * 60_000 }, async (t) => {
+      if (standbyBefore === null) return void t.skip(NO_STANDBY);
+      const { configFile } = paths();
+      if (JSON.parse(readFileSync(configFile, "utf8")).install.sessions.snapshots["releaseAfter"] !== `${RELEASE_AFTER_SECONDS}s`) {
+        await configured((sessions) => void (sessions.snapshots["releaseAfter"] = `${RELEASE_AFTER_SECONDS}s`));
+      }
+      const before = gvisorReleases(NODE_PINS).find((release) => gvisorRuntimeClass(release) === standbyBefore?.runtimeClassName);
+      assert.ok(before !== undefined && !restoresIntoStandby(before, NODE_PINS.gvisor.restoresIntoStandbySince ?? ""), `${standbyBefore.runtimeClassName} is of a release this one pins and restores into standbys with`);
+      // Released, under the release before's, which took its snapshot: restored into a pod made for it, its REPL whole.
+      await untilReleased(STANDBY_SESSION, Date.now());
+      assert.equal((await snapshotOf(STANDBY_SESSION))?.release, before);
+      const { name: restored, node } = await bindSession(STANDBY_SESSION);
+      assert.equal((await sessionPod(STANDBY_SESSION)).spec?.runtimeClassName, standbyBefore.runtimeClassName);
+      assert.ok((await gatewayLogs()).some((line) => line.includes(`restoring ${SESSIONS}/${STANDBY_SESSION} on ${node} from its snapshot `)), `the gateway logged no restore of ${STANDBY_SESSION} into ${restored}, a pod made for it`);
+      const seen = await repl.read(STANDBY_SESSION, standbyRepl);
+      assert.deepEqual([seen.live, seen.checkpointed], [`restored on ${PREVIOUS}`, `restored on ${PREVIOUS}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      // None kept after it, well past when one would be made.
+      await sleep(STANDBY_AFTER_MS + 30_000);
+      assert.deepEqual((await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).map(({ metadata }) => metadata?.name), []);
+
+      // A session of the current release: restored once, which keeps a standby on its node, then restored into it.
+      const current = await newSession("none");
+      const { sessionId } = await repl.set(current, `restored into a standby by ${current}`);
+      await untilReleased(current, Date.now());
+      const [release] = gvisorReleases(NODE_PINS);
+      assert.equal((await snapshotOf(current))?.release, release);
+      const { node: on } = await bindSession(current);
+      const [standby] = await until(`a standby running on ${on}`, async () => {
+        const running = await standbysRunning(on);
+        return running.length > 0 ? running : undefined;
+      }, 300_000);
+      const name = standby?.metadata?.name ?? "";
+      assert.equal(standby?.spec?.runtimeClassName, gvisorRuntimeClass(release ?? ""));
+      assert.equal(standby?.metadata?.annotations?.[STANDBY_ANNOTATION], standbySocket(SESSIONS, name));
+      // Its shim's socket, root's alone, in the directory the shims made, root's, which none but root may write to.
+      assert.equal((await onNode(on, `stat -c '%U %a %F' ${STANDBY_SOCKETS} ${standbySocket(SESSIONS, name)}`)).trim(), `root 700 directory\nroot 600 socket`);
+      await untilReleased(current, Date.now());
+      assert.deepEqual(await bindSession(current), { name, node: on });
+      assert.ok((await gatewayLogs()).some((line) => line.includes(`restoring ${SESSIONS}/${current} on ${on} into the standby ${name} `)), `the gateway logged no restore of ${current} into ${name}`);
+      const again = await repl.read(current, sessionId);
+      assert.deepEqual([again.live, again.checkpointed], [`restored into a standby by ${current}`, `restored into a standby by ${current}`]);
+      assert.match(again.notice ?? "", CAME_BACK_WHOLE);
     });
   });
 }
