@@ -1,5 +1,5 @@
 /**
- * The cut-over of an installation of the release before (upgrades/from-10.0.13.sh), in how it
+ * The cut-over of an installation of the release before (upgrades/from-10.0.14.sh), in how it
  * runs, without a cluster: its checks and refusals, its point of no return, and how a run
  * again goes on from where one before stopped. The end-to-end run's upgrade shard runs it on
  * an installation of that release (test/e2e/alasio.test.ts).
@@ -12,16 +12,15 @@ import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.13.sh", import.meta.url));
+const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.14.sh", import.meta.url));
 
 /** The PATH the cut-over runs with: `bin`'s, and the system's. */
 const pathOf = (bin: string) => [bin, "/usr/bin", "/bin"].join(delimiter);
 
 /**
  * A machine for the cut-over: a kubectl that reaches its cluster and lists the namespaces
- * `namespaces` names, `<name>\t<branch label>` each; an UPGRADE and an UPGRADE_CHECK,
- * each saying it ran, UPGRADE failing while `upgradeFails` is there; and its node's /run,
- * `nodeRun`, empty.
+ * `namespaces` names, `<name>\t<branch label>` each; and an UPGRADE and an UPGRADE_CHECK,
+ * each saying it ran, UPGRADE failing while `upgradeFails` is there.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -30,9 +29,7 @@ function machine() {
   const namespaces = join(root, "namespaces");
   const upgradeFails = join(root, "upgrade-fails");
   const config = join(root, "config.json");
-  const nodeRun = join(root, "run");
   mkdirSync(bin);
-  mkdirSync(nodeRun);
   writeFileSync(namespaces, "");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(join(bin, "kubectl"), `#!/bin/sh
@@ -53,7 +50,6 @@ esac
         CONFIG: config,
         UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ]`,
         UPGRADE_CHECK: `echo check >>'${ran}'`,
-        NODE_RUN: nodeRun,
         ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
       },
     });
@@ -61,7 +57,6 @@ esac
   };
   return {
     cutOver,
-    nodeRun,
     /** What UPGRADE and UPGRADE_CHECK ran, in order, since the last time it was asked. */
     ran: () => {
       const read = existsSync(ran) ? readFileSync(ran, "utf8").split("\n").filter(Boolean) : [];
@@ -83,7 +78,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
-    assert.match(run.said, /cutting over from 10\.0\.13[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 10\.0\.14[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
     at.remove();
   }
@@ -95,7 +90,7 @@ test("the cut-over refuses a branch environment before it changes anything, nami
     at.namespaces("alasio-branch-one\tone\nalasio-branch-two\ttwo\nalasio-sessions\tone\nother\t\n");
     const refused = at.cutOver();
     assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 10\.0\.13 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
+    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 10\.0\.14 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
     assert.deepEqual([at.ran(), at.marks()], [[], []]);
     // A namespace labelled for a branch that is not that branch's own is no branch environment.
     at.namespaces("alasio-sessions\tone\n");
@@ -155,35 +150,6 @@ test("the cut-over failing once its upgrade is through goes on with what follows
     assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
     assert.match(again.said, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
     assert.deepEqual(at.ran(), []);
-  } finally {
-    at.remove();
-  }
-});
-
-test("the cut-over removes, once its upgrade is through, the directory of the sockets 10.0.12's standbys listened on, on this machine, and /run/alasio with it where nothing else is there", () => {
-  const at = machine();
-  try {
-    const left = join(at.nodeRun, "alasio", "standby");
-    mkdirSync(join(left, "alasio-sessions"), { recursive: true });
-    writeFileSync(join(left, "alasio-sessions", "sandboxes-none-restore-0a1b2c3.sock"), "");
-    // Failed before it, it removes none of it; run again, it does.
-    const failed = at.cutOver("after-the-upgrade");
-    assert.notEqual(failed.code, 0);
-    assert.ok(existsSync(left));
-    const again = at.cutOver();
-    assert.equal(again.code, 0, again.said);
-    assert.match(again.said, /^[^\n]* removing \S+\/run\/alasio\/standby, where the standbys of 10\.0\.12 listened, which no shim does any more\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
-    assert.deepEqual(readdirSync(at.nodeRun), []);
-    // What else /run/alasio holds is kept, and it with it.
-    mkdirSync(left, { recursive: true });
-    writeFileSync(join(at.nodeRun, "alasio", "juicefs.log"), "");
-    const kept = at.cutOver();
-    assert.equal(kept.code, 0, kept.said);
-    assert.deepEqual(readdirSync(join(at.nodeRun, "alasio")), ["juicefs.log"]);
-    // With none left, it says nothing of it.
-    const none = at.cutOver();
-    assert.equal(none.code, 0, none.said);
-    assert.doesNotMatch(none.said, /removing/u);
   } finally {
     at.remove();
   }
