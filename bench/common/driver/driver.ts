@@ -6,6 +6,7 @@
  *   node driver.mjs mark   --url U [--header ...] --session S --fixture F
  *   node driver.mjs gaps   --url U [--header ...] --session S --fixture F
  *   node driver.mjs probe  --url U [--header ...] --session S --fixture F --run-id R [--t0-ns T]
+ *   node driver.mjs first  --url U [--header ...] --session S --fixture F
  *   node driver.mjs close  --url U [--header ...] --session S
  *   node driver.mjs now
  *
@@ -203,6 +204,13 @@ export const mark = (endpoint: Endpoint, sessionId: string, fixture: Fixture) =>
 export const gaps = (endpoint: Endpoint, sessionId: string, fixture: Fixture) =>
   controlling(endpoint, sessionId, async (bayma) => ({ ...(await bayma.bench<Record<string, unknown>>(sessionId, call(fixture, "gaps"))).value, at_ns: String(now()) }));
 
+/**
+ * Spike: a restore's first exec alone, connected as the probe connects while the session is being restored, without
+ * the verify after it, which reads every page.
+ */
+export const first = (endpoint: Endpoint, sessionId: string, fixture: Fixture) =>
+  controlling(endpoint, sessionId, async (bayma) => ({ ...(await bayma.bench<Record<string, unknown>>(sessionId, call(fixture, "first"))).value, at_ns: String(now()) }), Bayma.connectWhenUp);
+
 /** What a fixture's verify answers. */
 interface Verified {
   readonly marker: string;
@@ -328,11 +336,12 @@ async function main(argv: readonly string[]): Promise<unknown> {
   const sessionId = required(values.session, "session");
   if (command === "mark") return mark(endpoint, sessionId, fixtureOf(values.fixture));
   if (command === "gaps") return gaps(endpoint, sessionId, fixtureOf(values.fixture));
+  if (command === "first") return first(endpoint, sessionId, fixtureOf(values.fixture));
   if (command === "probe") {
     return probe(endpoint, sessionId, fixtureOf(values.fixture), required(values["run-id"], "run-id"), values["t0-ns"] ? BigInt(values["t0-ns"]) : now());
   }
   if (command === "close") return close(endpoint, sessionId);
-  throw new Error(`no command ${command}: setup, mark, gaps, probe, close or now`);
+  throw new Error(`no command ${command}: setup, mark, gaps, first, probe, close or now`);
 }
 
 // Run as a program, not imported, nor bundled into another's (../driver/build.ts).
