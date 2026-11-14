@@ -6,7 +6,7 @@
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-10.0.13.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] [NODE_RUN=<dir>] upgrades/from-10.0.13.sh
 #
 # CONFIG is the configuration's file, the owner's alasio/config.json, which UPGRADE upgrades
 # by and the steps below read, and change where they say.
@@ -25,7 +25,8 @@
 # does as root through. FAIL_AT=before-the-point-of-no-return fails the run there, once every
 # step before the upgrade has run; FAIL_AT=past-the-point-of-no-return past it, before the
 # upgrade; and FAIL_AT=after-the-upgrade once the upgrade is through, before what follows it:
-# as the upgrade shard rehearses a failure at each.
+# as the upgrade shard rehearses a failure at each. NODE_RUN is this machine's /run, as its node
+# has it, unless given elsewhere, as the tests give it.
 #
 # It upgrades main alone, as alasio upgrade does, which refuses while a branch environment
 # 10.0.13 made exists: it refuses then too, before it changes anything. Delete each first
@@ -36,8 +37,7 @@
 # through, after it. Each change's steps are a section of their own below, between its BEGIN
 # and END lines, which the flow at the end of the script calls. None changes, before the
 # point of no return, what a run that fails there would have to make again: a step that does
-# brings what makes it again, for the flow to run as such a run ends. None has any yet: the
-# upgrade alone takes an installation of 10.0.13 to this release.
+# brings what makes it again, for the flow to run as such a run ends.
 #
 # Run again, it goes on from where it stopped: a run that failed before the point of no
 # return starts over. Once past it (OUT/point-of-no-return), a run again goes on from there,
@@ -53,6 +53,25 @@ fail() {
 }
 # Whether UPGRADE_CHECK passes now, what it said in OUT/upgrade-check.log.
 accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
+
+# BEGIN the standbys' sockets 10.0.12 left.
+#
+# 10.0.12 named a standby's socket in /run/alasio/standby on its node, a directory the shim of
+# gVisor's release-20261102.0-eaucoin.4 made as it booted the standby. 10.0.13 names none
+# there, and its gateway deleted every standby as it started, so the directory was left on
+# each node a standby of 10.0.12 ran on, what is in it listened on by no shim, until the
+# machine starts again and its /run, a tmpfs, is made anew; nothing of 10.0.13 or of this
+# release reads it. Once the upgrade is through, this machine's goes, and /run/alasio with it
+# where nothing else is there. Another node's is left for its own restart, as this runs on one
+# machine alone.
+STANDBY_LEFT=${NODE_RUN:-/run}/alasio/standby
+standby_sockets_left() {
+  [ -e "$STANDBY_LEFT" ] || [ -L "$STANDBY_LEFT" ] || return 0
+  log "removing $STANDBY_LEFT, where the standbys of 10.0.12 listened, which no shim does any more"
+  rm -rf -- "$STANDBY_LEFT" || fail "$STANDBY_LEFT could not be removed"
+  rmdir -- "${STANDBY_LEFT%/standby}" 2>/dev/null || true
+}
+# END the standbys' sockets 10.0.12 left.
 
 command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
 [ -r "$CONFIG" ] || fail "CONFIG $CONFIG cannot be read"
@@ -83,6 +102,7 @@ if [ ! -e "$OUT/upgraded" ]; then
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"
+standby_sockets_left
 
 log "upgraded at $(cat "$OUT/upgraded")"
 log "through"
