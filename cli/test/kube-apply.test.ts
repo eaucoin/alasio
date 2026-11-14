@@ -11,8 +11,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
-import type { KubernetesObject } from "@kubernetes/client-node";
+import { KubeConfig, type KubernetesObject } from "@kubernetes/client-node";
 import { Effect, Logger, Result } from "effect";
 
 import { installConfigOf } from "../src/config.ts";
@@ -159,6 +160,35 @@ test("an apply whose policy of pods never holds them as applied fails within a m
   assert.equal(error._tag, "PolicyNotInForce");
   assert.match(error.message, /^the admission policy alasio-sandbox-pods did not hold pods as applied within 60 s \(.*a probe of whether this policy holds pods, at revision [0-9a-f]{16}\), so no workload was applied: none makes a pod the policy does not hold yet$/u);
   assert.deepEqual(kube.changes.slice(changed).filter(({ path }) => workloadPath(path)), []);
+});
+
+test("an apply whose probe of a policy of pods the API server never answers fails within a minute too, naming it, saying what the last probe answered, and applies no workload", { timeout: 240_000 }, async (t) => {
+  const { kube, run } = await rig(t);
+  const policy = "alasio-sandbox-pods";
+  const probing = objectsOf().find(({ kind, metadata }) => kind === "ValidatingAdmissionPolicy" && metadata?.name === policy)?.metadata?.annotations?.[POLICY_PROBE_POD_ANNOTATION];
+  const { namespace } = JSON.parse(probing ?? "{}") as { readonly namespace?: string };
+  assert.ok(namespace, `${policy} names no namespace to probe it in`);
+  const probe = `PATCH /api/v1/namespaces/${namespace}/pods/alasio-policy-probe`;
+  await run(applyInstallation(objectsOf(), WAIT));
+  /** An apply of a release whose policy's revision differs, failed: its error, and that it applied no workload within a minute and a half. */
+  const failed = async (nameservers: string) => {
+    const changed = kube.changes.length;
+    const asked = Date.now();
+    const error = await run(Effect.flip(applyInstallation(objectsOf({ sessions: { fullModeNameservers: [nameservers] } }), WAIT)));
+    assert.ok(Date.now() - asked < 90_000, `failed ${Date.now() - asked} ms on`);
+    assert.deepEqual(kube.changes.slice(changed).filter(({ path }) => workloadPath(path)), []);
+    assert.equal(error._tag, "PolicyNotInForce");
+    return error.message;
+  };
+  // Never answered.
+  kube.unanswered.add(probe);
+  assert.equal(await failed("9.9.9.9"), `the admission policy ${policy} did not hold pods as applied within 60 s (a pod that probes it was not answered), so no workload was applied: none makes a pod the policy does not hold yet`);
+  // Answered at the revision before for a while, then no more: what it last answered is said.
+  kube.unanswered.delete(probe);
+  kube.policyLag.set(policy, Number.MAX_SAFE_INTEGER);
+  const hung = setTimeout(() => kube.unanswered.add(probe), 2_000);
+  t.after(() => clearTimeout(hung));
+  assert.match(await failed("8.8.8.8"), /^the admission policy alasio-sandbox-pods did not hold pods as applied within 60 s \(.*a probe of whether this policy holds pods, at revision [0-9a-f]{16}\), so no workload was applied: none makes a pod the policy does not hold yet$/u);
 });
 
 test("a call the API server is too busy for, answered 504, 503 or 429, is asked again, after the Retry-After it says, within its bound; one failed otherwise, or past the bound, fails as answered", async (t) => {
@@ -870,6 +900,29 @@ test("the API's refusals and what cannot be reached say which call, and why", as
   assert.match(unreachable.message, /^Kubernetes could not be reached for GET \/api\/v1\/namespaces\/alasio: connect ECONNREFUSED/u);
   const unusable = await Effect.runPromise(Effect.flip(Effect.provide(get, KubeApi.layer({ path: kubeconfig, context: "elsewhere" }))));
   assert.equal(unusable.message, `the kubeconfig ${kubeconfig} cannot be used: it has no context elsewhere, only fake`);
+});
+
+test("a call given up on as its kubeconfig's credential plugin still runs ends no process as its credentials come", async (t) => {
+  const { kube, kubeconfig, run } = await rig(t);
+  // The token got by a plugin that answers a second on, as an exec or OIDC one may take its time.
+  const credential = JSON.stringify({ apiVersion: "client.authentication.k8s.io/v1", kind: "ExecCredential", status: { token: "fake-kube-token" } });
+  const config = new KubeConfig();
+  config.loadFromString(kube.kubeconfig);
+  config.loadFromOptions({
+    clusters: config.clusters,
+    contexts: config.contexts,
+    currentContext: config.currentContext,
+    users: [{ name: "fake", exec: { apiVersion: "client.authentication.k8s.io/v1", command: process.execPath, args: ["-e", `setTimeout(() => console.log(${JSON.stringify(credential)}), 1000)`], interactiveMode: "Never" } }],
+  });
+  writeFileSync(kubeconfig, config.exportConfig());
+  kube.put("namespaces", { apiVersion: "v1", kind: "Namespace", metadata: { name: "alasio" } });
+  const get = Effect.flatMap(KubeApi, (api) => api.get({ ...kind("Namespace"), name: "alasio" }));
+  const asked = Date.now();
+  assert.equal((await run(Effect.flip(Effect.timeout(get, "200 millis"))))._tag, "TimeoutError");
+  assert.ok(Date.now() - asked < 1_000, `gave up ${Date.now() - asked} ms on`);
+  // Its credentials come as the test waits: the call given up on fails nothing as they do.
+  await sleep(2_000);
+  assert.equal((await run(get))?.metadata?.name, "alasio");
 });
 
 test("KEDA and VPA are installed where the cluster has none, refused where it has its own (or for KEDA another provider of external metrics), and the cluster's used where it has one", async (t) => {

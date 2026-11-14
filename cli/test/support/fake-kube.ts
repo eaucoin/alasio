@@ -147,6 +147,8 @@ export interface FakeKube {
    * first first, each once.
    */
   readonly busy: Map<string, KubeBusy[]>;
+  /** The requests, by `<METHOD> <path>`, it takes and never answers, as an API server that hangs. */
+  readonly unanswered: Set<string>;
   /**
    * The pods, by `<namespace>/<name>`, their node's kubelet does not serve yet, as one started
    * anew has not taken them back: it lists every other pod bound to it, and answers an exec of
@@ -291,6 +293,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const finalizers = new Map<string, string>();
   const forbidden = new Set<string>();
   const busy = new Map<string, KubeBusy[]>();
+  const unanswered = new Set<string>();
   const unserved = new Set<string>();
   const execs: KubeExec[] = [];
   const forwards: KubeForward[] = [];
@@ -483,6 +486,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const target = parse(url.pathname);
     if (!target) return refuse(response, 404, `the server could not find the requested resource (${url.pathname})`);
     const path = url.pathname;
+    // Held open, until its client gives up on it or the fake closes.
+    if (unanswered.has(`${method} ${path}`)) return;
     const answered = busy.get(`${method} ${path}`)?.shift();
     // Done first, its own answer to no one, where it was committed behind the timeout.
     if (answered?.committed) handle(request, body, new ServerResponse(request));
@@ -693,6 +698,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     finalizers,
     forbidden,
     busy,
+    unanswered,
     unserved,
     policyLag,
     probes,

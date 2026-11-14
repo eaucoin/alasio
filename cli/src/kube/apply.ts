@@ -133,7 +133,7 @@ export type ApplyError = KubeApiError | NotReadyInTime | RolloutFailed | PolicyN
 /** How long the policies of pods are waited for to hold them as applied before any workload is, at most, whatever the apply's timeout. */
 const POLICY_IN_FORCE_MS = 60_000;
 /** How often whether a policy holds pods as applied is asked. */
-const POLICY_PROBE_EVERY = "200 millis";
+const POLICY_PROBE_EVERY = Duration.millis(200);
 
 /** A policy of pods did not hold them as applied in time, so no workload was applied. */
 export class PolicyNotInForce extends Schema.TaggedError<PolicyNotInForce>()("PolicyNotInForce", { policy: Schema.String, reason: Schema.String }) {
@@ -152,12 +152,14 @@ class NotYetInForce extends Schema.TaggedError<NotYetInForce>()("NotYetInForce",
  * revision before, which may refuse what this release's makes, as a standby's shape, or admit
  * what it no longer does. In force once it refuses a pod that probes it, made as a dry run,
  * saying its revision. One made, or refused otherwise, as by the revision before, or by a
- * namespace whose ServiceAccount is not made yet, is asked again, for POLICY_IN_FORCE_MS at most.
+ * namespace whose ServiceAccount is not made yet, is asked again, for POLICY_IN_FORCE_MS at most;
+ * a probe the API server does not answer is given what is left of it, as the API carries no
+ * timeout of its own for a call.
  */
 const policiesInForce = Effect.fnUntraced(function*(objects: readonly KubernetesObject[]): Effect.fn.Return<void, PolicyNotInForce, KubeApi> {
   const kube = yield* KubeApi;
   const policies = objects.filter(({ kind: of, metadata }) => of === "ValidatingAdmissionPolicy" && metadata?.annotations?.[POLICY_PROBE_POD_ANNOTATION] !== undefined);
-  yield* Effect.forEach(policies, ({ metadata }) => {
+  yield* Effect.forEach(policies, ({ metadata }) => Effect.gen(function*() {
     const name = metadata?.name ?? "";
     const revision = metadata?.annotations?.[POLICY_REVISION_ANNOTATION] ?? "";
     const { namespace, labels } = JSON.parse(metadata?.annotations?.[POLICY_PROBE_POD_ANNOTATION] ?? "{}") as PolicyProbe;
@@ -167,15 +169,24 @@ const policiesInForce = Effect.fnUntraced(function*(objects: readonly Kubernetes
       metadata: { name: "alasio-policy-probe", namespace, labels, annotations: { [POLICY_PROBE_ANNOTATION]: "true" } },
       spec: { containers: [{ name: "probe", image: "alasio-policy-probe" }] },
     };
-    return kube.dryApply(probe).pipe(
+    const until = (yield* Clock.currentTimeMillis) + POLICY_IN_FORCE_MS;
+    const left = Effect.map(Clock.currentTimeMillis, (now) => Math.max(0, until - now));
+    // What the last probe answered says why the policy is not yet in force, where the time runs out on one unanswered.
+    let answered = "a pod that probes it was not answered";
+    const asked = kube.dryApply(probe).pipe(
       Effect.matchEffect({
         onFailure: (error) => (error.reason.includes(name) && error.reason.includes(probeRefusal(revision)) ? Effect.void : Effect.fail(new NotYetInForce({ reason: error.reason }))),
         onSuccess: () => Effect.fail(new NotYetInForce({ reason: "a pod that probes it was made" })),
       }),
-      Effect.retry({ schedule: Schedule.max([Schedule.spaced(POLICY_PROBE_EVERY), Schedule.during(POLICY_IN_FORCE_MS)]) }),
+      Effect.tapError(({ reason }) => Effect.sync(() => void (answered = reason))),
+    );
+    const probed = Effect.flatMap(left, (ms) => Effect.timeoutOrElse(asked, { duration: Duration.millis(ms), orElse: () => Effect.fail(new NotYetInForce({ reason: answered })) }));
+    // Asked again while there is time left for another ask after the wait before it.
+    yield* probed.pipe(
+      Effect.retry({ schedule: Schedule.spaced(POLICY_PROBE_EVERY), while: () => Effect.map(left, (ms) => ms > Duration.toMillis(POLICY_PROBE_EVERY)) }),
       Effect.mapError(({ reason }) => new PolicyNotInForce({ policy: name, reason })),
     );
-  }, { concurrency: 4, discard: true });
+  }), { concurrency: 4, discard: true });
 });
 
 /** The installation's objects of `kinds`, as it has them now: none of a kind whose CRD the cluster lacks. */

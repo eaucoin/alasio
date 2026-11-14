@@ -290,24 +290,17 @@ function makeKubeApi(kubeConfig: KubeConfig, busyUntil: number | undefined): Kub
   const executor = new Exec(kubeConfig);
   const forwarder = new PortForward(kubeConfig);
 
-  /** Sends `call` with the kubeconfig's credentials. */
-  const send = (call: KubeCall): Effect.Effect<ClientRequest, KubeApiError> =>
-    Effect.tryPromise({
-      try: async () => {
-        const query = new URLSearchParams(Object.entries(call.query ?? {}).filter((entry): entry is [string, string] => entry[1] !== undefined));
-        const body = call.body === undefined ? undefined : JSON.stringify(call.body.content);
-        const options: RequestOptions = {
-          method: call.method,
-          headers: { Accept: "application/json", ...(call.body && body !== undefined ? { "Content-Type": call.body.contentType, "Content-Length": Buffer.byteLength(body) } : {}) },
-        };
-        await kubeConfig.applyToHTTPSOptions(options);
-        const url = new URL(`${server.pathname.replace(/\/$/u, "")}${call.path}${query.size ? `?${query}` : ""}`, server);
-        const sent = request(url, options);
-        sent.end(body);
-        return sent;
-      },
-      catch: (cause) => unreachable(call, cause),
-    });
+  /** The request of `call`, with the kubeconfig's credentials: its URL, its options, and its body. */
+  const prepare = async (call: KubeCall): Promise<{ readonly url: URL; readonly options: RequestOptions; readonly body: string | undefined }> => {
+    const query = new URLSearchParams(Object.entries(call.query ?? {}).filter((entry): entry is [string, string] => entry[1] !== undefined));
+    const body = call.body === undefined ? undefined : JSON.stringify(call.body.content);
+    const options: RequestOptions = {
+      method: call.method,
+      headers: { Accept: "application/json", ...(call.body && body !== undefined ? { "Content-Type": call.body.contentType, "Content-Length": Buffer.byteLength(body) } : {}) },
+    };
+    await kubeConfig.applyToHTTPSOptions(options);
+    return { url: new URL(`${server.pathname.replace(/\/$/u, "")}${call.path}${query.size ? `?${query}` : ""}`, server), options, body };
+  };
 
   const readAll = (call: KubeCall, stream: Readable): Effect.Effect<Buffer, KubeApiError> =>
     Effect.tryPromise({ try: () => buffer(stream), catch: (cause) => unreachable(call, cause) });
@@ -331,17 +324,35 @@ function makeKubeApi(kubeConfig: KubeConfig, busyUntil: number | undefined): Kub
       }),
     );
 
-  /** The response to `call`, open while the scope is; a status of 400 or over is its refusal. */
+  /**
+   * The response to `call`, open while the scope is; a status of 400 or over is its refusal.
+   * Waited for interruptibly, as the API's client gives a call no timeout of its own, so one the
+   * API server never answers ends only as what waits for it stops waiting: interrupted as its
+   * credentials are got, the call is never sent; once sent, it is destroyed. The scope ends the
+   * call, or its response once there is one, from before either is made, so a response that
+   * comes as the wait is interrupted is ended with the scope too, never left open.
+   */
   const open = (call: KubeCall): Effect.Effect<IncomingMessage, KubeApiError, Scope.Scope> =>
-    Effect.acquireRelease(
-      Effect.flatMap(send(call), (sent) =>
-        Effect.callback<IncomingMessage, KubeApiError>((resume) => {
-          sent.on("response", (response) => resume(Effect.succeed(response)));
-          sent.on("error", (cause) => resume(Effect.fail(unreachable(call, cause))));
-          return Effect.sync(() => sent.destroy());
-        })),
-      (response) => Effect.sync(() => response.destroy()),
-    ).pipe(Effect.tap((response) => ((response.statusCode ?? 0) >= 400 ? refusal(call, response) : Effect.void)));
+    Effect.suspend(() => {
+      const held: { sent?: ClientRequest; response?: IncomingMessage } = {};
+      return Effect.andThen(
+        Effect.addFinalizer(() => Effect.sync(() => (held.response ?? held.sent)?.destroy())),
+        Effect.callback<IncomingMessage, KubeApiError>((resume, signal) => {
+          const failed = (cause: unknown) => resume(Effect.fail(unreachable(call, cause)));
+          prepare(call).then(({ url, options, body }) => {
+            if (signal.aborted) return;
+            const sent = (held.sent = request(url, options));
+            sent.on("response", (response) => {
+              held.response = response;
+              resume(Effect.succeed(response));
+            });
+            sent.on("error", failed);
+            sent.end(body);
+          }, failed);
+          return Effect.sync(() => held.sent?.destroy());
+        }),
+      );
+    }).pipe(Effect.tap((response) => ((response.statusCode ?? 0) >= 400 ? refusal(call, response) : Effect.void)));
 
   /** The JSON the API answers `call` with, asked again while the API is too busy to answer it (busy). */
   const json = <A>(call: KubeCall): Effect.Effect<A, KubeApiError> =>
