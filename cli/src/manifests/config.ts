@@ -14,7 +14,8 @@ import { Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "ef
 
 import { memoryBytes, memoryText } from "../capacity.ts";
 import { EVICTION_MAX_POD_GRACE_SECONDS } from "../cluster/k3s.ts";
-import { BAYMA_STOP_SECONDS } from "../../../src/kube/sandbox-shape.ts";
+import { POOLS, restorePodName } from "../../../src/gateway/names.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, SOCKET_PATH_MAX, standbyContainerSocket } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_MEMORY_FLOOR } from "../../../src/node-agent/names.ts";
 import { IMAGES } from "../release.ts";
 
@@ -32,6 +33,23 @@ export const matching = (pattern: RegExp, message: string) => Schema.String.chec
 const NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
 
 const Namespace = matching(NAME, "must be a namespace name");
+
+/**
+ * The longest name main's sessions' namespace may have: the one namespace whose sessions are
+ * restored, and so kept in standbys (src/gateway/snapshots.ts, src/gateway/standbys.ts), whose
+ * shims listen on sockets named after it on their nodes, the longest of them a container's own
+ * (standbyContainerSocket), of bayma's container in a restore's pod of the pool of the longest
+ * name. A longer one would leave that path past what a Unix socket's may be (SOCKET_PATH_MAX),
+ * where no shim can listen. A branch environment's sessions are never restored.
+ */
+export const SESSIONS_NAMESPACE_MAX = SOCKET_PATH_MAX -
+  Math.max(...Object.values(POOLS).map((pool) => standbyContainerSocket("", restorePodName(pool, "0".repeat(7)), BAYMA_CONTAINER).length));
+
+const SessionsNamespace = Namespace.check(
+  Schema.isMaxLength(SESSIONS_NAMESPACE_MAX, {
+    message: `must be at most ${SESSIONS_NAMESPACE_MAX} characters long, as its standbys' sockets on their nodes are named after it, in a path no longer than a Unix socket's may be`,
+  }),
+);
 const SecretName = matching(/^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/u, "must be a Secret's name");
 /** A Secret's name, or empty for none. */
 const OptionalSecretName = matching(/^(|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)$/u, "must be a Secret's name, or empty");
@@ -389,7 +407,7 @@ const Log = Schema.Struct({
 });
 
 const Sessions = Schema.Struct({
-  namespace: defaulted(Namespace, "alasio-sessions"),
+  namespace: defaulted(SessionsNamespace, "alasio-sessions"),
   createNamespace: defaulted(Schema.Boolean, true),
   /** The RuntimeClass sessions run under, gVisor's, whose checkpoints their snapshots are. */
   runtimeClassName: defaulted(matching(/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/u, "must name a RuntimeClass, gVisor's"), "gvisor"),

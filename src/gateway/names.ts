@@ -48,6 +48,9 @@ export function templateHash(template: object): string {
   return createHash("sha256").update(JSON.stringify(template, sorted)).digest("hex");
 }
 
+/** Each sandbox pool's name, by its sessions' internet: every environment's the same, in its sessions' namespace. */
+export const POOLS = { none: "sandboxes-none", full: "sandboxes-full" } as const;
+
 /** The name of a restore's pod of the pool `pool`, by its random part, `suffix`, seven of base 36's digits, as RESTORE_POD matches it. */
 export const restorePodName = (pool: string, suffix: string): string => `${pool}-restore-${suffix}`;
 

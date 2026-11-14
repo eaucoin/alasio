@@ -77,6 +77,18 @@ export const STANDBY_SOCKETS = "/run/gvisor/standby";
  * one of no other pod's.
  */
 export const standbySocket = (namespace: string, pod: string): string => `${STANDBY_SOCKETS}/${namespace}.${pod}.sock`;
+/**
+ * The socket of the container `container` of the standby pod `pod` of the namespace `namespace`,
+ * where the container has a shim of its own (../node-agent/standby.ts): its pod's, standbySocket,
+ * with the container's name before its extension, as the fork's shim names it.
+ */
+export const standbyContainerSocket = (namespace: string, pod: string, container: string): string => `${STANDBY_SOCKETS}/${namespace}.${pod}.${container}.sock`;
+/**
+ * The most bytes the path of a Unix socket the shim listens on may have: Linux's sun_path holds
+ * 108, of which Go, the shim's language, keeps the last for a terminating NUL, refusing a path
+ * of 108 bytes as invalid.
+ */
+export const SOCKET_PATH_MAX = 107;
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /**

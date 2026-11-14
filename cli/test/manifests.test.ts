@@ -47,7 +47,7 @@ import { MAIN_ENVIRONMENT } from "../src/manifests/common.ts";
 import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
-import { everyIntervalCron, filerStoreBackupHours } from "../src/manifests/config.ts";
+import { everyIntervalCron, filerStoreBackupHours, SESSIONS_NAMESPACE_MAX } from "../src/manifests/config.ts";
 import { folderTemplate } from "../src/manifests/folders.ts";
 import { UNTIL_TERM } from "../src/manifests/image-holder.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
@@ -60,7 +60,8 @@ import { environmentAccess } from "../src/manifests/log.ts";
 import { carriedPools, recordedCpuBaseline, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { STOP_GRACE_SECONDS } from "../../src/binder/names.ts";
 import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
-import { folderStateDir, templateHash } from "../../src/gateway/names.ts";
+import { folderStateDir, POOLS, restorePodName, templateHash } from "../../src/gateway/names.ts";
+import { BAYMA_CONTAINER, SOCKET_PATH_MAX, standbyContainerSocket, standbySocket } from "../../src/kube/sandbox-shape.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
 
@@ -267,6 +268,24 @@ describe("configuration", () => {
     // Past one look for ending pods, and, with bayma's own stop, within what kubelet gives a pod it evicts.
     for (const stopWait of ["16s", "90s"]) assert.equal(configOf({ sessions: { snapshots: { stopWait } } }).sessions.snapshots.stopWait, stopWait);
     assert.match(refused({ sessions: { snapshots: { nodeCache: "lots" } } }), /^sessions\.snapshots\.nodeCache must be a storage size, such as 20Gi$/u);
+  });
+
+  test("takes main's sessions' namespace only as long as its standbys' sockets fit a Unix socket's path, the longest of them a container's own", () => {
+    const longest = "s".repeat(SESSIONS_NAMESPACE_MAX);
+    assert.equal(configOf({ sessions: { namespace: longest } }).sessions.namespace, longest);
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { namespace: `${longest}s` } });
+    assert.ok(Result.isFailure(decoded));
+    assert.equal(
+      decoded.failure.message,
+      `sessions.namespace must be at most ${SESSIONS_NAMESPACE_MAX} characters long, as its standbys' sockets on their nodes are named after it, in a path no longer than a Unix socket's may be`,
+    );
+    // Of bayma's container in a restore's pod of each pool, the pod's own shorter, the longest exactly as long as a Unix socket's path may be.
+    const sockets = Object.values(POOLS).flatMap((pool) => {
+      const pod = restorePodName(pool, "zzzzzzz");
+      return [standbySocket(longest, pod), standbyContainerSocket(longest, pod, BAYMA_CONTAINER)];
+    });
+    assert.equal(Math.max(...sockets.map((socket) => socket.length)), SOCKET_PATH_MAX);
+    assert.equal(SESSIONS_NAMESPACE_MAX, 45);
   });
 
   test("takes every component's scale as { min, max }, refusing what the component cannot run, and the key it replaced", () => {

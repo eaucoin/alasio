@@ -53,6 +53,7 @@ import {
   type GatewayConfig,
   GatewaySnapshots,
   FOLDERS_NAMESPACE_VARIABLE,
+  POOLS,
   RECEIVER_PORT_VARIABLE,
   SESSIONS_NAMESPACE_VARIABLE,
   templateHash,
@@ -112,8 +113,6 @@ export const WORKSPACE_MOUNT = componentName("workspace-mount");
 export const WORKSPACE_MOUNT_COMPONENT = "workspace-mount";
 /** The port every pool pod's bayma serves MCP on. */
 export const POOL_POD_PORT = 7290;
-/** Each pool's name, by its sessions' internet. */
-export const POOLS = { none: "sandboxes-none", full: "sandboxes-full" } as const;
 /** The component of a pool's pods: a session's. */
 export const POOL_COMPONENT = "session";
 
