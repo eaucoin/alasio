@@ -100,7 +100,6 @@ export interface KubeForward {
   readonly port: number;
 }
 
-/** What a command run in a container came to. */
 /** A probe of a policy of pods the fake answered: the policy, the revision it answered at (null for none), and how many changes had been made then. */
 export interface KubeProbe {
   readonly policy: string;
@@ -108,6 +107,7 @@ export interface KubeProbe {
   readonly after: number;
 }
 
+/** What a command run in a container came to. */
 export interface KubeExecResult {
   readonly exitCode: number;
   readonly stdout?: string;
