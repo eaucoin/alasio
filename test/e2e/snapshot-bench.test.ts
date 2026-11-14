@@ -74,7 +74,7 @@ const VARIANT = variable("BENCH_VARIANT");
  * `settled` waits until it ends before the warm restore, and `kept-cache` leaves the node's page
  * cache as it is for the warm restore.
  */
-const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache", "mixed", "mixed-iocost", "cold-by-hand"];
+const SPIKE_VARIANTS = ["no-compaction", "settled", "kept-cache", "mixed", "mixed-iocost", "cold-by-hand", "restored"];
 /** Spike: `chain-N`, as-shipped but N - 1 live saves taken, each a delta of the one before, so that the release's delta makes a chain of N images. */
 const CHAIN = /^chain-([0-9]+)$/u.exec(VARIANT);
 if (VARIANT !== "as-shipped" && VARIANT !== "with-fix" && VARIANT !== "whole" && !SPIKE_VARIANTS.includes(VARIANT) && !CHAIN) throw new Error(`BENCH_VARIANT is ${VARIANT}, not as-shipped, with-fix or whole`);
@@ -820,6 +820,37 @@ async function sayRunner(name: string): Promise<void> {
 
 /** Spike: whether the run's restores run beside another session's release and restore: `mixed`, as shipped; `mixed-iocost`, with blk-iocost on (ioCost). */
 const MIXED = VARIANT === "mixed" || VARIANT === "mixed-iocost";
+/**
+ * Spike: `restored`, as-shipped but the session released and restored once before its live save, as a session that
+ * alasio released before is, so that the images of its saves carry the working set that its restore recorded (runsc's
+ * working-set-window), which a restore of them reads first.
+ */
+const RESTORED = VARIANT === "restored";
+/** Spike: how long a `restored` session runs after its restore before its live save: past runsc's working-set-window (3 s). */
+const WORKING_SET_HELD_MS = 6000;
+
+/**
+ * Spike: `restored`'s release and restore of the session before its saves, the restore asked by the fixture's first
+ * exec as alasio's next request asks it, and the session then left to run past the working-set-window: what runsc
+ * logged of the working set it recorded, and of the one it read first.
+ */
+async function restoreBefore(workspace: string, sessionId: string, fixture: string): Promise<Record<string, unknown>> {
+  const bound = await boundPodOf(workspace);
+  if (!bound) throw new Error(`no pod is bound to ${workspace}`);
+  const released = await release(workspace);
+  if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release before the saves answered ${released.status}: ${released.said}`);
+  await gone(bound.name);
+  // Its first exec alone, as the probe's, without the verify, which reads every page.
+  const asked = Date.now();
+  await driver(workspace, "first", "--session", sessionId, "--fixture", fixture);
+  const firstMs = Date.now() - asked;
+  await sleep(WORKING_SET_HELD_MS);
+  const restored = await boundPodOf(workspace);
+  if (!restored) throw new Error(`no pod is bound to ${workspace} after its restore before the saves`);
+  const lines = await bootLog(restored.node, await sandboxIdOf(restored.node, restored.name));
+  return { release_ms: released.ms, first_exec_ms: firstMs, working_set: lines.filter((line) => /Working set: |working set holds|recording the working set|working sets/u.test(line)) };
+}
+
 /** Spike: the background session of a mixed run: a whole-heap writer, whose release's delta makes its chain due to be compacted. */
 const BACKGROUND = { fixture: "saturating", sizeMib: 1024 } as const;
 
@@ -908,6 +939,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
     const sessionId = setup.session_id;
     // Spike: a mixed run's background session, beside the run's own.
     behind = MIXED ? await background(runId) : null;
+    const restoredBefore = RESTORED ? await restoreBefore(workspace, sessionId, fixture) : null;
 
     phase = "save-live";
     const bound = await boundPodOf(workspace);
@@ -947,7 +979,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number): Promise<v
       heldLive = await bucketBytes(node, workspace);
       const liveLogged = saveLogged(await bootLog(node, sandboxId));
       const liveSteps = await traced(node, workspace, liveT0);
-      const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps, pause_split: liveLogged.split, t0_wall_ms: liveT0, end_wall_ms: Date.now(), spike: { steps: liveSteps } };
+      const logged = { state_dir: request.live.stateDir, logged: liveLogged.said, gaps, pause_split: liveLogged.split, t0_wall_ms: liveT0, end_wall_ms: Date.now(), spike: { steps: liveSteps, restored_before: restoredBefore } };
       const measured = {
         unavailable_ms: gaps.max_gap_ms, pause_reported_ms: liveLogged.pauseMs, slowdown: gaps.slowdown, precopy_passes: liveLogged.passes, precopy_bytes: liveLogged.precopyBytes, uploaded_bytes: heldLive - heldBeforeSave,
         kernel_save_ms: liveLogged.kernelMs, memory_save_ms: liveLogged.memoryMs, overall_save_ms: liveLogged.overallMs, store_sent_bytes: liveSentBytes,
