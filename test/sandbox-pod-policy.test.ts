@@ -17,6 +17,7 @@ import { Effect, Layer, Result } from "effect";
 import { request } from "node:https";
 
 import { gvisorReleases, NODE_PINS } from "../cli/src/cluster/node.ts";
+import { POLICY_PROBE_ANNOTATION, POLICY_REVISION_ANNOTATION, probeRefusal } from "../cli/src/manifests/admission.ts";
 import { carriedFrom, decodeInstallConfig, manifests, NOTHING_KEPT } from "../cli/src/manifests/index.ts";
 import { GATEWAY_USER } from "../cli/src/manifests/sandbox-gateway.ts";
 import { ownDirectory } from "../src/gateway/names.ts";
@@ -153,6 +154,13 @@ test("a pool's pod, as its ReplicaSet makes it from its template, is made, VPA's
   // As VPA sizes it as it is made, unlike its template's.
   const sized = await made(poolPod((each) => void (each.spec.containers[0]!.resources = { requests: { cpu: "37m", memory: "777Mi" }, limits: { memory: "3Gi" } })));
   assert.ok("name" in sized, JSON.stringify(sized));
+});
+
+test("a pod that probes the policy is refused before anything else is asked of it, saying the policy's revision, as alasio up waits to find it before it applies a workload", async () => {
+  const revision = of<KubernetesObject>("ValidatingAdmissionPolicy", "alasio-sandbox-pods").metadata?.annotations?.[POLICY_REVISION_ANNOTATION] ?? "";
+  // A pool's pod as its ReplicaSet makes it, which the policy makes otherwise, annotated as a probe.
+  const probe = await made(poolPod((pod) => void (pod.metadata["annotations"] = { ...(pod.metadata["annotations"] as object), [POLICY_PROBE_ANNOTATION]: "true" })));
+  assert.ok("refused" in probe && probe.refused.includes("alasio-sandbox-pods") && probe.refused.includes(probeRefusal(revision)), JSON.stringify(probe));
 });
 
 test("a pool's pod with any field its template pins changed is refused", async () => {

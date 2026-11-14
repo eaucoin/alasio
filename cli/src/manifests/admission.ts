@@ -24,6 +24,10 @@
  * Where a policy holds an object to a rendered one, `pinned` makes the CEL that says so:
  * the object's fields are the rendered ones', key for key and item for item, but for what
  * a Check allows, and what the API server defaults where the rendered one has nothing.
+ *
+ * A policy of pods says, to a pod that probes it, which revision of it holds them (probed), as
+ * the API server holds pods to a policy only a moment after it is applied: alasio up applies
+ * none of the workloads that make pods until each holds them as applied (../kube/apply.ts).
  */
 import { posix } from "node:path";
 
@@ -32,7 +36,7 @@ import type { KubernetesObject, V1Container, V1LabelSelector, V1PodSpec, V1PodTe
 import { SERVING_LABEL } from "../../../neon/control/endpoints.ts";
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
-import { ATTACH_VOLUME, FOLDER_KEY_PREFIX, FOLDER_POOL, FOLDER_POD, folderPodSpec, folderTokenSecret, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
+import { ATTACH_VOLUME, FOLDER_KEY_PREFIX, FOLDER_POOL, FOLDER_POD, folderPodSpec, folderTokenSecret, ownDirectory, SANDBOX_POD_POLICY, templateHash } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID, STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, RESTORE_POD } from "../../../src/node-agent/names.ts";
@@ -116,6 +120,48 @@ function pinnedMap(expression: string, expected: PinnedMap, defaults: Readonly<R
     }),
     ...extra.map((key) => `(!(${JSON.stringify(key)} in ${expression}) || ${pinned(at(key), defaults[key] as Pinned, depth)})`),
   ].join(" && ");
+}
+
+/**
+ * The annotation of a pod that probes a policy of pods of alasio's: the policy refuses it, before
+ * anything else, saying its revision (probeRefusal). Only a dry run makes one.
+ */
+export const POLICY_PROBE_ANNOTATION = "alasio.dev/policy-probe";
+/** The annotation of a policy of pods of alasio's that says its revision: the hash of what it holds pods to. */
+export const POLICY_REVISION_ANNOTATION = "alasio.dev/policy-revision";
+/** The annotation of a policy of pods of alasio's that says, as JSON, the pod that probes it (PolicyProbe). */
+export const POLICY_PROBE_POD_ANNOTATION = "alasio.dev/policy-probe-pod";
+
+/** A pod that probes a policy of pods, as the policy matches it: its namespace, and its labels. */
+export interface PolicyProbe {
+  readonly namespace: string;
+  readonly labels: Readonly<Record<string, string>>;
+}
+
+/** What a policy of pods of the revision `revision` says as it refuses a pod that probes it. */
+export const probeRefusal = (revision: string): string => `a probe of whether this policy holds pods, at revision ${revision}`;
+
+/** A ValidatingAdmissionPolicy, as probed takes one. */
+interface Policy {
+  readonly metadata: { readonly name: string; readonly labels?: Readonly<Record<string, string>>; readonly annotations?: Readonly<Record<string, string>> };
+  readonly spec: { readonly validations: readonly { readonly expression: string; readonly message: string }[] };
+}
+
+/**
+ * `policy`, a policy of pods, refusing first a pod that `probe` says, annotated as probing it
+ * (POLICY_PROBE_ANNOTATION), with what says its revision (probeRefusal), the hash of the rest of
+ * it, which it carries (POLICY_REVISION_ANNOTATION) with the probe (POLICY_PROBE_POD_ANNOTATION).
+ */
+function probed<P extends Policy>(policy: P, probe: PolicyProbe): P {
+  const revision = templateHash(policy).slice(0, 16);
+  return {
+    ...policy,
+    metadata: { ...policy.metadata, annotations: { ...policy.metadata.annotations, [POLICY_REVISION_ANNOTATION]: revision, [POLICY_PROBE_POD_ANNOTATION]: JSON.stringify(probe) } },
+    spec: {
+      ...policy.spec,
+      validations: [{ expression: `!(${JSON.stringify(POLICY_PROBE_ANNOTATION)} in object.metadata.?annotations.orValue({}))`, message: probeRefusal(revision) }, ...policy.spec.validations],
+    },
+  };
 }
 
 /** Whether the request is by main's alasio or a branch environment's, as CEL. */
@@ -469,7 +515,7 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
     ? [`(request.namespace == ${JSON.stringify(sessionsNamespace)} && request.userInfo.username == ${JSON.stringify(restores.restorer)} && (${restoring.map(({ name }) => `variables.${name}`).join(" || ")}))`]
     : [];
   const bound = [BINDING_LABEL, FREE_LABEL, STANDBY_LABEL];
-  const policy = {
+  const policy = probed({
     apiVersion: "admissionregistration.k8s.io/v1",
     kind: "ValidatingAdmissionPolicy",
     metadata,
@@ -518,7 +564,7 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
         },
       ],
     },
-  };
+  }, { namespace: sessionsNamespace, labels: {} });
   const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: name, validationActions: ["Deny"] } };
   return [policy, binding];
 }
@@ -687,7 +733,9 @@ export function harnessPoolPodPolicy({ namespace, branch, templates }: { readonl
     },
   };
   const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: name, validationActions: ["Deny"] } };
-  return [policy, binding];
+  // Probed as a pod of a pool of its, which alone it matches; with no pool, it holds no pod.
+  const [pool] = pools;
+  return [pool === undefined ? policy : probed(policy, { namespace, labels: { [POOL_LABEL]: pool } }), binding];
 }
 
 /** The folder pods' policy, which holds every pod of the folder namespace to the folder template (folderPodPolicy). */
@@ -788,7 +836,7 @@ export function folderPodPolicy(template: V1PodTemplateSpec, { namespace, maker,
     vpaObservedContainers: optional(ANY_STRING),
     vpaUpdates: optional(ANY_STRING),
   } as PinnedMap;
-  const policy = {
+  const policy = probed({
     apiVersion: "admissionregistration.k8s.io/v1",
     kind: "ValidatingAdmissionPolicy",
     metadata,
@@ -828,7 +876,7 @@ export function folderPodPolicy(template: V1PodTemplateSpec, { namespace, maker,
         },
       ],
     },
-  };
+  }, { namespace, labels: {} });
   const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: FOLDER_POD_POLICY, validationActions: ["Deny"] } };
   return [policy, binding];
 }

@@ -21,6 +21,7 @@ import { kind, KubeApi } from "../src/kube/api.ts";
 import { applyInstallation, removeInstallation } from "../src/kube/apply.ts";
 import { checkAutoscalers } from "../src/kube/autoscalers.ts";
 import { awaitRolled, READY_ONCE_BOUND_ANNOTATION, readiness, readinessOf } from "../src/kube/rollout.ts";
+import { POLICY_PROBE_POD_ANNOTATION, POLICY_REVISION_ANNOTATION } from "../src/manifests/admission.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
 
 const WAIT = { timeout: "2 seconds", poll: "10 millis" } as const;
@@ -113,6 +114,51 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
   // All but the Jobs, deleted once run.
   assert.equal(stored.length, objectsOf().filter(({ kind }) => kind !== "Job").length);
   for (const object of stored) assert.equal(object.metadata.labels?.["alasio.dev/installation"], "alasio", `${object.kind} ${object.metadata.name}`);
+});
+
+/** The revision of each policy of pods of `objects`, which a probe finds it holding pods at, by name. */
+const probedRevisions = (objects: readonly KubernetesObject[]): Map<string, string> =>
+  new Map(
+    objects.flatMap(({ kind, metadata }) =>
+      kind === "ValidatingAdmissionPolicy" && metadata?.annotations?.[POLICY_PROBE_POD_ANNOTATION] !== undefined ? [[metadata.name ?? "", metadata.annotations[POLICY_REVISION_ANNOTATION] ?? ""] as const] : []
+    ),
+  );
+
+/** Whether `path` is a workload's, as an apply waits for the policies of pods before. */
+const workloadPath = (path: string): boolean => /\/(deployments|statefulsets|daemonsets|cronjobs)\//u.test(path);
+
+test("no workload is applied until each policy of pods holds them as applied, at its revision: the sandbox gateway makes no standby the policy before would hold", async (t) => {
+  const { kube, run } = await rig(t);
+  const first = objectsOf();
+  await run(applyInstallation(first, WAIT));
+  // Each probed, the sessions' and the harness pools', and each found holding pods at once, as the fake's do.
+  const revisions = probedRevisions(first);
+  assert.deepEqual([...revisions.keys()].toSorted(), ["alasio-harness-pool-pods", "alasio-sandbox-pods"]);
+  assert.deepEqual(new Map(kube.probes.map(({ policy, revision }) => [policy, revision])), revisions);
+  // A release whose sessions' template differs, their resolvers, and with it what their policy holds a pool's pod, a restore's and a standby to.
+  const next = objectsOf({ sessions: { fullModeNameservers: ["9.9.9.9"] } });
+  const policy = "alasio-sandbox-pods";
+  assert.notEqual(probedRevisions(next).get(policy), revisions.get(policy));
+  // The API server holds pods to the policy before for five probes more.
+  kube.policyLag.set(policy, 5);
+  const [changed, probed] = [kube.changes.length, kube.probes.length];
+  await run(applyInstallation(next, WAIT));
+  const answered = kube.probes.slice(probed).filter((probe) => probe.policy === policy);
+  assert.deepEqual(answered.map(({ revision }) => revision), [...Array.from({ length: 5 }, () => revisions.get(policy)), probedRevisions(next).get(policy)]);
+  const workloads = kube.changes.slice(changed).flatMap(({ method, path }, index) => (method === "PATCH" && workloadPath(path) ? [changed + index] : []));
+  assert.ok(workloads.length > 0, "no workload was applied");
+  assert.ok((answered.at(-1)?.after ?? Infinity) <= Math.min(...workloads), "a workload was applied before the policy held pods as applied");
+});
+
+test("an apply whose policy of pods never holds them as applied fails within a minute, naming it, and applies no workload", { timeout: 120_000 }, async (t) => {
+  const { kube, run } = await rig(t);
+  await run(applyInstallation(objectsOf(), WAIT));
+  kube.policyLag.set("alasio-sandbox-pods", Number.MAX_SAFE_INTEGER);
+  const changed = kube.changes.length;
+  const error = await run(Effect.flip(applyInstallation(objectsOf({ sessions: { fullModeNameservers: ["9.9.9.9"] } }), WAIT)));
+  assert.equal(error._tag, "PolicyNotInForce");
+  assert.match(error.message, /^the admission policy alasio-sandbox-pods did not hold pods as applied within 60 s \(.*a probe of whether this policy holds pods, at revision [0-9a-f]{16}\), so no workload was applied: none makes a pod the policy does not hold yet$/u);
+  assert.deepEqual(kube.changes.slice(changed).filter(({ path }) => workloadPath(path)), []);
 });
 
 test("a call the API server is too busy for, answered 504, 503 or 429, is asked again, after the Retry-After it says, within its bound; one failed otherwise, or past the bound, fails as answered", async (t) => {

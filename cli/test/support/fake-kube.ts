@@ -24,7 +24,7 @@ import { buffer } from "node:stream/consumers";
 
 import { KubeConfig } from "@kubernetes/client-node";
 
-import { harnessPoolPodPolicyName } from "../../src/manifests/admission.ts";
+import { harnessPoolPodPolicyName, POLICY_PROBE_ANNOTATION, POLICY_PROBE_POD_ANNOTATION, POLICY_REVISION_ANNOTATION, type PolicyProbe, probeRefusal } from "../../src/manifests/admission.ts";
 
 /** The fake's certificate, for 127.0.0.1, and its key: made once for these tests, valid for a century. */
 export const CERTIFICATE = `-----BEGIN CERTIFICATE-----
@@ -101,6 +101,13 @@ export interface KubeForward {
 }
 
 /** What a command run in a container came to. */
+/** A probe of a policy of pods the fake answered: the policy, the revision it answered at (null for none), and how many changes had been made then. */
+export interface KubeProbe {
+  readonly policy: string;
+  readonly revision: string | null;
+  readonly after: number;
+}
+
 export interface KubeExecResult {
   readonly exitCode: number;
   readonly stdout?: string;
@@ -156,6 +163,14 @@ export interface FakeKube {
   readonly get: (path: string) => KubeObject | undefined;
   /** Puts `object` at the path its kind (`plural`) and names make. */
   readonly put: (plural: string, object: KubeObject) => void;
+  /**
+   * The policies of pods that answer as many probes (POLICY_PROBE_ANNOTATION) as each says at the
+   * revision applied before theirs, or as none where there was none, by name, as the API server
+   * holds pods to a policy only a moment after it is applied. Every other answers at its own.
+   */
+  readonly policyLag: Map<string, number>;
+  /** The probes of policies of pods it answered, in order. */
+  readonly probes: KubeProbe[];
   /** Takes the object at `path` away, as one gone without a request of the test's, a pod a scale-in ended say. */
   readonly drop: (path: string) => void;
   readonly close: () => Promise<void>;
@@ -280,6 +295,10 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const execs: KubeExec[] = [];
   const forwards: KubeForward[] = [];
   const forwarded = new Map<string, number>();
+  const policyLag = new Map<string, number>();
+  const probes: KubeProbe[] = [];
+  /** The revision of each policy of pods before the one applied last, by name. */
+  const revisionsBefore = new Map<string, string>();
   let version = 0;
 
   const put = (plural: string, object: KubeObject): void => {
@@ -528,6 +547,23 @@ export async function serveFakeKube(): Promise<FakeKube> {
       if (existing?.kind === "StatefulSet" && patch.spec?.["podManagementPolicy"] !== undefined && policy(patch) !== policy(existing)) {
         return refuse(response, 422, `StatefulSet.apps "${target.name}" is invalid: spec: Forbidden: updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden`);
       }
+      // A pod that probes a policy of pods refused by the policy that matches it, at its revision, or at the one before while it lags.
+      const probed = patch.kind === "Pod" && (patch.metadata["annotations"] as Record<string, string> | undefined)?.[POLICY_PROBE_ANNOTATION] !== undefined
+        ? [...objects.values()].find((object) => {
+          const probe = (object.metadata["annotations"] as Record<string, string> | undefined)?.[POLICY_PROBE_POD_ANNOTATION];
+          if (object.kind !== "ValidatingAdmissionPolicy" || probe === undefined) return false;
+          const { namespace, labels } = JSON.parse(probe) as PolicyProbe;
+          return namespace === target.namespace && Object.entries(labels).every(([key, value]) => patch.metadata.labels?.[key] === value);
+        })
+        : undefined;
+      if (probed) {
+        const name = probed.metadata.name;
+        const lag = policyLag.get(name) ?? 0;
+        if (lag > 0) policyLag.set(name, lag - 1);
+        const revision = lag > 0 ? (revisionsBefore.get(name) ?? null) : ((probed.metadata["annotations"] as Record<string, string>)[POLICY_REVISION_ANNOTATION] ?? null);
+        probes.push({ policy: name, revision, after: changes.length });
+        if (revision !== null) return refuse(response, 422, `pods "${target.name}" is forbidden: ValidatingAdmissionPolicy '${name}' with binding '${name}' denied request: ${probeRefusal(revision)}`);
+      }
       // A harness pool's pod held to its templates by its environment's policy of them, once that is held: the fake makes no pod of a pool's itself, so one it is asked to make is none of them.
       // Each environment's policy holds its own namespace's pods alone, main's or a branch's.
       const branch = target.namespace?.startsWith("alasio-branch-") ? target.namespace.slice("alasio-branch-".length) : null;
@@ -558,6 +594,9 @@ export async function serveFakeKube(): Promise<FakeKube> {
       const specChanged = JSON.stringify(next.spec) !== JSON.stringify(existing?.spec);
       next.metadata = { ...next.metadata, resourceVersion: String(version), generation: (base.metadata.generation ?? 0) + (specChanged || !existing ? 1 : 0) };
       if (dryRun) return json(response, existing ? 200 : 201, next);
+      const revisionOf = (object: KubeObject | undefined) => (object?.metadata["annotations"] as Record<string, string> | undefined)?.[POLICY_REVISION_ANNOTATION];
+      const before = revisionOf(existing);
+      if (next.kind === "ValidatingAdmissionPolicy" && before !== undefined && before !== revisionOf(next)) revisionsBefore.set(next.metadata.name, before);
       settle(next);
       objects.set(path, next);
       return json(response, existing ? 200 : 201, next);
@@ -655,6 +694,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     forbidden,
     busy,
     unserved,
+    policyLag,
+    probes,
     drop: (path) => void objects.delete(path),
     execs,
     onExec: () => ({ exitCode: 0 }),

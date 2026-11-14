@@ -1,10 +1,11 @@
 /**
  * Applying an installation of alasio: its objects, every one labelled as the
  * installation's, server-side applied as alasio in the order what runs needs them: CRDs,
- * waited for until established; namespaces, and the cluster's classes of pods; what pods
- * run as and with, and where the API server
+ * waited for until established; the admission policies; namespaces, and the cluster's classes
+ * of pods; what pods run as and with, and where the API server
  * reaches its extensions (APIServices, webhooks); Jobs, each run to completion afresh
- * (the Neon setup, which makes the Secrets the stack mounts); the workloads, each that names
+ * (the Neon setup, which makes the Secrets the stack mounts); once each policy of pods holds
+ * them as applied, the workloads, each that names
  * others of them it waits for (APPLIED_AFTER_ANNOTATION) applied only once those are ready,
  * and each that names DaemonSets (APPLIED_ONCE_ROLLED_ANNOTATION) once those have rolled on the
  * Ready nodes they run a pod on, or ROLLED_WAIT has passed; then what
@@ -19,13 +20,11 @@
  * is deleted first, and waited for, while the controller runs to let go of it, or let go of
  * here where it has not within a minute, as it does not run.
  */
-import type { KubernetesObject, V1Deployment } from "@kubernetes/client-node";
+import type { KubernetesObject } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
-import { POOL_LABEL } from "../../../src/binder/names.ts";
-import { harnessPoolPodPolicyName } from "../manifests/admission.ts";
+import { POLICY_PROBE_ANNOTATION, POLICY_PROBE_POD_ANNOTATION, POLICY_REVISION_ANNOTATION, type PolicyProbe, probeRefusal } from "../manifests/admission.ts";
 import { APPLIED_AFTER_ANNOTATION, APPLIED_ONCE_ROLLED_ANNOTATION, RELEASE } from "../manifests/common.ts";
-import { FOLDER_HARNESS_POOLS, HARNESS_POOLS } from "../manifests/harness-pools.ts";
 import { describeRef, FIELD_MANAGER, hasStatus, type Kind, kind, type KindName, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./api.ts";
 import { awaitGone, awaitReady, awaitRolled, type NotReadyInTime, type RolloutFailed, selectorOf, type WaitOptions } from "./rollout.ts";
 
@@ -131,49 +130,52 @@ const key = (ref: ObjectRef): string => `${ref.apiVersion}/${ref.kind}/${ref.nam
 /** How applying an installation fails. */
 export type ApplyError = KubeApiError | NotReadyInTime | RolloutFailed | PolicyNotInForce;
 
-/** How long the harness pools' pods' policy is waited for to come into force before their pools are made, at most. */
+/** How long the policies of pods are waited for to hold them as applied before any workload is, at most, whatever the apply's timeout. */
 const POLICY_IN_FORCE_MS = 60_000;
-/** How often whether it is in force is asked. */
+/** How often whether a policy holds pods as applied is asked. */
 const POLICY_PROBE_EVERY = "200 millis";
 
-/** The harness pools' pods' policy was not in force in time, so none of their pools was made. */
+/** A policy of pods did not hold them as applied in time, so no workload was applied. */
 export class PolicyNotInForce extends Schema.TaggedError<PolicyNotInForce>()("PolicyNotInForce", { policy: Schema.String, reason: Schema.String }) {
   override get message(): string {
-    return `the policy that holds the harness pools' pods to their templates, ${this.policy}, was not in force within ${POLICY_IN_FORCE_MS / 1000} s (${this.reason}), so none of their pools was made`;
+    return `the admission policy ${this.policy} did not hold pods as applied within ${POLICY_IN_FORCE_MS / 1000} s (${this.reason}), so no workload was applied: none makes a pod the policy does not hold yet`;
   }
 }
 
-/** A dry run's pod the policy did not refuse, as it was made, or refused for another reason: why. */
+/** A probe the policy did not refuse as of its revision, made or refused otherwise: why. */
 class NotYetInForce extends Schema.TaggedError<NotYetInForce>()("NotYetInForce", { reason: Schema.String }) {}
 
 /**
- * Waits, where `objects` hold an environment's harness pools and the policy that holds their
- * pods to their templates (../manifests/admission.ts harnessPoolPodPolicy), until the API server
- * holds pods to it, as a policy comes into force a moment after it is applied, and a pool's pod
- * made before would be held to none: in force once it refuses a pod of a pool's labels but of
- * none of its template, made as a dry run. One made, or refused for another reason, as by a
+ * Waits until the API server holds pods to each policy of pods of `objects` as they have it, at
+ * its revision (../manifests/admission.ts probed), as a policy comes into force a moment after
+ * it is applied: a pod a workload made before would be held to none, or to the policy's
+ * revision before, which may refuse what this release's makes, as a standby's shape, or admit
+ * what it no longer does. In force once it refuses a pod that probes it, made as a dry run,
+ * saying its revision. One made, or refused otherwise, as by the revision before, or by a
  * namespace whose ServiceAccount is not made yet, is asked again, for POLICY_IN_FORCE_MS at most.
  */
-const harnessPoolPolicyInForce = Effect.fnUntraced(function*(objects: readonly KubernetesObject[]): Effect.fn.Return<void, PolicyNotInForce, KubeApi> {
+const policiesInForce = Effect.fnUntraced(function*(objects: readonly KubernetesObject[]): Effect.fn.Return<void, PolicyNotInForce, KubeApi> {
   const kube = yield* KubeApi;
-  const pools: readonly string[] = [...Object.values(HARNESS_POOLS), ...Object.values(FOLDER_HARNESS_POOLS)];
-  const policy = objects.find(({ kind: of, metadata }) => of === "ValidatingAdmissionPolicy" && metadata?.name?.startsWith(harnessPoolPodPolicyName(null)))?.metadata?.name;
-  const pool = (objects.filter(({ kind: of }) => of === "Deployment") as V1Deployment[]).find((deployment) => pools.includes(deployment.spec?.template.metadata?.labels?.[POOL_LABEL] ?? ""));
-  if (!policy || !pool) return;
-  const probe = {
-    apiVersion: "v1",
-    kind: "Pod",
-    metadata: { name: "alasio-policy-probe", namespace: pool.metadata?.namespace ?? "", labels: { ...pool.spec?.template.metadata?.labels } },
-    spec: { containers: [{ name: "probe", image: "alasio-policy-probe" }] },
-  };
-  yield* kube.dryApply(probe).pipe(
-    Effect.matchEffect({
-      onFailure: (error) => (error.reason.includes(policy) ? Effect.void : Effect.fail(new NotYetInForce({ reason: error.reason }))),
-      onSuccess: () => Effect.fail(new NotYetInForce({ reason: "a pod of none of its templates was made" })),
-    }),
-    Effect.retry({ schedule: Schedule.max([Schedule.spaced(POLICY_PROBE_EVERY), Schedule.during(POLICY_IN_FORCE_MS)]) }),
-    Effect.mapError(({ reason }) => new PolicyNotInForce({ policy, reason })),
-  );
+  const policies = objects.filter(({ kind: of, metadata }) => of === "ValidatingAdmissionPolicy" && metadata?.annotations?.[POLICY_PROBE_POD_ANNOTATION] !== undefined);
+  yield* Effect.forEach(policies, ({ metadata }) => {
+    const name = metadata?.name ?? "";
+    const revision = metadata?.annotations?.[POLICY_REVISION_ANNOTATION] ?? "";
+    const { namespace, labels } = JSON.parse(metadata?.annotations?.[POLICY_PROBE_POD_ANNOTATION] ?? "{}") as PolicyProbe;
+    const probe = {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name: "alasio-policy-probe", namespace, labels, annotations: { [POLICY_PROBE_ANNOTATION]: "true" } },
+      spec: { containers: [{ name: "probe", image: "alasio-policy-probe" }] },
+    };
+    return kube.dryApply(probe).pipe(
+      Effect.matchEffect({
+        onFailure: (error) => (error.reason.includes(name) && error.reason.includes(probeRefusal(revision)) ? Effect.void : Effect.fail(new NotYetInForce({ reason: error.reason }))),
+        onSuccess: () => Effect.fail(new NotYetInForce({ reason: "a pod that probes it was made" })),
+      }),
+      Effect.retry({ schedule: Schedule.max([Schedule.spaced(POLICY_PROBE_EVERY), Schedule.during(POLICY_IN_FORCE_MS)]) }),
+      Effect.mapError(({ reason }) => new PolicyNotInForce({ policy: name, reason })),
+    );
+  }, { concurrency: 4, discard: true });
 });
 
 /** The installation's objects of `kinds`, as it has them now: none of a kind whose CRD the cluster lacks. */
@@ -348,8 +350,8 @@ const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObje
     }
     if (phase.includes("PriorityClass")) yield* replaceChangedClasses(batch, options);
     if (phase.includes("Deployment")) {
-      // No pool's pod made before its policy holds it.
-      yield* harnessPoolPolicyInForce(objects);
+      // No pod made by a workload before its policy holds it as applied.
+      yield* policiesInForce(objects);
       yield* handOverReplicas(batch);
     }
     // Those that wait for others of theirs (APPLIED_AFTER_ANNOTATION) once the rest are applied, each once those are ready.
