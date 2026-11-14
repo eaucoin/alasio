@@ -958,30 +958,38 @@ if (inShard("upgrade")) {
       assert.ok(!existsSync(gvisorDirectory(dropped.release)), `gVisor ${dropped.release} is installed still`);
     });
 
-    // The session restored on the release before, under a gVisor release whose shim this release restores into no standby
-    // with, is restored into a pod of its own, and keeps none on its node; a session saved under the current release, whose
-    // shim takes its socket in /run/gvisor/standby alone, is restored into the standby its node keeps after a restore there,
-    // whole, its socket there, its shim's.
-    test("upgraded: a session saved under the release before's gVisor release is restored into a pod of its own, keeping no standby; one saved under the current release is restored into the standby its node keeps, its socket in /run/gvisor/standby", { timeout: 60 * 60_000 }, async (t) => {
+    // The session restored on the release before is restored whole, never into the release before's standby, which is gone:
+    // under a gVisor release whose shim this release restores into no standby with, into a pod of its own, keeping none on
+    // its node; under one it restores into standbys with, as it would be under this release's own. A session saved under
+    // the current release, whose shim takes its socket in /run/gvisor/standby alone, is restored into the standby its node
+    // keeps after a restore there, whole, its socket there, its shim's.
+    test("upgraded: a session saved under the release before's gVisor release is restored whole, into a pod of its own and keeping no standby where this release restores into none under it; one saved under the current release is restored into the standby its node keeps, its socket in /run/gvisor/standby", { timeout: 60 * 60_000 }, async (t) => {
       if (standbyBefore === null) return void t.skip(NO_STANDBY);
       const { configFile } = paths();
       if (JSON.parse(readFileSync(configFile, "utf8")).install.sessions.snapshots["releaseAfter"] !== `${RELEASE_AFTER_SECONDS}s`) {
         await configured((sessions) => void (sessions.snapshots["releaseAfter"] = `${RELEASE_AFTER_SECONDS}s`));
       }
       const before = gvisorReleases(NODE_PINS).find((release) => gvisorRuntimeClass(release) === standbyBefore?.runtimeClassName);
-      assert.ok(before !== undefined && !restoresIntoStandby(before, NODE_PINS.gvisor.restoresIntoStandbySince ?? ""), `${standbyBefore.runtimeClassName} is of a release this one pins and restores into standbys with`);
-      // Released, under the release before's, which took its snapshot: restored into a pod made for it, its REPL whole.
+      assert.ok(before !== undefined, `${standbyBefore.runtimeClassName} is of no release this one pins`);
+      const standing = restoresIntoStandby(before, NODE_PINS.gvisor.restoresIntoStandbySince ?? "");
+      // Released, under the release before's, which took its snapshot: restored, its REPL whole, never into the release
+      // before's standby; where this release restores into no standby under it, into a pod made for it.
       await untilReleased(STANDBY_SESSION, Date.now());
       assert.equal((await snapshotOf(STANDBY_SESSION))?.release, before);
       const { name: restored, node } = await bindSession(STANDBY_SESSION);
+      assert.notEqual(restored, standbyBefore.name);
       assert.equal((await sessionPod(STANDBY_SESSION)).spec?.runtimeClassName, standbyBefore.runtimeClassName);
-      assert.ok((await gatewayLogs()).some((line) => line.includes(`restoring ${SESSIONS}/${STANDBY_SESSION} on ${node} from its snapshot `)), `the gateway logged no restore of ${STANDBY_SESSION} into ${restored}, a pod made for it`);
+      if (!standing) {
+        assert.ok((await gatewayLogs()).some((line) => line.includes(`restoring ${SESSIONS}/${STANDBY_SESSION} on ${node} from its snapshot `)), `the gateway logged no restore of ${STANDBY_SESSION} into ${restored}, a pod made for it`);
+      }
       const seen = await repl.read(STANDBY_SESSION, standbyRepl);
       assert.deepEqual([seen.live, seen.checkpointed], [`restored on ${PREVIOUS}`, `restored on ${PREVIOUS}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
-      // None kept after it, well past when one would be made.
-      await sleep(STANDBY_AFTER_MS + 30_000);
-      assert.deepEqual((await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).map(({ metadata }) => metadata?.name), []);
+      if (!standing) {
+        // None kept after it, well past when one would be made.
+        await sleep(STANDBY_AFTER_MS + 30_000);
+        assert.deepEqual((await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).map(({ metadata }) => metadata?.name), []);
+      }
 
       // A session of the current release: restored once, which keeps a standby on its node, then restored into it.
       const current = await newSession("none");
@@ -989,9 +997,13 @@ if (inShard("upgrade")) {
       await untilReleased(current, Date.now());
       const [release] = gvisorReleases(NODE_PINS);
       assert.equal((await snapshotOf(current))?.release, release);
+      // The standby its node keeps after this restore, which takes the place of any it kept before, as one kept after the
+      // restore of the session saved under the release before's, where it restores into standbys too.
+      const bound = Date.now();
       const { node: on } = await bindSession(current);
-      const [standby] = await until(`a standby running on ${on}`, async () => {
-        const running = await standbysRunning(on);
+      const [standby] = await until(`a standby running on ${on}, made after the restore of ${current}`, async () => {
+        // Its creation time, of whole seconds, no later than when it was made.
+        const running = (await standbysRunning(on)).filter(({ metadata }) => new Date(metadata?.creationTimestamp ?? 0).getTime() >= bound - 1000);
         return running.length > 0 ? running : undefined;
       }, 300_000);
       const name = standby?.metadata?.name ?? "";
