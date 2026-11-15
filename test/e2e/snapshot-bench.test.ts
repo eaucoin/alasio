@@ -842,6 +842,8 @@ async function restoreBefore(workspace: string, sessionId: string, fixture: stri
   await gone(bound.name);
   // Its first exec alone, as the probe's, without the verify, which reads every page.
   const asked = Date.now();
+  // A restore on the node, after which the gateway makes its standby: the run's own restores wait for that one (standbyFor).
+  lastRestoreAt = asked;
   await driver(workspace, "first", "--session", sessionId, "--fixture", fixture);
   const firstMs = Date.now() - asked;
   await sleep(WORKING_SET_HELD_MS);
