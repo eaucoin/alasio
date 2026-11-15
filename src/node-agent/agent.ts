@@ -1180,8 +1180,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * from `committed` meanwhile. Its new snapshot, or null where it did not compact it.
    * Nothing waits on it: it writes and uploads its image before it holds the workspace, then
    * checks it in the bucket and commits it once it holds it, as a checkpoint commits its own.
+   * It says how it ended, compacted or superseded, by `ended`.
    */
-  const compactNow = (committed: Manifest): Effect.Effect<Manifest | null, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
+  const compactNow = (committed: Manifest, ended: (outcome: string) => Effect.Effect<void>): Effect.Effect<Manifest | null, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const why = compactionDue(committed.layers);
       if (why === null) return null;
@@ -1289,11 +1290,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           }),
         );
         if (manifest === null) {
-          yield* Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "superseded" }));
+          yield* ended("superseded");
           yield* Effect.logInfo(`compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}, but the workspace moved on from it meanwhile: the compacted image is left to be collected`);
           return null;
         }
-        yield* Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "compacted" }));
+        yield* ended("compacted");
         yield* Effect.logInfo(
           `compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}: its ${committed.layers.length} images, ${committed.bytes} bytes, are the image of its snapshot ${snapshot}, ${manifest.bytes} bytes, in ${compactMs} ms, uploaded in ${uploadMs} ms`,
         );
@@ -1347,22 +1348,37 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /**
    * Compacts `committed` as compactNow does, once no other compaction runs on the node, in the agent's scope: what fails is
-   * said, and changes nothing. One of the workspace's before it is stopped, as the workspace has moved on from it.
+   * said, and changes nothing. One of the workspace's before it is stopped, as the workspace has moved on from it. Each is
+   * counted once, by how it ended: one stopped after it has counted its outcome, as it removes what it staged once it has
+   * committed or been superseded, is not counted again as stopped.
    */
   const compactLater = (committed: Manifest): Effect.Effect<void> =>
-    compactNow(committed).pipe(
-      compacting.withPermits(1),
-      // Its workspace's images, which it reads and writes beside the lock, are spared meanwhile.
-      (compacting) => inFlightWhile([committed], compacting),
-      Effect.tapError((error) => Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": error._tag }))),
-      Effect.catch((error) => Effect.logWarning(`compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)} failed, which changes nothing of it: ${error.message}`)),
-      Effect.onInterrupt(() =>
-        Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "stopped" })).pipe(
-          Effect.andThen(Effect.logInfo(`stopped compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)}, which changes nothing of it`)),
-        )
-      ),
-      withAlasioSpan("alasio.node_agent.compaction", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot } }),
-      withLogScope("node-agent"),
+    Effect.suspend(() => {
+      /** How it ended, once counted. */
+      let outcome: string | null = null;
+      const ended = (counted: string) =>
+        Effect.sync(() => {
+          if (outcome !== null) return;
+          outcome = counted;
+          compactions.add(1, { "alasio.node_agent.compaction.outcome": counted });
+        });
+      return compactNow(committed, ended).pipe(
+        compacting.withPermits(1),
+        // Its workspace's images, which it reads and writes beside the lock, are spared meanwhile.
+        (compacting) => inFlightWhile([committed], compacting),
+        Effect.tapError((error) => ended(error._tag)),
+        Effect.catch((error) => Effect.logWarning(`compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)} failed, which changes nothing of it: ${error.message}`)),
+        Effect.onInterrupt(() =>
+          Effect.suspend(() =>
+            outcome !== null ? Effect.void : ended("stopped").pipe(
+              Effect.andThen(Effect.logInfo(`stopped compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)}, which changes nothing of it`)),
+            )
+          )
+        ),
+        withAlasioSpan("alasio.node_agent.compaction", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot } }),
+        withLogScope("node-agent"),
+      );
+    }).pipe(
       FiberMap.run(compactionsRunning, prefixOf(committed)),
       Effect.asVoid,
     );
