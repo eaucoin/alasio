@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
 
@@ -313,11 +313,9 @@ test("one session's requests hold at most a share of what the receiver may hold,
 });
 
 test("a session's telemetry the collector does not take, down longer than the forwarder's retries, is never answered as taken to bayma's exporter, and is once the collector takes it", async () => {
-  // The collector's port, nothing listening on it until it comes up.
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  const port = (probe.address() as AddressInfo).port;
-  await new Promise((resolve) => probe.close(resolve));
+  // The collector, down until it comes up: each connection to it reset as it is made, no request of it read. Its port held
+  // throughout, so that no other process takes it before it comes up.
+  let collectorUp = false;
   const taken: Buffer[] = [];
   const collector = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -327,6 +325,11 @@ test("a session's telemetry the collector does not take, down longer than the fo
       response.writeHead(200, { "content-type": "application/x-protobuf" }).end();
     });
   });
+  collector.prependListener("connection", (socket: Socket) => {
+    if (!collectorUp) socket.resetAndDestroy();
+  });
+  await new Promise<void>((resolve) => collector.listen(0, "127.0.0.1", resolve));
+  const { port } = collector.address() as AddressInfo;
   const forwarder = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port}` });
   try {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -344,7 +347,7 @@ test("a session's telemetry the collector does not take, down longer than the fo
         for (const deadline = Date.now() + 5_000; receiver.held().bytes > 0; await new Promise((resolve) => setTimeout(resolve, 10))) {
           assert.ok(Date.now() < deadline, "the forward of the exporter's last attempt outlived the exporter");
         }
-        await new Promise<void>((resolve) => collector.listen(port, "127.0.0.1", resolve));
+        collectorUp = true;
         const up = await exported("once-up");
         assert.equal(up.code, ExportResultCode.SUCCESS);
         assert.deepEqual(taken.map((body) => [/once-up/u.test(body.toString("latin1")), /while-down/u.test(body.toString("latin1"))]), [[true, false]]);
