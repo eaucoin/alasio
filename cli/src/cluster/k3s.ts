@@ -47,21 +47,43 @@ export interface Registries {
   readonly configs?: Readonly<Record<string, { readonly tls: RegistryTls }>>;
 }
 
+/**
+ * How often, in seconds, kubelet reports its node's status though nothing of it changed
+ * (KUBELET_CONFIG): as often as it looks at it (its nodeStatusUpdateFrequency, 10 s by
+ * default). After its first report, and after one of a change, the next comes up to half of
+ * this sooner or later, so k3s's network policy controller starts within some 15 s of beginning
+ * to wait for one. A report is a patch of the node's status, a few kilobytes, to the API server.
+ */
+export const NODE_STATUS_REPORT_SECONDS = 10;
+
 /** Where a node's kubelet config file is, which k3s copies among its own kubelet's (KUBELET_ARGS). */
 export const KUBELET_CONFIG_PATH = "/etc/rancher/k3s/kubelet.yaml";
 
 /**
- * What kubelet takes from its config file alone: a container over its memory's limit has the
- * kernel kill its largest process alone (singleProcessOOMKill), as a build or a dev server an
- * agent runs in a folder instance or a harness's pod is, rather than every process in it, as
- * kubelet has the kernel do on cgroup v2 otherwise: the container, its bayma or harness and
- * their REPL sessions, lives on, and the exec that ran it says it was killed.
+ * What kubelet takes from its config file alone:
+ *
+ * - a container over its memory's limit has the kernel kill its largest process alone
+ *   (singleProcessOOMKill), as a build or a dev server an agent runs in a folder instance or a
+ *   harness's pod is, rather than every process in it, as kubelet has the kernel do on cgroup v2
+ *   otherwise: the container, its bayma or harness and their REPL sessions, lives on, and the
+ *   exec that ran it says it was killed;
+ * - its node's status is reported every NODE_STATUS_REPORT_SECONDS whether or not it changed
+ *   (nodeStatusReportFrequency), not every 5 minutes. k3s starts its network policy controller,
+ *   kube-router, only once the node's Ready condition has been reported since k3s started
+ *   (k3s's pkg/agent/netpol), and kubelet reports an unchanged status only that often, its
+ *   first report after its own start up to half of it sooner or later; a kubelet that reported
+ *   as it started, before the controller looked, has it wait for that next report, 2.5 to 7.5
+ *   minutes by default. Until the controller starts, the rules of the pods that ran before k3s
+ *   started stay as they were, and a pod started since has none: its network policies are not
+ *   in force, and a restore into it is not resumed (src/node-agent/agent.ts), after every start
+ *   of k3s, an upgrade's or systemd's after k3s ended.
  */
 export const KUBELET_CONFIG = [
   "# kubelet as alasio's cluster runs it, beside what k3s gives it: alasio up writes this file.",
   "apiVersion: kubelet.config.k8s.io/v1beta1",
   "kind: KubeletConfiguration",
   "singleProcessOOMKill: true",
+  `nodeStatusReportFrequency: ${NODE_STATUS_REPORT_SECONDS}s`,
   "",
 ].join("\n");
 

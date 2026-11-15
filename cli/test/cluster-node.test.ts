@@ -75,11 +75,13 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
     // Its sandbox image by the name the CRI pins it by.
     "pause-image": "docker.io/rancher/mirrored-pause:3.10.2",
   });
-  // A container over its memory's limit loses its largest process alone, not every process in it.
+  // A container over its memory's limit loses its largest process alone, not every process in it; and the node's status is
+  // reported every 10 s, changed or not, so k3s's network policy controller, which waits for a report, waits no longer.
   assert.deepEqual(files.get("/etc/rancher/k3s/kubelet.yaml")?.split("\n").filter((line) => !line.startsWith("#")), [
     "apiVersion: kubelet.config.k8s.io/v1beta1",
     "kind: KubeletConfiguration",
     "singleProcessOOMKill: true",
+    "nodeStatusReportFrequency: 10s",
     "",
   ]);
   const runtimes = containerdFiles(["20990101.0"], { systemd: true });
