@@ -235,6 +235,11 @@ export interface FakeReleases {
   readonly held: (containerId: string, status: string) => void;
   /** Makes containerd's annotations say the container is its pod's own, its sandbox's root container, as a pod's pause container is. */
   readonly rooted: (containerId: string) => void;
+  /**
+   * Makes the container's sandbox's process gone from the node's /proc, as a sandbox that died leaves runsc's state naming
+   * it; or, given `program`, a process of that program, as one the node gave its pid since is.
+   */
+  readonly died: (containerId: string, program?: string) => void;
   /** Installs `release` beside the others, as a node is given one it keeps. */
   readonly installs: (release: string) => void;
 }
@@ -289,6 +294,16 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     kept[containerId] = { ...of, annotations: { ...of.annotations, "io.kubernetes.cri.container-type": "sandbox" } };
     writeFileSync(containers, JSON.stringify(kept));
   };
+  const died = (containerId: string, program?: string) => {
+    const of = (JSON.parse(readFileSync(containers, "utf8")) as Record<string, { pid: number }>)[containerId];
+    if (of === undefined) throw new Error(`no container ${containerId} runs`);
+    const proc = join(procRoot, String(of.pid));
+    rmSync(proc, { recursive: true, force: true });
+    if (program === undefined) return;
+    mkdirSync(proc, { recursive: true });
+    symlinkSync(program, join(proc, "exe"));
+    writeFileSync(join(proc, "cmdline"), `${program}\0`);
+  };
   const starts = (argv0: string, args: readonly string[]) => {
     // Its arguments after node's own, which end at "--".
     const started = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { argv0, stdio: "ignore" });
@@ -323,6 +338,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     runs,
     held,
     rooted,
+    died,
     installs,
     dirOf,
     bundleOf,

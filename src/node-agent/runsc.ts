@@ -182,6 +182,8 @@ export type Verified = { readonly restorable: true } | { readonly restorable: fa
 export interface Runsc {
   /** The releases installed on this node, in order. */
   readonly releases: Effect.Effect<readonly string[]>;
+  /** The release the node's runtime starts sandboxes with (RunscOptions.current). */
+  readonly current: string;
   /**
    * Saves the sandbox of a container whole into `imagePath`, uncompressed, as a restore
    * reading it directly needs, which ends the sandbox unless it is saved live.
@@ -195,7 +197,8 @@ export interface Runsc {
    * Kills a container, by its runtime's id, as its shim would, `runsc kill <id> KILL`: one runsc holds paused, as each of a
    * sandbox restored whole is until its resume, as the fork's runsc kills one (runsc/container/container.go killPaused),
    * every process of its sandbox with it where it is the sandbox's root container, or of a sandbox restored paused and never
-   * resumed since, each container of the sandbox ending, as runsc's state then says.
+   * resumed since, each container of the sandbox ending, as runsc's state then says. One whose sandbox died, which runsc
+   * holds stopped, is killed with nothing left to kill, as the fork's runsc lets it be from 20261102.0-eaucoin.7 on.
    */
   readonly kill: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
@@ -376,6 +379,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
 
   return {
     releases,
+    current,
 
     checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false }) =>
       run(release, ["checkpoint"], [

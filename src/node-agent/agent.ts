@@ -2086,7 +2086,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * found, and the containers it ended through runsc. Of those held paused, the pod's own, its
    * sandbox's root container, is killed first, which ends every container of the sandbox, the
    * others then listed again: one still held paused, as one of another sandbox would be, is killed
-   * next, and one held paused after its kill fails the abandon. A process one of them forks is the
+   * next, and one held paused after its kill fails the abandon. One whose sandbox died is killed through the current
+   * release's runsc, as the release that ran it is not known any more. A process one of them forks is the
    * container's from its fork on, as its arguments, until it execs, are those of the runsc it
    * forked from, and its own after; so one forked as the scan before ran, or as the process it
    * forked from was killed, is found by the scan after the kills. The scans go on until one kills
@@ -2106,8 +2107,14 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         if (ended.includes(paused.id)) {
           return yield* new RunscError({ release: "the node's", command: `kill ${paused.id} KILL`, reason: "runsc holds the container paused still after its kill" });
         }
-        // Through the release that runs its sandbox, as its shim would.
-        const { release } = yield* runsc.container(paused.id);
+        // Through the release that runs its sandbox, as its shim would; through the current release where its sandbox's
+        // process is not one of a release's, as one whose sandbox died is not (its pid gone, or another process's since),
+        // which runsc then holds stopped and whose kill it lets succeed.
+        const release = yield* runsc.container(paused.id).pipe(
+          Effect.map(({ release }) => release),
+          Effect.catchTag("RunscError", (error) =>
+            Effect.as(Effect.logWarning(`killing ${paused.id} through the current release's runsc, ${runsc.current}, as ${error.message}`), runsc.current)),
+        );
         yield* runsc.kill(release, paused.id);
         ended.push(paused.id);
         containers = yield* listed;

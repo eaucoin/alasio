@@ -3810,6 +3810,29 @@ test("an abandon kills through runsc the containers it holds paused, as each of 
     })
   ));
 
+test("an abandon kills through the current release's runsc the containers runsc holds paused whose sandbox died, its process gone or its pid another's since; then what runsc runs for them", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const OLDER = "20260921.0-eaucoin.7";
+      for (const reused of [undefined, "/usr/bin/sleep"]) {
+        const here = yield* node(reused === undefined ? "node-1" : "node-2", { releases: [RELEASE, OLDER] });
+        // Run by the older release, whose sandbox's process is no release's any more.
+        for (const id of [CONTAINER, OTHER_CONTAINER]) {
+          here.releases.runs(id, OLDER, SESSIONS, POD);
+          here.releases.held(id, "paused");
+          here.releases.died(id, reused);
+        }
+        here.releases.rooted(OTHER_CONTAINER);
+        const gofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, CONTAINER));
+        const killed = yield* here.agent.abandon(abandonRequest);
+        assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.filter((arg) => !arg.startsWith("--"))), [["kill", OTHER_CONTAINER, "KILL"]]);
+        assert.deepEqual(here.releases.calls(OLDER), []);
+        assert.deepEqual(killed, [{ containerId: CONTAINER, pid: gofer.pid }]);
+        assert.equal(yield* Effect.promise(() => gofer.ended), "SIGKILL");
+      }
+    })
+  ));
+
 test("an abandon fails, killing no process past runsc, where runsc does not kill a container it holds paused, or holds it paused still after its kill", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
