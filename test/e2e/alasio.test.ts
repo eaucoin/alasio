@@ -423,6 +423,11 @@ if (inShard("upgrade")) {
     let standbyBefore: { readonly name: string; readonly node: string; readonly runtimeClassName: string; readonly socket: string } | null = null;
     /** Why the scenario of the release before's standby is skipped, where it is. */
     const NO_STANDBY = `${PREVIOUS}'s current gVisor release restores into no standby`;
+    /**
+     * A session of main's released into its snapshot on the release before, which its first bind after the cut-over restores,
+     * into a pod made since the upgrade started k3s anew.
+     */
+    const RULES_SESSION = "fs-e2eupgraderules";
     /** The standbys of main's sessions that run, each of its containers started, on `node` where named. */
     const standbysRunning = async (node?: string) =>
       (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: node === undefined ? STANDBY_LABEL : `${STANDBY_LABEL}=${node}` })).filter((pod) =>
@@ -438,6 +443,61 @@ if (inShard("upgrade")) {
       await alasioOk("up", "--timeout", "20m");
     };
     const scenarios: readonly Scenario[] = [
+      {
+        // First, as its check is of the first restore after the cut-over.
+        seeds: "a session released into its snapshot, which its first bind after the cut-over restores",
+        seed: async () => {
+          const token = await mainToken(RULES_SESSION);
+          await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+          await bindSession(RULES_SESSION);
+          await repl.set(RULES_SESSION, `held on ${PREVIOUS}`);
+          await untilReleased(RULES_SESSION, Date.now());
+          assert.ok(await snapshotOf(RULES_SESSION), `${RULES_SESSION} was released into no snapshot on ${PREVIOUS}`);
+        },
+        // The upgrade wrote kubelet's config file anew, which has kubelet report its node's status every 10 s, changed or not,
+        // and so started k3s anew, whose network policy controller starts only once the node's Ready condition has been
+        // reported since (cli/src/cluster/k3s.ts's KUBELET_CONFIG): at once, not at kubelet's next report of an unchanged
+        // status, up to 7.5 minutes later before, a pod started meanwhile having no rules, so that no restore into one was
+        // resumed.
+        keeps: "kubelet reporting its node's status every 10 s, as the upgrade, which started k3s anew, configured it: the session restored first after it resumed at its first bind, its network policies in force within seconds",
+        check: async (t) => {
+          const [node] = (await kube.list<V1Node>("Node")).map(({ metadata }) => metadata?.name ?? "");
+          assert.ok(node, "the cluster has no node");
+          // k3s started anew past the cut-over's point of no return: by the upgrade, which changed the node's files.
+          const began = Date.parse((await inCutOverRecord("cat point-of-no-return")).trim());
+          const started = Number(await onNode(node, `date -d "$(systemctl show --property=ExecMainStartTimestamp --value k3s)" +%s`)) * 1000;
+          assert.ok(started > began, `k3s started at ${new Date(started).toISOString()}, before the cut-over's point of no return at ${new Date(began).toISOString()}`);
+          const policing = /^(\d+)\.\d+ .*Starting network policy controller version /mu.exec(
+            await onNode(node, `journalctl --unit k3s --since @${started / 1000} --output short-unix --no-pager | grep --max-count 1 'Starting network policy controller version ' || true`),
+          );
+          assert.ok(policing, "k3s started no network policy controller since it started");
+          // Restored into a pod made since k3s started.
+          const restoring = Date.now();
+          const { name, node: on } = await bindSession(RULES_SESSION);
+          assert.match(name, /-restore-/u);
+          const agent = (await nodeAgents()).get(on);
+          assert.ok(agent, `no node agent runs ready on ${on}`);
+          const said = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n")
+            .filter((line) => line.includes(`the restore of ${SESSIONS}/${RULES_SESSION} `) || line.includes(`the sandbox of ${SESSIONS}/${RULES_SESSION} `));
+          // Resumed at its first bind, none of its restores abandoned as its policies were not in force.
+          assert.ok(!said.some((line) => line.includes("abandoned the restore of")), said.join("\n"));
+          const resumed = said.map((line) => new RegExp(`resumed the sandbox of ${SESSIONS}/${RULES_SESSION} in ${SESSIONS}/${name}, its network policies in force after (\\d+) ms`, "u").exec(line)).find(Boolean);
+          assert.ok(resumed, said.join("\n"));
+          const waited = Number(resumed[1]);
+          // Its Ready condition's heartbeat, as kubelet reports it: every 10 s or so, its first after a change up to 5 s sooner
+          // or later, as kubelet looks at its node's status every 10 s: so at most two looks apart, never 5 minutes.
+          const beats = new Set<number>();
+          for (const end = Date.now() + 60_000; Date.now() < end; await sleep(1_000)) {
+            const ready = (await kube.get<V1Node>(ref("Node", node)))?.status?.conditions?.find(({ type }) => type === "Ready");
+            if (ready?.lastHeartbeatTime) beats.add(new Date(ready.lastHeartbeatTime).getTime());
+          }
+          const heard = [...beats].sort((a, b) => a - b);
+          const gaps = heard.slice(1).map((at, i) => (at - (heard[i] ?? at)) / 1000);
+          t.diagnostic(`k3s started ${(started - began) / 1000} s past the cut-over's point of no return, its network policy controller ${Number(policing[1]) - started / 1000} s after it; ${RULES_SESSION} restored ${Math.round((restoring - started) / 1000)} s after k3s started, its network policies in force after ${waited} ms; kubelet reported ${node}'s status ${gaps.join(" s, ")} s apart`);
+          assert.ok(waited < 10_000, `the network policies of ${SESSIONS}/${name} were in force after ${waited} ms`);
+          assert.ok(gaps.length >= 2 && gaps.every((gap) => gap <= 25), `kubelet reported ${node}'s status ${heard.length} times in 60 s, ${gaps.join(" s, ")} s apart`);
+        },
+      },
       {
         seeds: "a session released into its snapshot, its REPL holding a value, its record of its release written as the release before writes one",
         seed: async () => {
@@ -986,9 +1046,11 @@ if (inShard("upgrade")) {
       assert.deepEqual([seen.live, seen.checkpointed], [`restored on ${PREVIOUS}`, `restored on ${PREVIOUS}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
       if (!standing) {
-        // None kept after it, well past when one would be made.
+        // None kept after it under its release, well past when one would be made: the one the node may keep under the
+        // current release, of a restore after the upgrade, aside.
         await sleep(STANDBY_AFTER_MS + 30_000);
-        assert.deepEqual((await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` })).map(({ metadata }) => metadata?.name), []);
+        const kept = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${STANDBY_LABEL}=${node}` });
+        assert.deepEqual(kept.filter(({ spec }) => spec?.runtimeClassName === standbyBefore?.runtimeClassName).map(({ metadata }) => metadata?.name), []);
       }
 
       // A session of the current release: restored once, which keeps a standby on its node, then restored into it.
