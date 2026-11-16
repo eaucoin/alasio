@@ -140,8 +140,13 @@ function forkOf(body: Uint8Array): { readonly environment: string; readonly work
 /** How long an ask of a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5_000;
 
-/** How long a pod's containers are waited for to stop, once its deletion is asked. */
-const STOP_TIMEOUT_MS = 120_000;
+/**
+ * How long a pod's containers are waited for to stop past the end of its deletion's grace, as its deletionTimestamp says it:
+ * kubelet's SIGKILL of what runs on, then its report of them stopped.
+ */
+const STOP_MARGIN_MS = 30_000;
+/** A pod's termination grace where its spec says none, as the API server defaults it. */
+const DEFAULT_GRACE_SECONDS = 30;
 
 /** The runtime's ids of `pod`'s containers, as its status names them. */
 const containerIdsOf = (pod: V1Pod): string[] =>
@@ -244,14 +249,23 @@ export const makeSessions = Effect.fnUntraced(function*(
       yield* timed(detachDuration, pool, agents.detach(node, pool.namespace, name, last ? containerIdsOf(last) : []));
     }).pipe(Effect.catch((error) => Effect.logWarning(`could not detach what was attached into ${pool.namespace}/${name}, whose readying failed: ${error.message}`)))));
 
-  /** Waits until `name`'s containers have all stopped, or it is gone. */
+  /**
+   * Waits until `name`'s containers have all stopped, or it is gone: STOP_MARGIN_MS at most past the end of its deletion's
+   * grace, as its deletionTimestamp says it, however long its grace is (sessions.snapshots.stopWait and its bayma's own stop,
+   * of a snapshotted session's), or, while its deletion is not asked yet, as its binder asks it after, past its grace from
+   * the wait's start on.
+   */
   const stopped = (pool: Pool, name: string): Effect.Effect<void, KubeApiError | BindStepFailed> =>
     Effect.gen(function*() {
-      const deadline = (yield* Clock.currentTimeMillis) + STOP_TIMEOUT_MS;
+      const started = yield* Clock.currentTimeMillis;
       for (;;) {
         const ending = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
         if (!ending || (ending.status?.containerStatuses ?? []).every(({ state }) => state?.terminated)) return;
-        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `${name}'s containers had not stopped within ${STOP_TIMEOUT_MS / 1000} s` });
+        const deletion = ending.metadata?.deletionTimestamp;
+        const graceEnds = deletion === undefined ? started + (ending.spec?.terminationGracePeriodSeconds ?? DEFAULT_GRACE_SECONDS) * 1000 : new Date(deletion).getTime();
+        if ((yield* Clock.currentTimeMillis) >= graceEnds + STOP_MARGIN_MS) {
+          return yield* new BindStepFailed({ reason: `${name}'s containers had not stopped ${STOP_MARGIN_MS / 1000} s past the end of its termination grace` });
+        }
         yield* Effect.sleep(500);
       }
     });

@@ -145,7 +145,7 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
 }
 
 /** An environment of the test's own, its pools' namespace, with `count` free pods of the `none` pool on node-a, serving at the loopback, their bayma limited to `memoryLimit` where given. */
-async function environment(count: number, { gvisor = false, holdsStop = false, memoryLimit = undefined as string | undefined } = {}): Promise<SessionsEnvironment & { none: Pool; template: V1PodTemplateSpec }> {
+async function environment(count: number, { gvisor = false, holdsStop = false, stopWaitSeconds = 60, memoryLimit = undefined as string | undefined } = {}): Promise<SessionsEnvironment & { none: Pool; template: V1PodTemplateSpec }> {
   const namespace = `sessions-${(namespaces += 1)}`;
   const none: Pool = { name: "sandboxes-none", namespace };
   let template: V1PodTemplateSpec = {};
@@ -153,9 +153,14 @@ async function environment(count: number, { gvisor = false, holdsStop = false, m
     Effect.gen(function*() {
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } });
       // The pool's template, as its snapshots record it.
-      // Its bayma holding its stop for a save, where it is told to, as a pool's of snapshotted sessions does.
+      // Its bayma holding its stop for a save, where it is told to, for `stopWaitSeconds`, as a pool's of snapshotted sessions
+      // does, its grace that and its bayma's own stop's 30 s.
       const held = holdsStop
-        ? { terminationGracePeriodSeconds: 90, volumes: BAYMA_SPEC.volumes, containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) }
+        ? {
+          terminationGracePeriodSeconds: stopWaitSeconds + 30,
+          volumes: BAYMA_SPEC.volumes,
+          containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", String(stopWaitSeconds * 1000)] })),
+        }
         : BAYMA_SPEC;
       const spec = memoryLimit === undefined ? held : { ...held, containers: held.containers.map((container) => ({ ...container, resources: { limits: { memory: memoryLimit } } })) };
       template = { metadata: { labels: { ...freeLabels(none) }, annotations: { "alasio.dev/session-template": "t-current" } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
@@ -274,6 +279,63 @@ test("a pod whose readying failed, its workspace not attached, is detached once 
   assert.ok(name, "no pod was deleted");
   await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-x", state: { terminated: { exitCode: 0 } } }] } })));
   for (const deadline = Date.now() + 10_000; !recorded.asked.includes(`detach node-a ${env.namespace}/${name}`); await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, recorded.asked.join("\n"));
+});
+
+test("a pod whose readying failed is waited for to stop, before its workspace is detached, for as long as its grace is, past its deletion's end no more", async () => {
+  // A grace of 150 s, as a stopWait of 120 s gives one.
+  const env = await environment(4, { holdsStop: true, stopWaitSeconds: 120 });
+  const recorded = agents();
+  let failures = 2;
+  const failing: NodeAgents = {
+    ...recorded.agents,
+    attach: (node, request) => (failures > 0 ? ((failures -= 1), Effect.fail(new NodeAgentError({ node, call: "attach", status: 503, reason: "workspace storage is not mounted" }))) : recorded.agents.attach(node, request)),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), failing);
+  const key = sessionKey("fs-graceful");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  /** A while of the test's own, as the gateway's fibers run, whose clock is the test's. */
+  const meanwhile = (ms = 200) => Effect.promise(() => new Promise((resolve) => setTimeout(resolve, ms)));
+  /** The pods of the environment being deleted. */
+  const deleting = Effect.promise(async () => ((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "")))) as V1Pod[]).filter(({ metadata }) => metadata?.deletionTimestamp));
+  /** Binds the key, its readying failing, and gives the pod its binder deleted, whose deletion's grace is its own. */
+  const failedBind = Effect.gen(function*() {
+    const before = new Set((yield* deleting).map(({ metadata }) => metadata?.name));
+    assert.equal((yield* Effect.result(binder.bind(placement.pool, key, placement)))._tag, "Failure");
+    const pod = (yield* deleting).find(({ metadata }) => !before.has(metadata?.name));
+    assert.equal(pod?.metadata?.deletionGracePeriodSeconds, 150);
+    return pod;
+  });
+  /** Ends `name`'s containers, as kubelet says it once its deletion ended them. */
+  const ended = (name: string) =>
+    Effect.promise(() => run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-x", state: { terminated: { exitCode: 0 } } }] } }))));
+  const detachedOf = (name: string) => recorded.asked.includes(`detach node-a ${env.namespace}/${name}`);
+  await Effect.runPromise(Effect.gen(function*() {
+    yield* TestClock.setTime(Date.now());
+    // Its containers stop 125 s after its deletion, within its grace: its workspace detached then.
+    const graceful = (yield* failedBind)?.metadata?.name ?? "";
+    yield* meanwhile();
+    yield* TestClock.adjust(125_000);
+    yield* meanwhile();
+    assert.ok(!detachedOf(graceful), recorded.asked.join("\n"));
+    yield* ended(graceful);
+    for (const deadline = Date.now() + 10_000; !detachedOf(graceful); yield* meanwhile(100)) {
+      assert.ok(Date.now() < deadline, recorded.asked.join("\n"));
+      yield* TestClock.adjust(500);
+    }
+    // Its containers not stopped 30 s past its deletion's end: waited for no more, its workspace not detached.
+    const stuckPod = yield* failedBind;
+    const stuck = stuckPod?.metadata?.name ?? "";
+    const deletion = new Date(stuckPod?.metadata?.deletionTimestamp ?? 0).getTime();
+    yield* meanwhile();
+    yield* TestClock.setTime(deletion + 31_000);
+    yield* meanwhile();
+    yield* ended(stuck);
+    for (let looks = 0; looks < 10; looks += 1) {
+      yield* TestClock.adjust(500);
+      yield* meanwhile(100);
+    }
+    assert.ok(!detachedOf(stuck), recorded.asked.join("\n"));
+  }).pipe(Effect.provide(TestClock.layer())));
 });
 
 test("a bound pod whose bayma runs an exec is kept, and its bayma asked again only once its poll comes round, with its binding's token", async () => {
