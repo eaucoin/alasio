@@ -33,7 +33,18 @@ export interface RunscOptions {
    * release's reads it, and the one the node's sandboxes run is in memory already, where another's is read from the disk.
    */
   readonly current: string;
+  /** How long a kill may take, KILL_TIMEOUT_MS unless told. */
+  readonly killTimeoutMs?: number;
 }
+
+/**
+ * How long `runsc kill` may take: it ends a sandbox well within a second, and one that cannot kill its processes itself, as
+ * one whose restore is not done, by destroying it, which the fork's tests give 10 s
+ * (TestMultiContainerCheckpointRestorePausedAbandonedKill). An abandon's kills run under its workspace's lock, which a kill
+ * that hangs, as on a sandbox stuck in the host's kernel, would hold for ever; and two of them, of a sandbox's root container
+ * and of one of another sandbox, end within the 30 s alasio gives an abandon.
+ */
+export const KILL_TIMEOUT_MS = 10_000;
 
 /** What runsc was asked to do and could not, and what it said. */
 export class RunscError extends Schema.TaggedError<RunscError>()("RunscError", {
@@ -198,7 +209,8 @@ export interface Runsc {
    * sandbox restored whole is until its resume, as the fork's runsc kills one (runsc/container/container.go killPaused),
    * every process of its sandbox with it where it is the sandbox's root container, or of a sandbox restored paused and never
    * resumed since, each container of the sandbox ending, as runsc's state then says. One whose sandbox died, which runsc
-   * holds stopped, is killed with nothing left to kill, as the fork's runsc lets it be from 20261102.0-eaucoin.7 on.
+   * holds stopped, is killed with nothing left to kill, as the fork's runsc lets it be from 20261102.0-eaucoin.7 on. A kill
+   * not done within KILL_TIMEOUT_MS (RunscOptions.killTimeoutMs) fails, its runsc killed.
    */
   readonly kill: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
@@ -318,7 +330,7 @@ function runsFor(args: readonly string[], root: string, { id, bundle }: ListedCo
  * other than the one it was found with; a kill reads it again just before, so it kills no
  * process but the one found.
  */
-export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc", current }: RunscOptions): Runsc {
+export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc", current, killTimeoutMs = KILL_TIMEOUT_MS }: RunscOptions): Runsc {
   const releases = Effect.promise(async () => {
     const entries = await readdir(releasesDir, { withFileTypes: true }).catch(() => []);
     const found = await Promise.all(
@@ -397,7 +409,11 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
 
     resume: (release, containerId) => run(release, ["resume"], [containerId]).pipe(Effect.asVoid),
 
-    kill: (release, containerId) => run(release, ["kill"], [containerId, "KILL"]).pipe(Effect.asVoid),
+    kill: (release, containerId) =>
+      run(release, ["kill"], [containerId, "KILL"]).pipe(
+        Effect.timeoutOrElse({ duration: killTimeoutMs, orElse: () => Effect.fail(new RunscError({ release, command: `kill ${containerId} KILL`, reason: `it did not end within ${killTimeoutMs / 1000} s` })) }),
+        Effect.asVoid,
+      ),
 
     exec: (release, containerId, argv, timeoutMs) =>
       run(release, ["exec"], [containerId, ...argv]).pipe(

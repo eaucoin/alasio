@@ -37,7 +37,8 @@
  * - `kill ID KILL`: ends the container, as runsc's state then says it (stopped), and, of one
  *   held paused, every container of its pod held paused, as the fork's runsc ends each of a
  *   sandbox restored paused; or fails, saying so, while a file `fail-kill` is beside it, or
- *   changes nothing while one `ignore-kill` is;
+ *   changes nothing while one `ignore-kill` is, or takes a minute while one `hang-kill` is,
+ *   writing its pid into `hung-kill` beside it;
  * - `wait --restore ID`: says nothing, once no file `hold-wait` is beside it, as runsc once
  *   the restore has read every page; or fails, saying so, while a file `fail-wait` is;
  * - `exec ID ARGV...`: says nothing; or fails, saying so, while a file `fail-exec` is beside it;
@@ -176,6 +177,7 @@ if (rest[0] === "checkpoint") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
 } else if (rest[0] === "kill") {
   if (existsSync(join(here, "fail-kill"))) { process.stderr.write("kill failed: the sandbox is not running\\n"); process.exit(128); }
+  if (existsSync(join(here, "hang-kill"))) { writeFileSync(join(here, "hung-kill"), String(process.pid)); setTimeout(() => {}, 60000); return; }
   const all = containers();
   const killed = all[rest[1]];
   if (!killed) { process.stderr.write("container does not exist\\n"); process.exit(1); }

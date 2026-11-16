@@ -3850,6 +3850,43 @@ test("an abandon fails, killing no process past runsc, where runsc does not kill
     })
   ));
 
+test("an abandon whose kill through runsc does not end within its bound fails, its runsc killed, killing no process past runsc, and holds its workspace no longer", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1", {
+        runsc: (runsc, releases) => ({
+          ...runsc,
+          kill: makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: RELEASE, killTimeoutMs: 500 }).kill,
+        }),
+      });
+      for (const id of [CONTAINER, OTHER_CONTAINER]) here.releases.held(id, "paused");
+      const sandbox = yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER));
+      const hang = join(here.releases.dirOf(RELEASE), "hang-kill");
+      writeFileSync(hang, "");
+      const refused = yield* Effect.flip(here.agent.abandon(abandonRequest));
+      assert.equal(refused.message, `runsc kill ${CONTAINER} KILL of ${RELEASE} failed: it did not end within 0.5 s`);
+      // Its runsc killed as the kill failed.
+      const hung = Number(readFileSync(join(here.releases.dirOf(RELEASE), "hung-kill"), "utf8"));
+      const gone = () => {
+        try {
+          process.kill(hung, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      };
+      for (const deadline = Date.now() + 5000; !gone() && Date.now() < deadline;) yield* Effect.sleep("20 millis");
+      assert.ok(gone(), `the runsc kill ${hung} runs on`);
+      // Killed past runsc, its sandbox would be held paused on, and no stop of its pod end.
+      assert.ok(sandbox.running());
+
+      // Its workspace held no longer: its next abandon runs, and ends it.
+      rmSync(hang);
+      yield* here.agent.abandon(abandonRequest);
+      assert.equal(yield* Effect.promise(() => sandbox.ended), "SIGKILL");
+    })
+  ));
+
 test("as the agent stops, an operation it runs is let end before what it runs in is closed", () =>
   Effect.gen(function*() {
     const scope = yield* Scope.make();
