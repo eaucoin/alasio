@@ -46,7 +46,7 @@ import type { Manifest } from "../../src/node-agent/agent.ts";
 import { STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS, standbySocket } from "../../src/kube/sandbox-shape.ts";
 import { STANDBY_AFTER_MS } from "../../src/gateway/standbys.ts";
 import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
-import { gvisorReleases, NODE_PINS, SERVICE as K3S_SERVICE } from "../../cli/src/cluster/node.ts";
+import { describeNodeStep, gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
 import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
@@ -430,9 +430,20 @@ if (inShard("upgrade")) {
     const RULES_SESSION = "fs-e2eupgraderules";
     /**
      * A line of the upgrade's plan, as alasio says its node's steps (cli/src/cluster/node.ts describeNodeStep), of one that
-     * starts k3s anew: restarted with its new configuration, or to renew its certificates, or installed anew.
+     * starts k3s anew: restarted with its new configuration, or to renew its certificates, or installed anew, of whichever
+     * version, in place of whichever.
      */
-    const K3S_RESTARTED = new RegExp(`restart the service ${K3S_SERVICE}\\b|as the systemd service ${K3S_SERVICE}, enabled and started anew`, "u");
+    const K3S_RESTARTED = (() => {
+      const VERSION = "\0";
+      const artifact = { path: "", url: "", algorithm: "sha256", digest: "" } as const;
+      const said = [
+        describeNodeStep({ _tag: "StartK3s", restart: true }),
+        describeNodeStep({ _tag: "ReadKubeconfig", renew: true }),
+        describeNodeStep({ _tag: "InstallK3s", version: VERSION, role: "server", binary: artifact, script: artifact }),
+      ];
+      // Each as it is said, but the version, and what it replaces, said after it.
+      return new RegExp(said.map((each) => each.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(VERSION, ".+?")).join("|"), "u");
+    })();
     /** The standbys of main's sessions that run, each of its containers started, on `node` where named. */
     const standbysRunning = async (node?: string) =>
       (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: node === undefined ? STANDBY_LABEL : `${STANDBY_LABEL}=${node}` })).filter((pod) =>
