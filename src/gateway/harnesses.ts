@@ -43,7 +43,7 @@
 import type { V1Pod } from "@kubernetes/client-node";
 import { Cause, Clock, Effect, Exit, Option, Schema } from "effect";
 
-import { type Binder, BindStepFailed } from "../binder/binder.ts";
+import { type Binder, BindStepFailed, containersStopped } from "../binder/binder.ts";
 import { type BindingLease, heldLeases } from "../binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, type Pool, POOL_LABEL } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
@@ -68,8 +68,6 @@ const ASK_TIMEOUT_MS = 5_000;
 const UNREACHED_MS = 10 * 60_000;
 /** How long whether a branch environment has the harnesses' pools is taken as it was last looked at. */
 const POOLS_LOOKED_MS = 60_000;
-/** How long a released pod's containers are waited for to stop, once its deletion is asked. */
-const STOP_TIMEOUT_MS = 120_000;
 /** How long a host whose drain failed is waited for to be said ended, as kubelet says it some seconds after. */
 const ENDED_WAIT_MS = 10_000;
 
@@ -289,21 +287,12 @@ export const makeHarnesses = Effect.fnUntraced(function*(
       Effect.andThen(tell(pool, (environment) => ({ kind: "harness.lost", environment, source: "sandbox-gateway", subject: subject(key), binding, pod, reason }))),
     );
 
-  /** Waits until `name`'s containers have all stopped, or it is gone. */
-  const stopped = (pool: Pool, name: string): Effect.Effect<V1Pod | null, KubeApiError | BindStepFailed> =>
-    Effect.gen(function*() {
-      const deadline = (yield* Clock.currentTimeMillis) + STOP_TIMEOUT_MS;
-      for (;;) {
-        const ending = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
-        if (!ending || (ending.status?.containerStatuses ?? []).every(({ state }) => state?.terminated)) return ending;
-        if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindStepFailed({ reason: `${name}'s containers had not stopped within ${STOP_TIMEOUT_MS / 1000} s` });
-        yield* Effect.sleep(500);
-      }
-    });
-
-  /** Removes what its node's agent wrote for `pod` of `pool`, on `node`, once its containers stopped, its directory with it. */
+  /**
+   * Removes what its node's agent wrote for `pod` of `pool`, on `node`, once its containers stopped, its directory with it:
+   * waited for as long as its grace is (containersStopped).
+   */
   const detached = (pool: Pool, node: string, name: string): Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed> =>
-    Effect.andThen(stopped(pool, name), node ? agents.detach(node, pool.namespace, name, []) : Effect.void);
+    Effect.andThen(Effect.provideService(containersStopped(pool, name), KubeClient, kube), node ? agents.detach(node, pool.namespace, name, []) : Effect.void);
 
   /**
    * The bound pods whose release runs, or has run, by their uid: those the gateway ends, those

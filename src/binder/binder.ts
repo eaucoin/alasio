@@ -105,6 +105,36 @@ export class BindStepFailed extends Schema.TaggedError<BindStepFailed>()("BindSt
 }
 
 /**
+ * How long a pod's containers are waited for to stop past the end of its deletion's grace, as its deletionTimestamp says it:
+ * kubelet's SIGKILL of what runs on, then its report of them stopped.
+ */
+const STOP_MARGIN_MS = 30_000;
+/** A pod's termination grace where its spec says none, as the API server defaults it. */
+const DEFAULT_GRACE_SECONDS = 30;
+
+/**
+ * Waits until the containers of `pool`'s pod `name` have all stopped, or it is gone: what was read of it last, null once
+ * gone. STOP_MARGIN_MS at most past the end of its deletion's grace, as its deletionTimestamp says it, however long its
+ * grace is; or, while its deletion is not asked yet, as its binder asks it after a readying that failed, past its grace from
+ * the wait's start on.
+ */
+export const containersStopped = (pool: Pool, name: string): Effect.Effect<V1Pod | null, KubeApiError | BindStepFailed, KubeClient> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeClient;
+    const started = yield* Clock.currentTimeMillis;
+    for (;;) {
+      const ending = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
+      if (!ending || (ending.status?.containerStatuses ?? []).every(({ state }) => state?.terminated)) return ending;
+      const deletion = ending.metadata?.deletionTimestamp;
+      const graceEnds = deletion === undefined ? started + (ending.spec?.terminationGracePeriodSeconds ?? DEFAULT_GRACE_SECONDS) * 1000 : new Date(deletion).getTime();
+      if ((yield* Clock.currentTimeMillis) >= graceEnds + STOP_MARGIN_MS) {
+        return yield* new BindStepFailed({ reason: `${name}'s containers had not stopped ${STOP_MARGIN_MS / 1000} s past the end of its termination grace` });
+      }
+      yield* Effect.sleep(500);
+    }
+  });
+
+/**
  * How a release of a key went: its binding released; its binding ended, released already by a
  * release that was through, whose end of its pod failed after (`ended`), so it is told of as
  * released once; none, the key bound nowhere; or none, as another binder is binding or

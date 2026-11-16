@@ -7,6 +7,7 @@ import { before, test } from "node:test";
 
 import type { V1Deployment, V1Pod, V1PodSpec } from "@kubernetes/client-node";
 import { Effect, Layer, Logger } from "effect";
+import { TestClock } from "effect/testing";
 
 import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
@@ -63,8 +64,8 @@ async function host(): Promise<{ port: number; status: HarnessStatus; working: b
   } });
 }
 
-/** Node agents that record the bindings given, and the detaches asked; the first binding failing where `fails` says. */
-function agents({ fails = false } = {}): { agents: NodeAgents; bound: (BindingRequest & { node: string })[]; detached: string[] } {
+/** Node agents that record the bindings given, and the detaches asked; the first `fails` bindings failing. */
+function agents({ fails = 0 } = {}): { agents: NodeAgents; bound: (BindingRequest & { node: string })[]; detached: string[] } {
   const bound: (BindingRequest & { node: string })[] = [];
   const detached: string[] = [];
   let failing = fails;
@@ -79,15 +80,18 @@ function agents({ fails = false } = {}): { agents: NodeAgents; bound: (BindingRe
       prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused, restoreStandby: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused,
       bindFree: (node, request) =>
-        failing ? ((failing = false), Effect.fail(new NodeAgentError({ node, call: "bind", status: 409, reason: "it has its binding already" }))) : Effect.sync(() => void bound.push({ node, ...request })),
+        failing > 0 ? ((failing -= 1), Effect.fail(new NodeAgentError({ node, call: "bind", status: 409, reason: "it has its binding already" }))) : Effect.sync(() => void bound.push({ node, ...request })),
       detach: (node, namespace, pod) => Effect.sync(() => void detached.push(`${node} ${namespace}/${pod}`)),
     },
   };
 }
 
 let made = 0;
-/** main's environment of the test's own: its own namespace, its sessions', and `count` free pods of its Codex pool on node-a, at the loopback. */
-async function environment(count: number): Promise<SessionsEnvironment & { home: string; codex: Pool }> {
+/**
+ * main's environment of the test's own: its own namespace, its sessions', and `count` free pods of its Codex pool on node-a,
+ * at the loopback, given `graceSeconds` to stop where it says, the API server's default otherwise.
+ */
+async function environment(count: number, { graceSeconds = undefined as number | undefined } = {}): Promise<SessionsEnvironment & { home: string; codex: Pool }> {
   made += 1;
   const home = `alasio-${made}`;
   const codex: Pool = { name: "harness-codex", namespace: home };
@@ -95,7 +99,10 @@ async function environment(count: number): Promise<SessionsEnvironment & { home:
     Effect.gen(function*() {
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: home } });
       // Limited, as a session's harness pods are, to what their host may hold.
-      const spec = { containers: [{ name: "harness", image: "alasio", resources: { limits: { memory: "1536Mi" } } }] } as V1PodSpec;
+      const spec = {
+        containers: [{ name: "harness", image: "alasio", resources: { limits: { memory: "1536Mi" } } }],
+        ...(graceSeconds === undefined ? {} : { terminationGracePeriodSeconds: graceSeconds }),
+      } as V1PodSpec;
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: codex.name, namespace: home }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(codex) } }, template: { metadata: { labels: { ...freeLabels(codex) } }, spec } } });
       for (let n = 0; n < count; n += 1) yield* freePod(kube, codex, `codex-${n}`, spec);
     })
@@ -214,7 +221,7 @@ test("a conversation's harness is placed in its environment's own namespace's po
 
 test("a harness's pod is readied by its node's agent giving it its binding, the conversation and its binding's token, as its pool's user; one whose readying failed is removed once its containers stopped", async () => {
   const env = await environment(2);
-  const recorded = agents({ fails: true });
+  const recorded = agents({ fails: 1 });
   const { binder, harnesses } = await harnessesOf(env, configOf(env.home, 8080), recorded.agents);
   const key = harnessKey("telegram:41");
   const placement = await Effect.runPromise(harnesses.place(key, { environment: "main", harness: "codex", workspace: "session" }));
@@ -232,6 +239,55 @@ test("a harness's pod is readied by its node's agent giving it its binding, the 
   const binding = JSON.parse(given?.binding ?? "{}") as { conversationId: string; token: string };
   assert.equal(binding.conversationId, "telegram:41");
   assert.deepEqual(verifyToken(bindingKey, binding.token, Date.now()), { key, binding: bound.binding, namespace: env.home });
+});
+
+test("a harness's pod whose readying failed is waited for to stop, before what was written for it is removed, for as long as its grace is, past its deletion's end no more", async () => {
+  // A grace of 600 s, as long as a folder instance's pod's.
+  const env = await environment(4, { graceSeconds: 600 });
+  const recorded = agents({ fails: 2 });
+  const { binder, harnesses } = await harnessesOf(env, configOf(env.home, 8080), recorded.agents);
+  const key = harnessKey("telegram:42");
+  const placement = await Effect.runPromise(harnesses.place(key, { environment: "main", harness: "codex", workspace: "session" }));
+  /** A while of the test's own, as the gateway's fibers run, whose clock is the test's. */
+  const meanwhile = (ms = 200) => Effect.promise(() => new Promise((resolve) => setTimeout(resolve, ms)));
+  /** The pods of the environment being deleted. */
+  const deleting = Effect.promise(async () => ((await run(withKube((kube) => kube.list("v1", "Pod", env.home, "")))) as V1Pod[]).filter(({ metadata }) => metadata?.deletionTimestamp));
+  /** Binds the key, its readying failing, and gives the pod its binder deleted, whose deletion's grace is its own. */
+  const failedBind = Effect.gen(function*() {
+    const before = new Set((yield* deleting).map(({ metadata }) => metadata?.name));
+    assert.equal((yield* Effect.result(binder.bind(placement.pool, key, placement)))._tag, "Failure");
+    const pod = (yield* deleting).find(({ metadata }) => !before.has(metadata?.name));
+    assert.equal(pod?.metadata?.deletionGracePeriodSeconds, 600);
+    return pod;
+  });
+  const detachedOf = (name: string) => recorded.detached.includes(`node-a ${env.home}/${name}`);
+  await Effect.runPromise(Effect.gen(function*() {
+    yield* TestClock.setTime(Date.now());
+    // Its containers stop 125 s after its deletion, within its grace: what was written for it removed then.
+    const graceful = (yield* failedBind)?.metadata?.name ?? "";
+    yield* meanwhile();
+    yield* TestClock.adjust(125_000);
+    yield* meanwhile();
+    assert.ok(!detachedOf(graceful), recorded.detached.join("\n"));
+    yield* Effect.promise(() => stopped(env.home, graceful));
+    for (const deadline = Date.now() + 10_000; !detachedOf(graceful); yield* meanwhile(100)) {
+      assert.ok(Date.now() < deadline, recorded.detached.join("\n"));
+      yield* TestClock.adjust(500);
+    }
+    // Its containers not stopped 30 s past its deletion's end: waited for no more, nothing removed.
+    const stuckPod = yield* failedBind;
+    const stuck = stuckPod?.metadata?.name ?? "";
+    const deletion = new Date(stuckPod?.metadata?.deletionTimestamp ?? 0).getTime();
+    yield* meanwhile();
+    yield* TestClock.setTime(deletion + 31_000);
+    yield* meanwhile();
+    yield* Effect.promise(() => stopped(env.home, stuck));
+    for (let looks = 0; looks < 10; looks += 1) {
+      yield* TestClock.adjust(500);
+      yield* meanwhile(100);
+    }
+    assert.ok(!detachedOf(stuck), recorded.detached.join("\n"));
+  }).pipe(Effect.provide(TestClock.layer())));
 });
 
 test("a bound harness is kept while anything goes on in it, its host asked with its binding's token no oftener than its poll; once idle for its wait, drained, its pod ended, what was written for it removed, and told of", async () => {
