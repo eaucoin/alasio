@@ -191,6 +191,13 @@ export interface Runsc {
   readonly exec: (release: string, containerId: string, argv: readonly string[], timeoutMs: number) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
   readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /**
+   * Kills a container, by its runtime's id, as its shim would, `runsc kill <id> KILL`: one runsc holds paused, as each of a
+   * sandbox restored whole is until its resume, as the fork's runsc kills one (runsc/container/container.go killPaused),
+   * every process of its sandbox with it where it is the sandbox's root container, or of a sandbox restored paused and never
+   * resumed since, each container of the sandbox ending, as runsc's state then says.
+   */
+  readonly kill: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
   /** The digests of the images an image holds pages of besides its own, its layers, which a restore of it reads too. */
   readonly layers: (release: string, imagePath: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
@@ -226,7 +233,7 @@ export interface Runsc {
   /** The processes runsc runs for each of `containers` on the node, as makeRunsc finds them. */
   readonly processes: (containers: readonly ListedContainer[]) => Effect.Effect<readonly ContainerProcess[], RunscError>;
   /** Kills `process` (SIGKILL) if its pid is still its own, of the start time it was found with: whether it did. */
-  readonly kill: (process: ContainerProcess) => Effect.Effect<boolean, RunscError>;
+  readonly killProcess: (process: ContainerProcess) => Effect.Effect<boolean, RunscError>;
 }
 
 /** An entry of a TOML table whose value is a basic string, its key bare or quoted. */
@@ -386,6 +393,8 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
 
     resume: (release, containerId) => run(release, ["resume"], [containerId]).pipe(Effect.asVoid),
 
+    kill: (release, containerId) => run(release, ["kill"], [containerId, "KILL"]).pipe(Effect.asVoid),
+
     exec: (release, containerId, argv, timeoutMs) =>
       run(release, ["exec"], [containerId, ...argv]).pipe(
         Effect.timeoutOrElse({ duration: timeoutMs, orElse: () => Effect.fail(new RunscError({ release, command: `exec ${argv.join(" ")}`, reason: `it did not end within ${timeoutMs / 1000} s` })) }),
@@ -465,7 +474,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         catch: (cause) => new RunscError({ release: "the node's", command: "list", reason: `the node's processes in ${procRoot} are not readable: ${String(cause)}` }),
       }),
 
-    kill: ({ pid, startTime }) =>
+    killProcess: ({ pid, startTime }) =>
       Effect.tryPromise({
         try: async () => {
           if ((await startTimeAt(String(pid))) !== startTime) return false;

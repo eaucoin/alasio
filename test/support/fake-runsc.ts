@@ -34,6 +34,10 @@
  *   nice value it ran at; or it fails, saying so, while a file
  *   `fail-compact` is beside it, or waits while one `hold-compact` is;
  * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
+ * - `kill ID KILL`: ends the container, as runsc's state then says it (stopped), and, of one
+ *   held paused, every container of its pod held paused, as the fork's runsc ends each of a
+ *   sandbox restored paused; or fails, saying so, while a file `fail-kill` is beside it, or
+ *   changes nothing while one `ignore-kill` is;
  * - `wait --restore ID`: says nothing, once no file `hold-wait` is beside it, as runsc once
  *   the restore has read every page; or fails, saying so, while a file `fail-wait` is;
  * - `exec ID ARGV...`: says nothing; or fails, saying so, while a file `fail-exec` is beside it;
@@ -170,6 +174,18 @@ if (rest[0] === "checkpoint") {
   const held = setInterval(() => { if (!existsSync(join(here, "hold-wait"))) clearInterval(held); }, 20);
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
+} else if (rest[0] === "kill") {
+  if (existsSync(join(here, "fail-kill"))) { process.stderr.write("kill failed: the sandbox is not running\\n"); process.exit(128); }
+  const all = containers();
+  const killed = all[rest[1]];
+  if (!killed) { process.stderr.write("container does not exist\\n"); process.exit(1); }
+  if (!existsSync(join(here, "ignore-kill"))) {
+    const ofPod = ({ annotations }) => ["namespace", "name", "uid"].every((key) => annotations["io.kubernetes.cri.sandbox-" + key] === killed.annotations["io.kubernetes.cri.sandbox-" + key]);
+    for (const [id, each] of Object.entries(all)) {
+      if (id === rest[1] || (killed.status === "paused" && each.status === "paused" && ofPod(each))) all[id] = { ...each, status: "stopped" };
+    }
+    writeFileSync(join(here, "..", "containers.json"), JSON.stringify(all));
+  }
 } else if (rest[0] === "exec") {
   if (existsSync(join(here, "fail-exec"))) { process.stderr.write("exec failed: the hook exited 1\\n"); process.exit(1); }
 } else if (rest[0] === "state") {
@@ -217,6 +233,8 @@ export interface FakeReleases {
   readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean, mounts?: readonly OciMount[], uid?: string) => void;
   /** Makes runsc's state say the container, which runs, is `status`: `paused`, as one restored and not yet resumed is. */
   readonly held: (containerId: string, status: string) => void;
+  /** Makes containerd's annotations say the container is its pod's own, its sandbox's root container, as a pod's pause container is. */
+  readonly rooted: (containerId: string) => void;
   /** Installs `release` beside the others, as a node is given one it keeps. */
   readonly installs: (release: string) => void;
 }
@@ -252,12 +270,23 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     const bundle = bundleOf(containerId);
     mkdirSync(bundle, { recursive: true });
     writeFileSync(join(bundle, "config.json"), JSON.stringify({ ociVersion: "1.2.0", mounts: mounts.map((mount) => ({ ...mount, type: "bind", options: ["rbind"] })) }));
-    held[containerId] = { pid, bundle, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod, "io.kubernetes.cri.sandbox-uid": uid } };
+    held[containerId] = {
+      pid,
+      bundle,
+      annotations: { "io.kubernetes.cri.container-type": "container", "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod, "io.kubernetes.cri.sandbox-uid": uid },
+    };
     writeFileSync(containers, JSON.stringify(held));
   };
   const held = (containerId: string, status: string) => {
     const kept = JSON.parse(readFileSync(containers, "utf8")) as Record<string, Record<string, unknown>>;
     kept[containerId] = { ...kept[containerId], status };
+    writeFileSync(containers, JSON.stringify(kept));
+  };
+  const rooted = (containerId: string) => {
+    const kept = JSON.parse(readFileSync(containers, "utf8")) as Record<string, { annotations: Record<string, string> }>;
+    const of = kept[containerId];
+    if (of === undefined) throw new Error(`no container ${containerId} runs`);
+    kept[containerId] = { ...of, annotations: { ...of.annotations, "io.kubernetes.cri.container-type": "sandbox" } };
     writeFileSync(containers, JSON.stringify(kept));
   };
   const starts = (argv0: string, args: readonly string[]) => {
@@ -293,6 +322,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     procRoot,
     runs,
     held,
+    rooted,
     installs,
     dirOf,
     bundleOf,

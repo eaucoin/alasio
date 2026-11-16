@@ -58,14 +58,18 @@
  * RESTORE_RUNNING_WAIT_MS, or whose policies are not in force within POLICY_WAIT_MS, leaves
  * it paused.
  *
- * A restore alasio refuses before it resumes the sandbox is abandoned: the agent kills
- * what runsc runs for the pod's containers, their sandbox and gofers among it, so that the
- * pod's teardown waits on none of it: a `runsc restore` that failed has left them running,
- * its shim then tearing none of them down. A container runsc holds paused, as each of a
- * sandbox restored whole is until its resume, is left to the pod's teardown, which ends it
- * through runsc as kubelet stops the pod: killed past runsc, it would be held paused on, as
- * runsc never looks whether the sandbox of one it holds paused still runs, and its shim's
- * delete of it refused, so that no stop of its pod would ever end. A container is the pod's only where the
+ * A restore alasio refuses before it resumes the sandbox is abandoned: the agent ends what
+ * of it runs, so that the pod's teardown waits on none of it, its grace among it, and the
+ * node's room it holds is freed at once. A container runsc holds paused, as each of a sandbox
+ * restored whole is until its resume, is killed through runsc, as its shim would kill it
+ * (`runsc kill`, SIGKILL), which ends every process of the sandbox and says each of its
+ * containers ended, as kubelet then finds them: killed past runsc, it would be held paused on,
+ * as runsc never looks whether the sandbox of one it holds paused still runs, and its shim's
+ * delete of it refused, so that no stop of its pod would ever end; and left to the pod's
+ * teardown, it would end only at its grace's end, as kubelet's SIGTERM waits for a resume that
+ * never comes. Then the agent kills what runsc still runs for the pod's containers, their
+ * sandbox and gofers among it: a `runsc restore` that failed has left them running, its shim
+ * then tearing none of them down. A container is the pod's only where the
  * annotations containerd gives its spec name the pod and its uid, so that the containers of
  * a pod of its name made since are left be. A process is a container's only where its
  * arguments name runsc's root, the container's bundle and its id, and is killed only while
@@ -101,7 +105,7 @@ import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
 import { makeLoading } from "./loading.ts";
 import { backgroundReadSeconds, RESTORE_RUNNING_WAIT_MS, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
-import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
+import { type ListedContainer, type ReleaseNotInstalled, type Runsc, RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import { type S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
@@ -550,7 +554,7 @@ export interface NodeAgent {
   /** Resumes the workspace's sandbox, restored paused, once its pod's network policies are in force on this node, as the module says. */
   readonly resume: (request: ResumeRequest) => Effect.Effect<void, ResumeError>;
   /** Abandons the workspace's restore into a pod on this node, alasio having refused it before its resume, as the module says: what it killed. */
-  readonly abandon: (request: AbandonRequest) => Effect.Effect<readonly Killed[], RunscError>;
+  readonly abandon: (request: AbandonRequest) => Effect.Effect<readonly Killed[], RunscError | ReleaseNotInstalled>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
   /**
    * What this node holds, once it is other than what the tag `seen` names (holdingsTag), as
@@ -2077,21 +2081,37 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
-   * Kills what runsc runs for the containers of the pod `request` names but those it holds
-   * paused, as the module says: what it killed, of how many it found, and how many containers
-   * it left paused. A process one of them forks is the container's
-   * from its fork on, as its arguments, until it execs, are those of the runsc it forked
-   * from, and its own after; so one forked as the scan before ran, or as the process it
-   * forked from was killed, is found by the scan after the kills. The scans go on until
-   * one kills nothing new, at most ABANDON_SCANS of them.
+   * Ends the containers of the pod `request` names that runsc holds paused through runsc, then
+   * kills what runsc runs for its containers, as the module says: what it killed, of how many it
+   * found, and the containers it ended through runsc. Of those held paused, the pod's own, its
+   * sandbox's root container, is killed first, which ends every container of the sandbox, the
+   * others then listed again: one still held paused, as one of another sandbox would be, is killed
+   * next, and one held paused after its kill fails the abandon. A process one of them forks is the
+   * container's from its fork on, as its arguments, until it execs, are those of the runsc it
+   * forked from, and its own after; so one forked as the scan before ran, or as the process it
+   * forked from was killed, is found by the scan after the kills. The scans go on until one kills
+   * nothing new, at most ABANDON_SCANS of them.
    */
-  const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number, number], RunscError> =>
+  const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number, readonly string[]], RunscError | ReleaseNotInstalled> =>
     Effect.gen(function*() {
       // The pod's by its uid too: a pod of its name made since is another, whose processes are its own.
-      const pods = (yield* runsc.containers).filter(({ annotations }) =>
-        podOf(annotations) === `${request.namespace}/${request.pod}` && annotations[POD_UID_ANNOTATION] === request.uid
+      const listed = Effect.map(runsc.containers, (all) =>
+        all.filter(({ annotations }) => podOf(annotations) === `${request.namespace}/${request.pod}` && annotations[POD_UID_ANNOTATION] === request.uid)
       );
-      const containers = pods.filter(({ status }) => status !== "paused");
+      let containers = yield* listed;
+      const ended: string[] = [];
+      for (;;) {
+        const [paused] = containers.filter(({ status }) => status === "paused").sort((a, b) => Number(isRoot(b)) - Number(isRoot(a)));
+        if (paused === undefined) break;
+        if (ended.includes(paused.id)) {
+          return yield* new RunscError({ release: "the node's", command: `kill ${paused.id} KILL`, reason: "runsc holds the container paused still after its kill" });
+        }
+        // Through the release that runs its sandbox, as its shim would.
+        const { release } = yield* runsc.container(paused.id);
+        yield* runsc.kill(release, paused.id);
+        ended.push(paused.id);
+        containers = yield* listed;
+      }
       const killed: Killed[] = [];
       // Each process found, by its pid and start time, killed or not.
       const seen = new Set<string>();
@@ -2100,28 +2120,28 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         let killedNow = 0;
         for (const each of found) {
           seen.add(`${each.pid} ${each.startTime}`);
-          if (yield* runsc.kill(each)) {
+          if (yield* runsc.killProcess(each)) {
             killed.push({ containerId: each.containerId, pid: each.pid });
             killedNow += 1;
           }
         }
         if (killedNow === 0) break;
       }
-      return [killed, seen.size, pods.length - containers.length] as const;
+      return [killed, seen.size, ended] as const;
     });
 
-  const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
+  const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError | ReleaseNotInstalled> =>
     exclusive([request], Effect.sync(() => storeProxy.revoke(prefixOf(request))).pipe(Effect.andThen(goferOptionsGone(request)), Effect.andThen(abandonNow(request)))).pipe(
       Effect.ensuring(loading.end(prefixOf(request))),
-      Effect.tap(([killed, found, paused]) =>
+      Effect.tap(([killed, found, ended]) =>
         Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": "abandoned" })).pipe(
-          Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length, "alasio.abandon.paused": paused })),
+          Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length, "alasio.abandon.paused": ended.length })),
           Effect.andThen(Effect.logInfo(
             `abandoned the restore of ${prefixOf(request)} in ${request.namespace}/${request.pod}: ${
-              killed.length > 0 ? `killed ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}` : paused > 0 ? "killed nothing" : "runsc ran nothing for it"
-            }${found > killed.length ? `; of those found, ${found - killed.length} had ended since, their pids gone or another process's` : ""}${
-              paused > 0 ? `; ${paused} of its containers, which runsc holds paused, left to its pod's teardown, which ends them through runsc` : ""
-            }`,
+              ended.length > 0 ? `killed through runsc ${ended.join(", ")}, which runsc held paused; ` : ""
+            }${
+              killed.length > 0 ? `killed ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}` : ended.length > 0 ? "no process of them left to kill" : "runsc ran nothing for it"
+            }${found > killed.length ? `; of those found, ${found - killed.length} had ended since, their pids gone or another process's` : ""}`,
           )),
         )
       ),
@@ -2221,6 +2241,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
 /** The annotation containerd gives a container's spec of its pod's uid. */
 const POD_UID_ANNOTATION = "io.kubernetes.cri.sandbox-uid";
+/** The annotation containerd gives a container's spec of what it is of its pod: `sandbox` for the pod's own, its sandbox's root container. */
+const CONTAINER_TYPE_ANNOTATION = "io.kubernetes.cri.container-type";
+
+/** Whether `container` is its pod's own, its sandbox's root container, as containerd's annotations of its spec say. */
+function isRoot({ annotations }: ListedContainer): boolean {
+  return annotations[CONTAINER_TYPE_ANNOTATION] === "sandbox";
+}
 
 /** The pod a container is of, `<namespace>/<name>`, as the annotations containerd gives its spec say, `?` for what they do not. */
 function podOf(annotations: Readonly<Record<string, string>>): string {

@@ -107,7 +107,7 @@ import {
 import type { ListedExport } from "./otlp-sink.ts";
 import type { ReplFilled, ReplSeen, ReplSet, ReplSummed } from "./session-repl.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
-import type { Corrupted, Released } from "./snapshot-bucket.ts";
+import type { Corrupted, Outlived, Released } from "./snapshot-bucket.ts";
 import { OTLP, STAND_INS, type StandIn, TELEGRAM, TELEGRAM_BRANCH, urlOf } from "./stand-ins.ts";
 import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from "./telegram-stub.ts";
 import { workspaceStorage } from "./workspace-storage.ts";
@@ -2237,6 +2237,77 @@ if (inShard("snapshots")) {
         assert.ok(Date.now() < deadline, "no alert on restores falling back reached Telegram");
         await sleep(5_000);
       }
+    });
+
+    test("a restore refused before its sandbox resumed, as one of a snapshot that holds the session no more is, is abandoned: its sandbox, held paused, killed through runsc, so that its pod is gone within seconds of its deletion, not at its grace's end, what it held of its node freed, its workspace detached; the session comes back from bayma's checkpoints", async (t) => {
+      const outlived = await newSession("none");
+      const { sessionId: kept } = await repl.set(outlived, `checkpointed by ${outlived}`);
+      await untilReleased(outlived, Date.now());
+      // Said taken live at a generation of bayma's state it never reached: its restore finds it holds the session no more only
+      // as it would resume its sandbox, restored paused into its pod, which runs.
+      const [node = ""] = (await nodeAgents()).keys();
+      const said = await inNodeAgent<Outlived>(node, "./snapshot-bucket.ts", "outlive", SESSIONS, outlived);
+      // Each pod of main's sessions seen as the turn binds it: when its deletion was asked, as its grace before its
+      // deletionTimestamp says, and when it was first seen gone.
+      const seen = new Map<string, { asked?: number; grace?: number; gone?: number }>();
+      let watching = true;
+      const watched = (async () => {
+        while (watching) {
+          const now = Date.now();
+          const pods = await kube.list<V1Pod>("Pod", { namespace: SESSIONS }).catch(() => null);
+          if (pods !== null) {
+            const listed = new Set(pods.map(({ metadata }) => metadata?.name ?? ""));
+            for (const { metadata } of pods) {
+              const of = seen.get(metadata?.name ?? "") ?? {};
+              seen.set(metadata?.name ?? "", of);
+              if (of.asked === undefined && metadata?.deletionTimestamp) {
+                of.grace = metadata.deletionGracePeriodSeconds ?? 0;
+                of.asked = new Date(metadata.deletionTimestamp).getTime() - of.grace * 1000;
+              }
+            }
+            for (const [name, of] of seen) if (of.gone === undefined && !listed.has(name)) of.gone = now;
+          }
+          await sleep(250);
+        }
+      })();
+      let abandoned: { readonly line: string; readonly pod: string } | undefined;
+      try {
+        await turn("hello after its snapshot outlived it");
+        // The restore abandoned on its node, its containers held paused killed through runsc.
+        for (const pod of (await nodeAgents()).values()) {
+          const line = (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").find((each) => each.includes(`abandoned the restore of ${SESSIONS}/${outlived} in `));
+          const name = line === undefined ? undefined : new RegExp(`abandoned the restore of ${SESSIONS}/${outlived} in ${SESSIONS}/(\\S+): `, "u").exec(line)?.[1];
+          if (line !== undefined && name !== undefined) abandoned = { line: line.slice(line.indexOf("abandoned")), pod: name };
+        }
+        assert.ok(abandoned, `no node agent abandoned the restore of ${outlived}`);
+        t.diagnostic(abandoned.line);
+        assert.match(abandoned.line, /: killed through runsc \S+, which runsc held paused/u);
+        const pod = abandoned.pod;
+        await until(`the pod ${pod} gone`, async () => (seen.get(pod)?.gone === undefined ? undefined : true), 180_000);
+      } finally {
+        watching = false;
+        await watched;
+      }
+      const { asked, grace, gone } = seen.get(abandoned.pod) ?? {};
+      assert.ok(asked !== undefined && grace !== undefined && gone !== undefined, `the deletion of ${abandoned.pod} was not seen: ${JSON.stringify(seen.get(abandoned.pod))}`);
+      t.diagnostic(`${abandoned.pod} was gone ${gone - asked} ms after its deletion was asked, its grace ${grace} s`);
+      // Gone, as kubelet lets a pod go once its containers stopped and what they held of the node is freed, within
+      // seconds: its sandbox's stop waited on no resume that would never come, past which only its grace's end would
+      // have killed it.
+      assert.ok(grace >= 60, `the pod ${abandoned.pod} was given ${grace} s to stop`);
+      assert.ok(gone - asked < 30_000, `the pod ${abandoned.pod} took ${gone - asked} ms to go, of its grace of ${grace} s`);
+      // kubelet's stop of it failed nowhere, as one of a container held paused past runsc's kill of its sandbox fails.
+      const failed = (await kube.list<CoreV1Event>("Event", { namespace: SESSIONS })).filter(({ involvedObject, reason }) => involvedObject.name === abandoned?.pod && (reason === "FailedKillPod" || reason === "FailedPreStopHook"));
+      assert.deepEqual(failed.map(({ reason, message }) => `${reason}: ${message}`), []);
+      // Its workspace detached, as it was once its containers stopped.
+      const logged = await gatewayLogs();
+      assert.ok(!logged.some((line) => line.includes(`could not detach what was attached into ${SESSIONS}/${abandoned?.pod}`)), logged.filter((line) => line.includes(abandoned?.pod ?? "")).join("\n"));
+      // Fallen back, as the gateway logs, for the snapshot that holds the session no more.
+      const fallback = logged.find((line) => line.includes(`${SESSIONS}/${outlived} is bound from bayma's checkpoints, not from its snapshot: `));
+      assert.ok(fallback?.includes(`bayma's state generation is `) && fallback.includes(`and was ${said.generation} as it was saved`), `the gateway logged no fallback of ${outlived} for its snapshot ${said.snapshot}, outlived: ${fallback}`);
+      const read = await repl.read(outlived, kept);
+      assert.deepEqual([read.live, read.checkpointed], [null, `checkpointed by ${outlived}`]);
+      assert.match(read.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
     });
 
     test("a session restored where a restore ran before is restored into the standby its node keeps of the same template and gVisor release, claimed for it, whole, its workspace's files with it, and another is kept there after it; saved again from the standby, live and as it is released, it is restored from that save whole", { skip: !restoresIntoStandby(NODE_PINS.gvisor.releases[0]?.release ?? "", NODE_PINS.gvisor.restoresIntoStandbySince ?? "") && "the current gVisor release's shim restores into no standby" }, async (t) => {

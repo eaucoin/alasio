@@ -9,6 +9,11 @@
  * - `release <environment> <workspace> <release>` says the workspace's current snapshot was
  *   taken by gVisor's `release`, as one taken by a release no longer kept says. Prints one
  *   JSON line of the snapshot and the release it said.
+ * - `outlive <environment> <workspace>` says the workspace's current snapshot was taken live,
+ *   at a state generation of bayma's its state directory, as the snapshot's pod template runs
+ *   bayma with it, has never been at: one that holds the session no more, which a restore of it
+ *   finds as it would resume its sandbox. Prints one JSON line of the snapshot and the
+ *   generation it said.
  *
  * alasio's modules are imported by their paths in the repository, which inNodeAgent in
  * harness.ts rewrites to the image's as it pipes this in.
@@ -35,9 +40,18 @@ export interface Released {
   readonly release: string;
 }
 
+/** The snapshot said taken live at a generation bayma's state has never been at: its id, and that generation. */
+export interface Outlived {
+  readonly snapshot: string;
+  readonly generation: number;
+}
+
+/** A generation of bayma's state no session reaches, as each exec moves it on by one. */
+const NEVER_REACHED = 2 ** 31;
+
 const [verb, environment, workspace, release] = process.argv.slice(2);
-if (!(verb === "corrupt" || (verb === "release" && release)) || !environment || !workspace) {
-  throw new Error("usage: snapshot-bucket.ts corrupt <environment> <workspace> | release <environment> <workspace> <release>");
+if (!(verb === "corrupt" || verb === "outlive" || (verb === "release" && release)) || !environment || !workspace) {
+  throw new Error("usage: snapshot-bucket.ts corrupt <environment> <workspace> | release <environment> <workspace> <release> | outlive <environment> <workspace>");
 }
 
 /** The variable of the agent's environment `name`, which it is given. */
@@ -62,6 +76,15 @@ const said = await Effect.runPromise(Effect.gen(function*() {
   if (verb === "release" && release) {
     yield* bucket.putJson(current, { ...manifest, release });
     const done: Released = { snapshot: manifest.snapshot, release };
+    return done;
+  }
+  if (verb === "outlive") {
+    // The state directory bayma runs with, as the arguments of the template's containers give it.
+    const containers = (manifest.podTemplate as { readonly spec?: { readonly containers?: readonly { readonly args?: readonly string[] }[] } }).spec?.containers ?? [];
+    const stateDir = containers.flatMap(({ args = [] }) => (args.includes("--state-dir") ? [args[args.indexOf("--state-dir") + 1] ?? ""] : []))[0];
+    if (!stateDir) return yield* Effect.die(new Error(`the snapshot ${manifest.snapshot} of ${environment}/${workspace} runs no bayma with a state directory`));
+    yield* bucket.putJson(current, { ...manifest, live: { stateDir, generation: NEVER_REACHED, running: [] } });
+    const done: Outlived = { snapshot: manifest.snapshot, generation: NEVER_REACHED };
     return done;
   }
   // The largest file of its image, which is the sandbox's memory, never all zeros.

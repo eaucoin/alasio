@@ -3790,24 +3790,40 @@ test("an abandon kills no process of another pod's container, of a pod of its na
     })
   ));
 
-test("an abandon leaves what runsc runs for a container it holds paused, as one restored whole is until its resume, to its pod's teardown, which ends it through runsc; it kills what runs for the pod's others", () =>
+test("an abandon kills through runsc the containers it holds paused, as each of a sandbox restored whole is until its resume, its pod's own first, which ends them all; then what runsc runs for them", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
-      here.releases.held(CONTAINER, "paused");
-      const sandbox = yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER));
+      // The pod's own container, its sandbox's root, listed after the other, as runsc may list them.
+      here.releases.rooted(OTHER_CONTAINER);
+      for (const id of [CONTAINER, OTHER_CONTAINER]) here.releases.held(id, "paused");
       const gofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, CONTAINER));
       const otherGofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, OTHER_CONTAINER));
-      assert.deepEqual(yield* here.agent.abandon(abandonRequest), [{ containerId: OTHER_CONTAINER, pid: otherGofer.pid }]);
-      assert.equal(yield* Effect.promise(() => otherGofer.ended), "SIGKILL");
-      // Each would have been killed by now: killed past runsc, its sandbox would be held paused on, and no stop of the pod end.
-      yield* Effect.sleep("200 millis");
-      for (const each of [sandbox, gofer]) assert.ok(each.running(), `${each.pid} runs on`);
-      // Running again, as its resume makes it, it is killed as any other.
-      here.releases.held(CONTAINER, "running");
       const killed = yield* here.agent.abandon(abandonRequest);
-      assert.deepEqual(killed.toSorted((a, b) => a.pid - b.pid), [{ containerId: CONTAINER, pid: sandbox.pid }, { containerId: CONTAINER, pid: gofer.pid }].toSorted((a, b) => a.pid - b.pid));
-      for (const each of [sandbox, gofer]) assert.equal(yield* Effect.promise(() => each.ended), "SIGKILL");
+      // Killed through runsc, as its shim would kill it, of the release that runs its sandbox: the pod's own, which ended both.
+      assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.filter((arg) => !arg.startsWith("--"))), [["kill", OTHER_CONTAINER, "KILL"]]);
+      const listed = JSON.parse(readFileSync(join(here.releases.releasesDir, "containers.json"), "utf8")) as Record<string, { status?: string }>;
+      assert.deepEqual([listed[CONTAINER]?.status, listed[OTHER_CONTAINER]?.status], ["stopped", "stopped"]);
+      // What runsc ran for them that was left, killed as the process of a container ended.
+      assert.deepEqual(killed.toSorted((a, b) => a.pid - b.pid), [{ containerId: CONTAINER, pid: gofer.pid }, { containerId: OTHER_CONTAINER, pid: otherGofer.pid }].toSorted((a, b) => a.pid - b.pid));
+      for (const each of [gofer, otherGofer]) assert.equal(yield* Effect.promise(() => each.ended), "SIGKILL");
+    })
+  ));
+
+test("an abandon fails, killing no process past runsc, where runsc does not kill a container it holds paused, or holds it paused still after its kill", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      for (const id of [CONTAINER, OTHER_CONTAINER]) here.releases.held(id, "paused");
+      const sandbox = yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER));
+      for (const [file, said] of [["fail-kill", /runsc kill of .* failed: kill failed: the sandbox is not running/u], ["ignore-kill", /runsc holds the container paused still after its kill/u]] as const) {
+        writeFileSync(join(here.releases.dirOf(RELEASE), file), "");
+        const refused = yield* Effect.flip(here.agent.abandon(abandonRequest));
+        assert.match(refused.message, said);
+        rmSync(join(here.releases.dirOf(RELEASE), file));
+      }
+      // Killed past runsc, its sandbox would be held paused on, and no stop of its pod end.
+      assert.ok(sandbox.running());
     })
   ));
 
