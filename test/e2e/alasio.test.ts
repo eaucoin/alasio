@@ -46,7 +46,7 @@ import type { Manifest } from "../../src/node-agent/agent.ts";
 import { STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS, standbySocket } from "../../src/kube/sandbox-shape.ts";
 import { STANDBY_AFTER_MS } from "../../src/gateway/standbys.ts";
 import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
-import { gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
+import { gvisorReleases, NODE_PINS, SERVICE as K3S_SERVICE } from "../../cli/src/cluster/node.ts";
 import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
@@ -425,9 +425,14 @@ if (inShard("upgrade")) {
     const NO_STANDBY = `${PREVIOUS}'s current gVisor release restores into no standby`;
     /**
      * A session of main's released into its snapshot on the release before, which its first bind after the cut-over restores,
-     * into a pod made since the upgrade started k3s anew.
+     * into a pod made since the upgrade started k3s anew, where it did.
      */
     const RULES_SESSION = "fs-e2eupgraderules";
+    /**
+     * A line of the upgrade's plan, as alasio says its node's steps (cli/src/cluster/node.ts describeNodeStep), of one that
+     * starts k3s anew: restarted with its new configuration, or to renew its certificates, or installed anew.
+     */
+    const K3S_RESTARTED = new RegExp(`restart the service ${K3S_SERVICE}\\b|as the systemd service ${K3S_SERVICE}, enabled and started anew`, "u");
     /** The standbys of main's sessions that run, each of its containers started, on `node` where named. */
     const standbysRunning = async (node?: string) =>
       (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: node === undefined ? STANDBY_LABEL : `${STANDBY_LABEL}=${node}` })).filter((pod) =>
@@ -454,19 +459,25 @@ if (inShard("upgrade")) {
           await untilReleased(RULES_SESSION, Date.now());
           assert.ok(await snapshotOf(RULES_SESSION), `${RULES_SESSION} was released into no snapshot on ${PREVIOUS}`);
         },
-        // The upgrade wrote kubelet's config file anew, which has kubelet report its node's status every 10 s, changed or not,
-        // and so started k3s anew, whose network policy controller starts only once the node's Ready condition has been
-        // reported since (cli/src/cluster/k3s.ts's KUBELET_CONFIG): at once, not at kubelet's next report of an unchanged
-        // status, up to 7.5 minutes later before, a pod started meanwhile having no rules, so that no restore into one was
-        // resumed.
-        keeps: "kubelet reporting its node's status every 10 s, as the upgrade, which started k3s anew, configured it: the session restored first after it resumed at its first bind, its network policies in force within seconds",
+        // kubelet reports its node's status every 10 s, changed or not, as its config file says, and k3s's network policy
+        // controller starts only once the node's Ready condition has been reported since k3s started
+        // (cli/src/cluster/k3s.ts's KUBELET_CONFIG): at once, not at kubelet's next report of an unchanged status, up to 7.5
+        // minutes later before, a pod started meanwhile having no rules, so that no restore into one was resumed. An upgrade
+        // that changes the node's files starts k3s anew, as its plan says (K3S_RESTARTED): then the restore comes after it.
+        keeps: "kubelet reporting its node's status every 10 s: the session restored first after the cut-over, after k3s started anew where the upgrade restarted it, resumed at its first bind, its network policies in force within seconds",
         check: async (t) => {
           const [node] = (await kube.list<V1Node>("Node")).map(({ metadata }) => metadata?.name ?? "");
           assert.ok(node, "the cluster has no node");
-          // k3s started anew past the cut-over's point of no return: by the upgrade, which changed the node's files.
           const began = Date.parse((await inCutOverRecord("cat point-of-no-return")).trim());
           const started = Number(await onNode(node, `date -d "$(systemctl show --property=ExecMainStartTimestamp --value k3s)" +%s`)) * 1000;
-          assert.ok(started > began, `k3s started at ${new Date(started).toISOString()}, before the cut-over's point of no return at ${new Date(began).toISOString()}`);
+          // k3s started anew past the cut-over's point of no return where the upgrade planned it, as one that changes the
+          // node's files does, and not otherwise.
+          const restarting = K3S_RESTARTED.test(await inCutOverRecord("cat upgrade.log"));
+          assert.equal(
+            started > began,
+            restarting,
+            `k3s started at ${new Date(started).toISOString()}, the cut-over's point of no return at ${new Date(began).toISOString()}, and the upgrade ${restarting ? "planned" : "did not plan"} to start k3s anew`,
+          );
           const policing = /^(\d+)\.\d+ .*Starting network policy controller version /mu.exec(
             await onNode(node, `journalctl --unit k3s --since @${started / 1000} --output short-unix --no-pager | grep --max-count 1 'Starting network policy controller version ' || true`),
           );
@@ -493,7 +504,7 @@ if (inShard("upgrade")) {
           }
           const heard = [...beats].sort((a, b) => a - b);
           const gaps = heard.slice(1).map((at, i) => (at - (heard[i] ?? at)) / 1000);
-          t.diagnostic(`k3s started ${(started - began) / 1000} s past the cut-over's point of no return, its network policy controller ${Number(policing[1]) - started / 1000} s after it; ${RULES_SESSION} restored ${Math.round((restoring - started) / 1000)} s after k3s started, its network policies in force after ${waited} ms; kubelet reported ${node}'s status ${gaps.join(" s, ")} s apart`);
+          t.diagnostic(`k3s started ${restarting ? `${(started - began) / 1000} s past the cut-over's point of no return, as the upgrade restarted it` : `${(began - started) / 1000} s before the cut-over's point of no return, as the upgrade did not restart it`}, its network policy controller ${Number(policing[1]) - started / 1000} s after it; ${RULES_SESSION} restored ${Math.round((restoring - started) / 1000)} s after k3s started, its network policies in force after ${waited} ms; kubelet reported ${node}'s status ${gaps.join(" s, ")} s apart`);
           assert.ok(waited < 10_000, `the network policies of ${SESSIONS}/${name} were in force after ${waited} ms`);
           assert.ok(gaps.length >= 2 && gaps.every((gap) => gap <= 25), `kubelet reported ${node}'s status ${heard.length} times in 60 s, ${gaps.join(" s, ")} s apart`);
         },
