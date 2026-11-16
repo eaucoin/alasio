@@ -61,7 +61,11 @@
  * A restore alasio refuses before it resumes the sandbox is abandoned: the agent kills
  * what runsc runs for the pod's containers, their sandbox and gofers among it, so that the
  * pod's teardown waits on none of it: a `runsc restore` that failed has left them running,
- * its shim then tearing none of them down. A container is the pod's only where the
+ * its shim then tearing none of them down. A container runsc holds paused, as each of a
+ * sandbox restored whole is until its resume, is left to the pod's teardown, which ends it
+ * through runsc as kubelet stops the pod: killed past runsc, it would be held paused on, as
+ * runsc never looks whether the sandbox of one it holds paused still runs, and its shim's
+ * delete of it refused, so that no stop of its pod would ever end. A container is the pod's only where the
  * annotations containerd gives its spec name the pod and its uid, so that the containers of
  * a pod of its name made since are left be. A process is a container's only where its
  * arguments name runsc's root, the container's bundle and its id, and is killed only while
@@ -2073,19 +2077,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
-   * Kills what runsc runs for the containers of the pod `request` names, as the module says:
-   * what it killed, of how many it found. A process one of them forks is the container's
+   * Kills what runsc runs for the containers of the pod `request` names but those it holds
+   * paused, as the module says: what it killed, of how many it found, and how many containers
+   * it left paused. A process one of them forks is the container's
    * from its fork on, as its arguments, until it execs, are those of the runsc it forked
    * from, and its own after; so one forked as the scan before ran, or as the process it
    * forked from was killed, is found by the scan after the kills. The scans go on until
    * one kills nothing new, at most ABANDON_SCANS of them.
    */
-  const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number], RunscError> =>
+  const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number, number], RunscError> =>
     Effect.gen(function*() {
       // The pod's by its uid too: a pod of its name made since is another, whose processes are its own.
-      const containers = (yield* runsc.containers).filter(({ annotations }) =>
+      const pods = (yield* runsc.containers).filter(({ annotations }) =>
         podOf(annotations) === `${request.namespace}/${request.pod}` && annotations[POD_UID_ANNOTATION] === request.uid
       );
+      const containers = pods.filter(({ status }) => status !== "paused");
       const killed: Killed[] = [];
       // Each process found, by its pid and start time, killed or not.
       const seen = new Set<string>();
@@ -2101,19 +2107,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         }
         if (killedNow === 0) break;
       }
-      return [killed, seen.size] as const;
+      return [killed, seen.size, pods.length - containers.length] as const;
     });
 
   const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
     exclusive([request], Effect.sync(() => storeProxy.revoke(prefixOf(request))).pipe(Effect.andThen(goferOptionsGone(request)), Effect.andThen(abandonNow(request)))).pipe(
       Effect.ensuring(loading.end(prefixOf(request))),
-      Effect.tap(([killed, found]) =>
+      Effect.tap(([killed, found, paused]) =>
         Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": "abandoned" })).pipe(
-          Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length })),
+          Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length, "alasio.abandon.paused": paused })),
           Effect.andThen(Effect.logInfo(
             `abandoned the restore of ${prefixOf(request)} in ${request.namespace}/${request.pod}: ${
-              killed.length === 0 ? "runsc ran nothing for it" : `killed ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}`
-            }${found > killed.length ? `; of those found, ${found - killed.length} had ended since, their pids gone or another process's` : ""}`,
+              killed.length > 0 ? `killed ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}` : paused > 0 ? "killed nothing" : "runsc ran nothing for it"
+            }${found > killed.length ? `; of those found, ${found - killed.length} had ended since, their pids gone or another process's` : ""}${
+              paused > 0 ? `; ${paused} of its containers, which runsc holds paused, left to its pod's teardown, which ends them through runsc` : ""
+            }`,
           )),
         )
       ),

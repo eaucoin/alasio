@@ -3790,6 +3790,27 @@ test("an abandon kills no process of another pod's container, of a pod of its na
     })
   ));
 
+test("an abandon leaves what runsc runs for a container it holds paused, as one restored whole is until its resume, to its pod's teardown, which ends it through runsc; it kills what runs for the pod's others", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      here.releases.held(CONTAINER, "paused");
+      const sandbox = yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER));
+      const gofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, CONTAINER));
+      const otherGofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, OTHER_CONTAINER));
+      assert.deepEqual(yield* here.agent.abandon(abandonRequest), [{ containerId: OTHER_CONTAINER, pid: otherGofer.pid }]);
+      assert.equal(yield* Effect.promise(() => otherGofer.ended), "SIGKILL");
+      // Each would have been killed by now: killed past runsc, its sandbox would be held paused on, and no stop of the pod end.
+      yield* Effect.sleep("200 millis");
+      for (const each of [sandbox, gofer]) assert.ok(each.running(), `${each.pid} runs on`);
+      // Running again, as its resume makes it, it is killed as any other.
+      here.releases.held(CONTAINER, "running");
+      const killed = yield* here.agent.abandon(abandonRequest);
+      assert.deepEqual(killed.toSorted((a, b) => a.pid - b.pid), [{ containerId: CONTAINER, pid: sandbox.pid }, { containerId: CONTAINER, pid: gofer.pid }].toSorted((a, b) => a.pid - b.pid));
+      for (const each of [sandbox, gofer]) assert.equal(yield* Effect.promise(() => each.ended), "SIGKILL");
+    })
+  ));
+
 test("as the agent stops, an operation it runs is let end before what it runs in is closed", () =>
   Effect.gen(function*() {
     const scope = yield* Scope.make();

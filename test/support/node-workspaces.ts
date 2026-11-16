@@ -112,7 +112,7 @@ export function workspacesNode({ quotaHeldWithinMs = 1_000, orphanGraceMs = 0 }:
         running.has(id) ? Effect.succeed({ release: "r", annotations: { ...annotations.get(id) }, tracksWrites: false, bundle: "" }) : Effect.fail(new RunscError({ release: "", command: "state", reason: "not found" })),
       // Each that has annotations, whether it runs or not, as runsc lists what it keeps.
       containers: Effect.suspend(() =>
-        runscFails.list ? Effect.fail(new RunscError({ release: "the node's", command: "list", reason: "runsc could not list its containers" })) : Effect.succeed([...annotations].map(([id, of]) => ({ id, bundle: "", annotations: { ...of } })))
+        runscFails.list ? Effect.fail(new RunscError({ release: "the node's", command: "list", reason: "runsc could not list its containers" })) : Effect.succeed([...annotations].map(([id, of]) => ({ id, status: running.has(id) ? "running" : "stopped", bundle: "", annotations: { ...of } })))
       ),
       // A process of each that runs, as runsc runs one for a container's sandbox.
       processes: (containers) => Effect.sync(() => containers.filter(({ id }) => running.has(id)).map(({ id }, n) => ({ containerId: id, pid: 1000 + n, startTime: "1" }))),

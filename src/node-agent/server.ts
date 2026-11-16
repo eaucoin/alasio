@@ -60,7 +60,8 @@
  *   workspace's restore into the pod `namespace`/`pod` of the uid `uid` on this node, which
  *   alasio refused before it resumed its sandbox: kills each process runsc runs for the pod's containers, their
  *   sandbox and gofers among them, that is still the one it found, so that the pod's
- *   teardown waits on none of them: `{ killed: [{ containerId, pid }] }` (200). 500 when
+ *   teardown waits on none of them, but those of a container runsc holds paused, which that
+ *   teardown ends through runsc (./agent.ts): `{ killed: [{ containerId, pid }] }` (200). 500 when
  *   runsc's containers, or the node's processes, could not be read, or one not killed.
  * - `POST /standby/restore`, `{ environment, workspace, namespace, pod, imagePath }`: restores
  *   the workspace's image, `imagePath`, as this node's agent prepared it, into the standby pod

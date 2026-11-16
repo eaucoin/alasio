@@ -75,13 +75,18 @@ const ContainerState = Schema.Struct({
 /** What `runsc list --format=json` says of the containers under the root, as far as the agent reads it: null for none, as runsc writes an empty list. */
 const ContainerList = Schema.NullOr(Schema.Array(Schema.Struct({
   id: Schema.NonEmptyString,
+  status: Schema.NonEmptyString,
   bundle: Schema.NonEmptyString,
   annotations: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 })));
 
-/** A container runsc keeps under the root: its id, containerd's, its bundle, and its spec's annotations. */
+/**
+ * A container runsc keeps under the root: its id, containerd's, its status as runsc's state
+ * says it (created, running, paused or stopped), its bundle, and its spec's annotations.
+ */
 export interface ListedContainer {
   readonly id: string;
+  readonly status: string;
   readonly bundle: string;
   readonly annotations: Readonly<Record<string, string>>;
 }
@@ -440,7 +445,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
           catch: (cause) => new RunscError({ release: "the node's", command: "list --format=json", reason: `its list is not one: ${String(cause)}` }),
         })
       ),
-      Effect.map((listed) => listed.map(({ id, bundle, annotations }) => ({ id, bundle, annotations: annotations ?? {} }))),
+      Effect.map((listed) => listed.map(({ id, status, bundle, annotations }) => ({ id, status, bundle, annotations: annotations ?? {} }))),
     ),
 
     processes: (containers) =>
