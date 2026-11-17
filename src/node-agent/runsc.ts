@@ -11,7 +11,7 @@
  * says how), and kills them, as the agent does of a restore whose shim left them running.
  */
 import { execFile } from "node:child_process";
-import { readdir, readFile, readlink } from "node:fs/promises";
+import { readdir, readFile, readlink, stat } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
 
 import { Effect, Schema } from "effect";
@@ -59,6 +59,19 @@ export class RunscError extends Schema.TaggedError<RunscError>()("RunscError", {
   }
 }
 
+/**
+ * A container's sandbox is gone, as one that died is: runsc's state says the container stopped, or names no process of its
+ * sandbox, or one the node runs no more.
+ */
+export class SandboxGone extends Schema.TaggedError<SandboxGone>()("SandboxGone", {
+  containerId: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the sandbox of ${this.containerId} is gone: ${this.reason}`;
+  }
+}
+
 /** A release is not on this node. */
 export class ReleaseNotInstalled extends Schema.TaggedError<ReleaseNotInstalled>()("ReleaseNotInstalled", {
   release: Schema.String,
@@ -76,9 +89,13 @@ const ImageInspection = Schema.Struct({
   memory_files: Schema.optional(Schema.Array(Schema.Struct({ layer_bytes: Schema.Array(Schema.Number) }))),
 });
 
-/** What `runsc state` says of a container, as far as the agent reads it: its sandbox's process, its bundle, and its spec's annotations. */
+/**
+ * What `runsc state` says of a container, as far as the agent reads it: its status, its sandbox's process, -1 or none for a
+ * container not running (runsc/container/container.go SandboxPid), its bundle, and its spec's annotations.
+ */
 const ContainerState = Schema.Struct({
-  pid: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+  status: Schema.NonEmptyString,
+  pid: Schema.optional(Schema.Number.check(Schema.isInt())),
   bundle: Schema.String,
   annotations: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
@@ -240,9 +257,11 @@ export interface Runsc {
    * sandbox, from the program its sandbox's process runs (whatever a pod's RuntimeClass
    * names now, it ran what it named as it started), its annotations, and whether its
    * sandbox tracks its writes, as the flags its process was started with say (its
-   * runtime's options file when it started, which may have changed since).
+   * runtime's options file when it started, which may have changed since). One whose sandbox is gone fails SandboxGone:
+   * runsc's state says it stopped, as runsc says one whose sandbox died (of one it held paused too, from
+   * 20261102.0-eaucoin.7 on), or names no process of its sandbox, or one the node's /proc holds no more.
    */
-  readonly container: (containerId: string) => Effect.Effect<RunningContainer, RunscError>;
+  readonly container: (containerId: string) => Effect.Effect<RunningContainer, RunscError | SandboxGone>;
   /** The containers runsc keeps under the root, whichever release runs each, as `runsc list` says. */
   readonly containers: Effect.Effect<readonly ListedContainer[], RunscError>;
   /** The processes runsc runs for each of `containers` on the node, as makeRunsc finds them. */
@@ -459,10 +478,24 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         const failed = (reason: string) => new RunscError({ release: "the node's", command: `state ${containerId}`, reason });
         const { stdout } = yield* runCurrent(["state"], [containerId]);
         const state = yield* Effect.try({ try: () => Schema.decodeUnknownSync(ContainerState)(JSON.parse(stdout)), catch: (cause) => failed(`its state is not one: ${String(cause)}`) });
-        const program = yield* Effect.tryPromise({ try: () => readlink(join(procRoot, String(state.pid), "exe")), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
+        if (state.status === "stopped") return yield* new SandboxGone({ containerId, reason: "runsc's state says it stopped" });
+        const { pid } = state;
+        if (pid === undefined || pid <= 0) return yield* new SandboxGone({ containerId, reason: "runsc's state names no process of its sandbox" });
+        const proc = join(procRoot, String(pid));
+        // A file of its process: gone where the node's /proc holds the process no more, as of one that ended; not readable otherwise.
+        const read = <A>(file: (proc: string) => Promise<A>): Effect.Effect<A, RunscError | SandboxGone> =>
+          Effect.tryPromise({ try: () => file(proc), catch: (cause) => cause }).pipe(
+            Effect.catch((cause) =>
+              Effect.flatMap(
+                Effect.promise(() => stat(proc).then(() => false, (error: NodeJS.ErrnoException) => error.code === "ENOENT")),
+                (gone) => Effect.fail(gone ? new SandboxGone({ containerId, reason: `its sandbox's process ${pid} is gone` }) : failed(`its sandbox's process ${pid} is not readable: ${String(cause)}`)),
+              )
+            ),
+          );
+        const program = yield* read((at) => readlink(join(at, "exe")));
         const [release = "", ...under] = relative(releasesDir, program).split(sep);
         if (under.length === 0 || release === ".." || !(yield* releases).includes(release)) return yield* failed(`its sandbox runs ${program}, of no release installed here`);
-        const argv = yield* Effect.tryPromise({ try: () => readFile(join(procRoot, String(state.pid), "cmdline"), "utf8"), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
+        const argv = yield* read((at) => readFile(join(at, "cmdline"), "utf8"));
         const tracking = argv.split("\0").findLast((arg) => arg.startsWith("--dirty-tracking="))?.slice("--dirty-tracking=".length);
         return { release, annotations: state.annotations ?? {}, tracksWrites: tracking !== undefined && tracking !== "off", bundle: state.bundle };
       }),

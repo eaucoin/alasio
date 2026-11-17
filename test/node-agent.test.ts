@@ -3810,25 +3810,67 @@ test("an abandon kills through runsc the containers it holds paused, as each of 
     })
   ));
 
-test("an abandon kills through the current release's runsc the containers runsc holds paused whose sandbox died, its process gone or its pid another's since; then what runsc runs for them", () =>
+/** The node's /proc entry of the process of the container's sandbox, as runsc's state names it. */
+const sandboxProc = (node: Node, id: string) =>
+  join(node.releases.procRoot, String((JSON.parse(readFileSync(join(node.releases.releasesDir, "containers.json"), "utf8")) as Record<string, { pid: number }>)[id]?.pid));
+
+test("an abandon kills through runsc no container whose sandbox died, which runsc lists stopped, and through the current release's runsc one it lists paused whose sandbox is gone as its state is read; then what runsc runs for them", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const OLDER = "20260921.0-eaucoin.7";
-      for (const reused of [undefined, "/usr/bin/sleep"]) {
-        const here = yield* node(reused === undefined ? "node-1" : "node-2", { releases: [RELEASE, OLDER] });
+      const cases = [
+        { said: "listed stopped, its process gone", died: true, reused: undefined, unchecked: false },
+        { said: "listed stopped, its pid another's", died: true, reused: "/usr/bin/sleep", unchecked: false },
+        { said: "listed paused before it died, its state saying it stopped, its process gone", died: true, reused: undefined, unchecked: true },
+        { said: "listed paused before it died, its state saying it stopped, its pid another's", died: true, reused: "/usr/bin/sleep", unchecked: true },
+        // As a runsc before 20261102.0-eaucoin.7 says it.
+        { said: "listed paused, its state naming its process, which is gone", died: false, reused: undefined, unchecked: false },
+      ] as const;
+      for (const [index, { said, died, reused, unchecked }] of cases.entries()) {
+        const here = yield* node(`node-${index + 1}`, { releases: [RELEASE, OLDER] });
         // Run by the older release, whose sandbox's process is no release's any more.
         for (const id of [CONTAINER, OTHER_CONTAINER]) {
           here.releases.runs(id, OLDER, SESSIONS, POD);
           here.releases.held(id, "paused");
-          here.releases.died(id, reused);
+          if (!died) rmSync(sandboxProc(here, id), { recursive: true });
+          else {
+            here.releases.died(id, reused);
+            if (unchecked) here.releases.unchecked(id);
+          }
         }
         here.releases.rooted(OTHER_CONTAINER);
         const gofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, CONTAINER));
         const killed = yield* here.agent.abandon(abandonRequest);
-        assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.filter((arg) => !arg.startsWith("--"))), [["kill", OTHER_CONTAINER, "KILL"]]);
-        assert.deepEqual(here.releases.calls(OLDER), []);
-        assert.deepEqual(killed, [{ containerId: CONTAINER, pid: gofer.pid }]);
-        assert.equal(yield* Effect.promise(() => gofer.ended), "SIGKILL");
+        // The pod's own, which ends both.
+        const throughRunsc = died && !unchecked ? [] : [["kill", OTHER_CONTAINER, "KILL"]];
+        assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.filter((arg) => !arg.startsWith("--"))), throughRunsc, said);
+        assert.deepEqual(here.releases.calls(OLDER), [], said);
+        assert.deepEqual(killed, [{ containerId: CONTAINER, pid: gofer.pid }], said);
+        assert.equal(yield* Effect.promise(() => gofer.ended), "SIGKILL", said);
+      }
+    })
+  ));
+
+test("an abandon fails, killing nothing, where runsc lists a container paused whose sandbox it cannot tell gone: runsc's state fails, or names a process of no release installed here", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const UNINSTALLED = "20260801.0-eaucoin.1";
+      for (const [index, [cause, said]] of ([
+        ["fail-state", /^runsc state of 20260921\.0-eaucoin\.8 failed: loading container: reading container metadata file: permission denied$/u],
+        ["uninstalled", /^runsc state [0-9a-f]+ of the node's failed: its sandbox runs .*\/20260801\.0-eaucoin\.1\/runsc, of no release installed here$/u],
+      ] as const).entries()) {
+        const here = yield* node(`node-${index + 1}`);
+        for (const id of [CONTAINER, OTHER_CONTAINER]) {
+          if (cause === "uninstalled") here.releases.runs(id, UNINSTALLED, SESSIONS, POD);
+          here.releases.held(id, "paused");
+        }
+        if (cause === "fail-state") writeFileSync(join(here.releases.dirOf(RELEASE), "fail-state"), "");
+        const sandbox = yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER));
+        const refused = yield* Effect.flip(here.agent.abandon(abandonRequest));
+        assert.match(refused.message, said);
+        assert.deepEqual(here.releases.calls(RELEASE), [], cause);
+        // Killed past runsc, its sandbox would be held paused on, and no stop of its pod end.
+        assert.ok(sandbox.running(), cause);
       }
     })
   ));

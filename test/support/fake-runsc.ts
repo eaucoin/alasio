@@ -46,10 +46,13 @@
  * - `state ID`: the container's sandbox's process, its status, running unless
  *   FakeReleases.held says another, and its pod's annotations, as
  *   `containers.json` beside the releases says (FakeReleases.runs), or fails for one it
- *   does not hold; that process's program, in the stand-in's /proc, is the runsc of the
- *   release that runs it, and its arguments runsc's flags, which track its writes or not;
+ *   does not hold, or while a file `fail-state` is beside it; that process's program, in
+ *   the stand-in's /proc, is the runsc of the release that runs it, and its arguments
+ *   runsc's flags, which track its writes or not; of one whose sandbox died
+ *   (FakeReleases.died), stopped, of the process -1;
  * - `list --format=json`: each container `containers.json` holds, as `state` says it, or
- *   null for none, as runsc writes an empty list.
+ *   null for none, as runsc writes an empty list; of one FakeReleases.unchecked names,
+ *   the next list says it as it was before its sandbox died.
  *
  * The stand-in's /proc holds besides, while they run, the processes the test starts as
  * runsc would (FakeReleases.starts), which are real, and idle until killed: their
@@ -191,11 +194,17 @@ if (rest[0] === "checkpoint") {
 } else if (rest[0] === "exec") {
   if (existsSync(join(here, "fail-exec"))) { process.stderr.write("exec failed: the hook exited 1\\n"); process.exit(1); }
 } else if (rest[0] === "state") {
+  if (existsSync(join(here, "fail-state"))) { process.stderr.write("loading container: reading container metadata file: permission denied\\n"); process.exit(128); }
   const running = containers()[rest[rest.length - 1]];
   if (!running) { process.stderr.write("container does not exist\\n"); process.exit(1); }
   process.stdout.write(JSON.stringify(stateOf(rest[rest.length - 1], running)) + "\\n");
 } else if (rest[0] === "list" && flag("format") === "json") {
-  const listed = Object.entries(containers()).map(([id, running]) => stateOf(id, running));
+  const all = containers();
+  const listed = Object.entries(all).map(([id, running]) => stateOf(id, running.unchecked ? { ...running, ...running.before } : running));
+  // Unchecked for this list only.
+  const unchecked = Object.entries(all).filter(([, each]) => each.unchecked);
+  for (const [id, each] of unchecked) all[id] = { ...each, unchecked: false };
+  if (unchecked.length > 0) writeFileSync(join(here, "..", "containers.json"), JSON.stringify(all));
   process.stdout.write(JSON.stringify(listed.length === 0 ? null : listed) + "\\n");
 } else if (rest[0] === "cpu-features") {
   process.stdout.write(read("cpu-features", "sse,avx,avx2") + "\\n");
@@ -238,10 +247,17 @@ export interface FakeReleases {
   /** Makes containerd's annotations say the container is its pod's own, its sandbox's root container, as a pod's pause container is. */
   readonly rooted: (containerId: string) => void;
   /**
-   * Makes the container's sandbox's process gone from the node's /proc, as a sandbox that died leaves runsc's state naming
-   * it; or, given `program`, a process of that program, as one the node gave its pid since is.
+   * Makes the container's sandbox die: its process gone from the node's /proc or, given `program`, a process of that
+   * program, as one the node gave its pid since is; and runsc's state say the container stopped, of the process -1, as
+   * runsc says one whose sandbox is not running from 20261102.0-eaucoin.7 on, of one it held paused too
+   * (runsc/container/state_file.go Load, container.go SandboxPid).
    */
   readonly died: (containerId: string, program?: string) => void;
+  /**
+   * Makes runsc's next list say the container, whose sandbox died, as it was before, as a list read before its sandbox
+   * died does, or one whose check of whether it stopped timed out, which says its saved status (runsc/cmd/list.go).
+   */
+  readonly unchecked: (containerId: string) => void;
   /** Installs `release` beside the others, as a node is given one it keeps. */
   readonly installs: (release: string) => void;
 }
@@ -297,14 +313,24 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     writeFileSync(containers, JSON.stringify(kept));
   };
   const died = (containerId: string, program?: string) => {
-    const of = (JSON.parse(readFileSync(containers, "utf8")) as Record<string, { pid: number }>)[containerId];
+    const kept = JSON.parse(readFileSync(containers, "utf8")) as Record<string, Record<string, unknown>>;
+    const of = kept[containerId];
     if (of === undefined) throw new Error(`no container ${containerId} runs`);
-    const proc = join(procRoot, String(of.pid));
+    kept[containerId] = { ...of, status: "stopped", pid: -1, before: { status: of["status"] ?? "running", pid: of["pid"] } };
+    writeFileSync(containers, JSON.stringify(kept));
+    const proc = join(procRoot, String(of["pid"]));
     rmSync(proc, { recursive: true, force: true });
     if (program === undefined) return;
     mkdirSync(proc, { recursive: true });
     symlinkSync(program, join(proc, "exe"));
     writeFileSync(join(proc, "cmdline"), `${program}\0`);
+  };
+  const unchecked = (containerId: string) => {
+    const kept = JSON.parse(readFileSync(containers, "utf8")) as Record<string, Record<string, unknown>>;
+    const of = kept[containerId];
+    if (of?.["before"] === undefined) throw new Error(`no container ${containerId} died`);
+    kept[containerId] = { ...of, unchecked: true };
+    writeFileSync(containers, JSON.stringify(kept));
   };
   const starts = (argv0: string, args: readonly string[]) => {
     // Its arguments after node's own, which end at "--".
@@ -341,6 +367,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     held,
     rooted,
     died,
+    unchecked,
     installs,
     dirOf,
     bundleOf,
