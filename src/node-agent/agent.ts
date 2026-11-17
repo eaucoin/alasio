@@ -63,10 +63,10 @@
  * node's room it holds is freed at once. A container runsc holds paused, as each of a sandbox
  * restored whole is until its resume, is killed through runsc, as its shim would kill it
  * (`runsc kill`, SIGKILL), which ends every process of the sandbox and says each of its
- * containers ended, as kubelet then finds them: killed past runsc, it would be held paused on,
- * as runsc never looks whether the sandbox of one it holds paused still runs, and its shim's
- * delete of it refused, so that no stop of its pod would ever end; and left to the pod's
- * teardown, it would end only at its grace's end, as kubelet's SIGTERM waits for a resume that
+ * containers ended, as kubelet then finds them: killed past runsc, its sandbox would end with
+ * runsc saying its containers paused still, until a command of runsc's next reads their state
+ * and finds the sandbox gone; and left to the pod's teardown, it would end only at its grace's
+ * end, as kubelet's SIGTERM waits for a resume that
  * never comes. Then the agent kills what runsc still runs for the pod's containers, their
  * sandbox and gofers among it: a `runsc restore` that failed has left them running, its shim
  * then tearing none of them down. A container is the pod's only where the

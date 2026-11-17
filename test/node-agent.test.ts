@@ -3869,7 +3869,7 @@ test("an abandon fails, killing nothing, where runsc lists a container paused wh
         const refused = yield* Effect.flip(here.agent.abandon(abandonRequest));
         assert.match(refused.message, said);
         assert.deepEqual(here.releases.calls(RELEASE), [], cause);
-        // Killed past runsc, its sandbox would be held paused on, and no stop of its pod end.
+        // Its sandbox, which runsc holds paused, killed through runsc alone, as its shim would kill it: it runs on.
         assert.ok(sandbox.running(), cause);
       }
     })
@@ -3887,7 +3887,7 @@ test("an abandon fails, killing no process past runsc, where runsc does not kill
         assert.match(refused.message, said);
         rmSync(join(here.releases.dirOf(RELEASE), file));
       }
-      // Killed past runsc, its sandbox would be held paused on, and no stop of its pod end.
+      // Its sandbox, which runsc holds paused, killed through runsc alone, as its shim would kill it: it runs on.
       assert.ok(sandbox.running());
     })
   ));
@@ -3919,7 +3919,7 @@ test("an abandon whose kill through runsc does not end within its bound fails, i
       };
       for (const deadline = Date.now() + 5000; !gone() && Date.now() < deadline;) yield* Effect.sleep("20 millis");
       assert.ok(gone(), `the runsc kill ${hung} runs on`);
-      // Killed past runsc, its sandbox would be held paused on, and no stop of its pod end.
+      // Its sandbox, which runsc holds paused, killed through runsc alone, as its shim would kill it: it runs on.
       assert.ok(sandbox.running());
 
       // Its workspace held no longer: its next abandon runs, and ends it.

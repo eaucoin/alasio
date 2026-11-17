@@ -2307,7 +2307,7 @@ if (inShard("snapshots")) {
       // have killed it.
       assert.ok(grace >= 60, `the pod ${abandoned.pod} was given ${grace} s to stop`);
       assert.ok(gone - asked < 30_000, `the pod ${abandoned.pod} took ${gone - asked} ms to go, of its grace of ${grace} s`);
-      // kubelet's stop of it failed nowhere, as one of a container held paused past runsc's kill of its sandbox fails.
+      // kubelet's stop of it failed nowhere.
       const failed = (await kube.list<CoreV1Event>("Event", { namespace: SESSIONS })).filter(({ involvedObject, reason }) => involvedObject.name === abandoned?.pod && (reason === "FailedKillPod" || reason === "FailedPreStopHook"));
       assert.deepEqual(failed.map(({ reason, message }) => `${reason}: ${message}`), []);
       // Its workspace detached, as it was once its containers stopped.
