@@ -15,12 +15,12 @@
     "restoresIntoStandbySince": "20261102.0-eaucoin.5",
     "releases": [
       {
-        "release": "20261102.0-eaucoin.7",
-        "sha512": "fe46f32314c06468d9b2d88d354476c142ef72fb50f362b91f16b5748d99a56b6b923b643912f64843c1079979c49726cb8c6ea74bfdc4db247489647dc2bef7"
+        "release": "20261102.0-eaucoin.8",
+        "sha512": "fcdb305346794a5d463591573069ee132067bb711a5878d34ccedc60d6767b94c4f4c06c4eaf77d7558c6bd2c302e750dcac555187c9f500e88580b803aacfdb"
       },
       {
-        "release": "20261102.0-eaucoin.6",
-        "sha512": "908e32d37db4c60528987c0dda782f6b88e60fcaa8aba6769b63fd967a160e89704229b4b3999536c77218e3ef01af157f3a8957e6c662770f694b9d1a886517"
+        "release": "20261102.0-eaucoin.7",
+        "sha512": "fe46f32314c06468d9b2d88d354476c142ef72fb50f362b91f16b5748d99a56b6b923b643912f64843c1079979c49726cb8c6ea74bfdc4db247489647dc2bef7"
       }
     ]
   },
