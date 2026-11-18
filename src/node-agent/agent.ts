@@ -66,18 +66,17 @@
  * containers ended, as kubelet then finds them: killed past runsc, its sandbox would end with
  * runsc saying its containers paused still, until a command of runsc's next reads their state
  * and finds the sandbox gone; and left to the pod's teardown, it would end only at its grace's
- * end, as kubelet's SIGTERM waits for a resume that
- * never comes. Then the agent kills what runsc still runs for the pod's containers, their
- * sandbox and gofers among it: a `runsc restore` that failed has left them running, its shim
- * then tearing none of them down. A container is the pod's only where the
- * annotations containerd gives its spec name the pod and its uid, so that the containers of
- * a pod of its name made since are left be. A process is a container's only where its
- * arguments name runsc's root, the container's bundle and its id, and is killed only while
- * its start time is the one it was found with, so a pid the node has given another process
- * since is left be (./runsc.ts). One forked meanwhile by a process the agent kills has the
- * arguments of the one it forked from until it execs, so the agent scans again after its
- * kills, until a scan kills nothing new. This stays as defence should a restore leave
- * runsc's processes behind.
+ * end, as kubelet's SIGTERM waits for a resume that never comes. Then the agent kills what
+ * runsc still runs for the pod's containers, their sandbox and gofers among it: a
+ * `runsc restore` that failed has left them running, its shim then tearing none of them down.
+ * A container is the pod's only where the annotations containerd gives its spec name the pod
+ * and its uid, so that the containers of a pod of its name made since are left be. A process
+ * is a container's only where its arguments name runsc's root, the container's bundle and its
+ * id, and is killed only while its start time is the one it was found with, so a pid the node
+ * has given another process since is left be (./runsc.ts). One forked meanwhile by a process
+ * the agent kills has the arguments of the one it forked from until it execs, so the agent
+ * scans again after its kills, until a scan kills nothing new. This stays as defence should a
+ * restore leave runsc's processes behind.
  *
  * One operation on a workspace's snapshots runs at a time. The node's cache evicts nothing of
  * a workspace an operation runs on or waits to, nor of one a compaction writes, nor discards
