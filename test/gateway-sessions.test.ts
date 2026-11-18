@@ -94,7 +94,7 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
  * Node agents that record what they are asked, in order; a checkpoint does what `checkpoint`
  * says to the pod it saves: ends it saved, fails ending it, or fails leaving it running.
  */
-function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable" = "saves"): { agents: NodeAgents; attached: (AttachRequest & { node: string })[]; detached: string[]; asked: string[]; saved: CheckpointRequest[] } {
+function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "outlasts alasio's wait" | "unsaveable" = "saves"): { agents: NodeAgents; attached: (AttachRequest & { node: string })[]; detached: string[]; asked: string[]; saved: CheckpointRequest[] } {
   const attached: (AttachRequest & { node: string })[] = [];
   const detached: string[] = [];
   const asked: string[] = [];
@@ -124,6 +124,8 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
           // Taken live, its sandbox runs on, at bayma's generation 1.
           if (request.live) return { snapshot: "s-live", release: "r1", live: { stateDir: request.live.stateDir, generation: 1, running: [] } } as unknown as Manifest;
           if (checkpoint === "unsaveable") return yield* new NodeAgentError({ node, call: "snapshot", status: 410, reason: "its restore from the bucket failed to read some of its pages" });
+          // A save that waits for pages its sandbox's restore cannot read, its store away, which runsc goes on with, the sandbox in it.
+          if (checkpoint === "outlasts alasio's wait") return yield* new NodeAgentError({ node, call: "snapshot", reason: "it had not ended within 900 seconds" });
           if (checkpoint !== "fails") yield* Effect.promise(() => end(request));
           if (checkpoint !== "saves") return yield* new NodeAgentError({ node, call: "snapshot", status: 500, reason: "runsc checkpoint failed" });
           return { snapshot: "s-1" } as unknown as Manifest;
@@ -624,8 +626,8 @@ test("a record of a workspace's release that cannot be read is written over by a
   assert.deepEqual(recorded.asked.filter((each) => each.startsWith("record")), []);
 });
 
-test("a release whose save fails leaving the sandbox running keeps the binding, and one whose save fails ending it goes on, as bayma's checkpoints keep what ran", async () => {
-  for (const [outcome, kept] of [["fails", true], ["fails, ending it", false]] as const) {
+test("a release whose save fails, or outlasts alasio's wait for it, leaving the sandbox running keeps the binding, recording nothing, and one whose save fails ending it goes on, as bayma's checkpoints keep what ran", async () => {
+  for (const [outcome, kept] of [["fails", true], ["outlasts alasio's wait", true], ["fails, ending it", false]] as const) {
     const env = await environment(1, { gvisor: true });
     const stand = await bayma();
     const recorded = agents(outcome);
@@ -639,6 +641,8 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
       const lease = await run(readLease(env.none, key));
       if (kept) {
         assert.deepEqual([lease?.spec?.holderIdentity, lease?.metadata?.annotations?.["alasio.dev/releasing"]], [bound.pod, undefined], outcome);
+        // Nothing is recorded of a save that did not end saved, nor its bayma stopped, nor its pod detached.
+        assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`], outcome);
         assert.deepEqual(recorded.detached, [], outcome);
       } else {
         await letGo(env.none, key);

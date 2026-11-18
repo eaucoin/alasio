@@ -432,7 +432,12 @@ export class SandboxUnsaveable extends Schema.TaggedError<SandboxUnsaveable>()("
   }
 }
 
-/** What runsc says of a checkpoint of a sandbox whose restore failed to read some of its pages in the background (pgalloc's AwaitLoadAll). */
+/**
+ * What runsc says of a checkpoint of a sandbox whose restore failed to read some of its pages
+ * in the background: as a whole save waits for them all (pgalloc's AwaitLoadAll), and, from
+ * 20261102.0-eaucoin.9 on, as a delta save waits for those of them it reads, the pages dirtied
+ * as they loaded.
+ */
 export const PAGES_UNREAD = "previous async page loading failed";
 
 /**
