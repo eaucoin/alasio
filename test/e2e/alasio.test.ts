@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test, type TestContext } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1DaemonSet, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -43,11 +43,12 @@ import { GATEWAY_RESTART_MS } from "../../src/sandbox/gateway-passing.ts";
 import { TOKEN_TTL_MS } from "../../src/sandbox/gateway-client.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
+import { NODE_PATH } from "../../src/node-agent/host.ts";
 import { STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS, standbySocket } from "../../src/kube/sandbox-shape.ts";
 import { STANDBY_AFTER_MS } from "../../src/gateway/standbys.ts";
 import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { describeNodeStep, gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
+import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, LOADING_SAVE_TEST_TIMINGS_VARIABLE, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -2119,6 +2120,82 @@ async function snapshotOf(volumeId: string): Promise<Manifest | null> {
   return JSON.parse(answered.trimEnd().split("\n").slice(0, -1).join("\n")) as Manifest;
 }
 
+/**
+ * The timings a node agent bounds a release's save of a sandbox still loading by in the test of
+ * a store that goes away (LOADING_SAVE_TEST_TIMINGS_VARIABLE): a floor of 2 s and a stall window
+ * of 3 s, looked at every half second, so that a save whose hook waits on pages that no longer
+ * load is revoked a few seconds into it, before the hook's own 30 s, and before what else may
+ * end it as it waits (one run saw the hook killed 6 s after the release was asked).
+ */
+const LOADING_TEST_TIMINGS = { floorMs: 2_000, stallMs: 3_000, pollMs: 500 };
+
+/**
+ * The node agents given the variable `name` of `value` beside what alasio up gives them, or that
+ * taken away again (null), their DaemonSet rolled out on every node.
+ */
+async function nodeAgentsWith(name: string, value: string | null): Promise<void> {
+  const target = ref("DaemonSet", componentName("node-agent"), NAMESPACE);
+  const containers = ((await kube.get<V1DaemonSet>(target))?.spec?.template.spec?.containers ?? []).map((container) =>
+    container.name !== "node-agent" ? container : { ...container, env: [...(container.env ?? []).filter((each) => each.name !== name), ...(value === null ? [] : [{ name, value }])] }
+  );
+  await kube.patch(target, { spec: { template: { spec: { containers } } } });
+  await kube.awaitReady([target], "10 minutes");
+}
+
+/**
+ * How fast a node agent reads its store while it is throttled (storeThrottled), in KiB/s: as
+ * slowly as alasio takes a restore to read the bucket at the slowest
+ * (src/node-agent/names.ts BACKGROUND_READ_BYTES_PER_SECOND), so a restore of
+ * BIG_REPL_MEBIBYTES still reads it minutes after its sandbox resumed, however fast the run's
+ * store is.
+ */
+const STORE_THROTTLE_KIB_PER_SECOND = 4 * 1024;
+
+/**
+ * An iptables command of the node's, as the agent runs the node's commands
+ * (src/node-agent/host.ts), in the agent's own pod's network: in the node's mounts alone.
+ */
+const agentIptables = (rule: string) => `PATH='${NODE_PATH}' nsenter --target 1 --mount -- iptables -w ${rule}`;
+/** What drops the packets a node agent's store, at $address, port $port, sends it past STORE_THROTTLE_KIB_PER_SECOND, as `-I` or `-D` adds or deletes it. */
+const storeSlowed = (action: "-I" | "-D") =>
+  agentIptables(`${action} INPUT -s "$address" -p tcp --sport "$port" -m hashlimit --hashlimit-name storeslow --hashlimit-mode srcip --hashlimit-above ${STORE_THROTTLE_KIB_PER_SECOND}kb/s -j DROP`);
+/** What refuses every packet a node agent sends its store, at $address, port $port, as `-I` or `-D` adds or deletes it. */
+const storeRefused = (action: "-I" | "-D") => agentIptables(`${action} OUTPUT -d "$address" -p tcp --dport "$port" -j REJECT --reject-with tcp-reset`);
+
+/** What gives a node agent's store's IPv4 address and its port, as the agent reaches it, from its S3_ENDPOINT. */
+const STORE_ADDRESS = [
+  'hostport=${S3_ENDPOINT#*://}',
+  'hostport=${hostport%%/*}',
+  'case $hostport in',
+  '  *:*) host=${hostport%:*} port=${hostport##*:} ;;',
+  '  *) host=$hostport; case $S3_ENDPOINT in https:*) port=443 ;; *) port=80 ;; esac ;;',
+  "esac",
+  `echo "$(getent ahostsv4 "$host" | awk 'NR == 1 { print $1 }') $port"`,
+].join("\n");
+
+/**
+ * The node agent `pod` reading its store slowly from now (storeSlowed), as one far away: what
+ * cuts it off its store then, as a store goes away (storeRefused), and what undoes both,
+ * whether it was cut or not.
+ */
+async function storeThrottled(pod: string): Promise<{ readonly cut: () => Promise<void>; readonly undone: () => Promise<void> }> {
+  const inAgent = (script: string, args: readonly string[] = []) => kube.execOk(NAMESPACE, pod, ["sh", "-c", script, "sh", ...args], { container: "node-agent" });
+  const [address = "", port = ""] = (await inAgent(STORE_ADDRESS)).trim().split(" ");
+  assert.match(`${address} ${port}`, /^\d+\.\d+\.\d+\.\d+ \d+$/u, `${pod}'s store is at no address and port`);
+  const store = ['address=$1 port=$2'];
+  await inAgent([...store, storeSlowed("-I")].join("\n"), [address, port]);
+  let cut = false;
+  return {
+    cut: async () => {
+      await inAgent([...store, storeRefused("-I")].join("\n"), [address, port]);
+      cut = true;
+    },
+    undone: async () => {
+      await inAgent([...store, ...(cut ? [storeRefused("-D")] : []), storeSlowed("-D")].join("\n"), [address, port]);
+    },
+  };
+}
+
 /** That each container of the pod holds no capability: all dropped, none added, unprivileged, and none to gain. */
 function assertNoCapability(pod: V1Pod | null): void {
   const containers = [...(pod?.spec?.initContainers ?? []), ...(pod?.spec?.containers ?? [])];
@@ -2677,6 +2754,75 @@ if (inShard("snapshots")) {
       await untilReleased(big, Date.now(), { savingMs: 480_000 });
       assert.ok(await snapshotOf(big), `the session ${big} was released with no snapshot`);
     });
+
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket, whose store goes away from its node's agent as its sandbox loads, is released within the agent's bound on a save of it still loading: its restore's reads refused, its save failing, its pod gone; it comes back from bayma's checkpoints`, async (t) => {
+      // Its node's agent bounding a release's save of a sandbox still loading by timings shorter than an installation may
+      // set, for this test alone, rolled out on every node, so that its revocation comes before bayma's hook bounds itself.
+      await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, JSON.stringify(LOADING_TEST_TIMINGS));
+      try {
+        await revokedAsTheStoreGoesAway(t);
+      } finally {
+        await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, null);
+      }
+    });
+
+    /** The test above's body, its node agents given LOADING_TEST_TIMINGS. */
+    async function revokedAsTheStoreGoesAway(t: TestContext): Promise<void> {
+      const big = await newSession("none");
+      const { sessionId: kept } = await repl.set(big, `checkpointed by ${big}`);
+      await repl.fill(big, BIG_REPL_MEBIBYTES);
+      // Its first save, which records no working set: restored, its sandbox loads the REPL's bytes in the background.
+      await untilReleased(big, Date.now(), { savingMs: 480_000 });
+      const agents = await nodeAgents();
+      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+      // Each node's agent reading its store slowly from now, as one far away.
+      const throttled = await Promise.all([...agents].map(async ([node, pod]) => ({ node, pod, store: await storeThrottled(pod) })));
+      try {
+        const { node } = await bindSession(big, 900_000);
+        const restoredAt = Date.now();
+        const cut = throttled.find((each) => each.node === node);
+        assert.ok(cut, `no agent of ${node} was throttled`);
+        // An exec of its small REPL, which has bayma load what it runs, as a session's use does.
+        const whole = await repl.read(big, kept);
+        assert.deepEqual([whole.live, whole.checkpointed], [`checkpointed by ${big}`, `checkpointed by ${big}`]);
+        assert.match(whole.notice ?? "", CAME_BACK_WHOLE);
+        // Its snapshot spent, as the gateway spends the one it restored, which it releases the session only after: then its
+        // node's agent cut off its store, the restore reading it still.
+        await until(`the snapshot of ${big} spent`, async () => ((await snapshotOf(big)) === null ? true : undefined), 300_000);
+        await cut.store.cut();
+        t.diagnostic(`restored on ${node}, its agent cut off its store ${Date.now() - restoredAt} ms after`);
+        // Released as its caller asks, as alasio does (a sweep's look at whether it idles asks its bayma, which may touch pages
+        // that no longer load), its save waiting on pages its restore cannot read, as bayma's hook, which readies the sandbox
+        // for it, has the REPL that holds the bytes collect its garbage: no byte served for the stall window once the save has
+        // run its floor, its restore's token revoked, the save failed, and the session released well within what alasio
+        // waits for a save.
+        const askedAt = Date.now();
+        const asked = await gatewayCall(await mainToken(big), "POST", "/release");
+        const released = Date.now() - askedAt;
+        t.diagnostic(`its release answered ${asked.status} ${asked.said.trim()} ${released} ms after it was asked`);
+        await until(`no pod bound to ${big}`, async () => ((await boundPodOf(big)) === null ? true : undefined), 120_000);
+        const agentLog = (await kube.logs(NAMESPACE, cut.pod, "node-agent")).split("\n");
+        const revoked = agentLog.find((line) => line.includes(`revoked the token of the restore of ${SESSIONS}/${big} from the bucket, as no byte of its pages has been served for `));
+        assert.ok(revoked, `${node}'s agent revoked no token of ${big}'s restore for a stall`);
+        t.diagnostic(revoked.slice(revoked.indexOf("revoked")));
+        // Its bytes as runsc said them, where it has by then.
+        const [, served, expected] = / while its release's save, running \d+ s, waits, (\d+)(?: of (\d+))? bytes of its pages served: /u.exec(revoked) ?? [];
+        assert.ok(served !== undefined && (expected === undefined || Number(served) < Number(expected)), revoked);
+        // Its save failed after it: as one of a sandbox saved no more, where runsc's wait for the pages failed first, or as
+        // its hook's, where the hook, whose pages could load no more, failed first.
+        const failed = agentLog.find((line) => line.includes(`the sandbox of ${SESSIONS}/${big} can be saved no more, `) || line.includes(`checkpointing ${SESSIONS}/${big} failed: `));
+        assert.ok(failed, `${node}'s agent said nothing of ${big}'s save failing`);
+        t.diagnostic(failed.slice(failed.indexOf(failed.includes("can be saved no more") ? "the sandbox" : "checkpointing")));
+        assert.ok(released < LOADING_TEST_TIMINGS.stallMs + 120_000, `its release answered ${released} ms after it was asked`);
+      } finally {
+        for (const { pod, store } of throttled) await store.undone().catch((error: unknown) => console.error(`# could not undo the throttle and cut of ${pod}'s store: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      // Back from bayma's checkpoints, no snapshot of it left.
+      assert.equal(await snapshotOf(big), null);
+      const seen = await repl.read(big, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${big}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+    }
 
     test("a session released before alasio up changes the pools' template is restored onto the one it was taken on, which the gateway's configuration carries beside the new one", async (t) => {
       const taken = await newSession("none");
