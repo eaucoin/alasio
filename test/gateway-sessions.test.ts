@@ -1814,6 +1814,53 @@ test("a bound pod whose execs run is saved live every liveEvery, its sandbox run
   }
 });
 
+test("a bound pod whose execs run, its sandbox's restore from the bucket reading it still, is not saved live, as its node's agent answers, counted as deferred and said, its binding held, and saved live once it may be", async () => {
+  const env = await environment(1, { gvisor: true });
+  const stand = await baymaOfGeneration();
+  const recorded = agents();
+  // Its node's agent defers a live save while the sandbox's restore reads the bucket still.
+  let loading = true;
+  const deferring: NodeAgents = {
+    ...recorded.agents,
+    checkpoint: (node, request) =>
+      loading && request.live
+        ? Effect.sync(() => void recorded.asked.push(`deferred ${node} ${request.pod}`)).pipe(
+          Effect.andThen(Effect.fail(new NodeAgentError({ node, call: "snapshot", status: 425, reason: "the sandbox is not saved live while its restore from the bucket reads it still" }))),
+        )
+        : recorded.agents.checkpoint(node, request),
+  };
+  try {
+    const opts = options(env, stand.port);
+    const { binder, sessions } = await sessionsOf({ ...opts, snapshots: { ...opts.snapshots!, liveEverySeconds: 1 } }, deferring);
+    const key = sessionKey("fs-loading");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 1, execsQueued: 0, idleSinceMs: null, generation: 1 };
+    const look = () => Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+    const until = async (asked: string) => {
+      for (const deadline = Date.now() + 5_000; !recorded.asked.includes(asked); await new Promise((resolve) => setTimeout(resolve, 50))) assert.ok(Date.now() < deadline, `not asked: ${asked}`);
+    };
+    const counted = await added("alasio.sandbox.live_checkpoints", async () => {
+      await look();
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await look();
+      await until(`deferred node-a ${bound.pod}`);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Its binding held, the pod running on.
+      assert.equal((await run(readLease(env.none, key)))?.spec?.holderIdentity, bound.pod);
+      // Its restore done reading: saved live at the next look past liveEvery.
+      loading = false;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      await look();
+      await until(`checkpoint node-a ${bound.pod} live`);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    });
+    assert.deepEqual(counted, { "alasio.sandbox.live_checkpoint.outcome=deferred": 1, "alasio.sandbox.live_checkpoint.outcome=taken": 1 });
+  } finally {
+    stand.close();
+  }
+});
+
 test("a bound pod whose bayma ended in it, or was started again, is released as broken, into the snapshot taken of it live; and one whose pod went, as lost, into it too, recorded while its Lease holds", async () => {
   const env = await environment(2, { gvisor: true });
   const recorded = agents();

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { SAVE_HOOK_SECONDS } from "../src/node-agent/agent.ts";
+import { SAVE_HOOK_SECONDS } from "../src/node-agent/names.ts";
 
 const START = new URL("../sandbox/agent/start.sh", import.meta.url).pathname;
 

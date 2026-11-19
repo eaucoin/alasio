@@ -229,6 +229,66 @@ export const SNAPSHOT_CACHE_BYTES_VARIABLE = "ALASIO_SNAPSHOT_CACHE_BYTES";
 export const OPERATION_LIMIT_SECONDS = 15 * 60;
 
 /**
+ * How long bayma's hook may take to ready the sandbox for its save, and to go on after one
+ * taken live, as it bounds itself in those (sandbox/agent/start.sh).
+ */
+export const SAVE_HOOK_SECONDS = 30;
+
+/**
+ * What a release's save of a sandbox whose restore from the bucket still reads it may wait on
+ * those reads before the agent revokes the restore's token (./agent.ts boundWhileLoading): its
+ * reads refused from then, not retried, its loading fails, and so does the save, which the
+ * session comes back from bayma's checkpoints after, rather than stay paused for as long as the
+ * restore asks of a store that is away, past the OPERATION_LIMIT_SECONDS alasio waits for it.
+ * The agent revokes it only once the save has run LOADING_SAVE_FLOOR_SECONDS, from as runsc's
+ * save starts, and either no byte of the restore's pages has been served for its stall window
+ * (LOADING_STALL_SECONDS), or, at the rate they have been served since the save began, those
+ * left would be served only past the latest a revocation can come (LOADING_SAVE_LATEST_SECONDS):
+ * a store that answers, however slowly, is never cut while it can serve them in time.
+ *
+ * LOADING_SAVE_FLOOR_SECONDS is how long the save runs at least before a stall or a rate too
+ * slow revokes the token: as long as bayma's hook may take (SAVE_HOOK_SECONDS), which waits on
+ * the pages it touches too, twice, so that what the save itself has served is measured over a
+ * minute at least.
+ */
+export const LOADING_SAVE_FLOOR_SECONDS = 60;
+
+/**
+ * How long no byte of a restore's pages may be served, as its release's save waits, before the
+ * agent takes its reads as stalled, unless told (LOADING_STALL_SECONDS_VARIABLE): 90 s. A restore
+ * whose store answers is served bytes as each read streams, its loader keeping reads in flight;
+ * one whose store is away tries each read again within 20 s (10 s for its pages), so 90 s is four
+ * attempts or more that served nothing, past the minute a store's brief failover takes.
+ */
+export const LOADING_STALL_SECONDS = 90;
+
+/** The least a stall window may be set to: bayma's hook's own bound (SAVE_HOOK_SECONDS), which a save may wait on first. */
+export const LOADING_STALL_LEAST_SECONDS = SAVE_HOOK_SECONDS;
+
+/**
+ * How long from as a release's checkpoint is asked its save may wait on its restore's reads at
+ * the most: OPERATION_LIMIT_SECONDS less 5 minutes for what follows a revocation (the gofer's
+ * next attempt of a read, 20 s at most; the save's end; forgetting the workspace's snapshot, a
+ * request of 60 s at most to a store away; the answer to alasio), which a stall window may take
+ * no more of either.
+ */
+export const LOADING_SAVE_LATEST_SECONDS = OPERATION_LIMIT_SECONDS - 5 * 60;
+
+/** The most a stall window may be set to, so that one counted from the floor still ends by LOADING_SAVE_LATEST_SECONDS. */
+export const LOADING_STALL_MOST_SECONDS = LOADING_SAVE_LATEST_SECONDS - LOADING_SAVE_FLOOR_SECONDS;
+
+/** The variable holding a node agent's stall window, in seconds (LOADING_STALL_SECONDS). */
+export const LOADING_STALL_SECONDS_VARIABLE = "ALASIO_LOADING_STALL_SECONDS";
+
+/**
+ * The variable that gives a node agent, for a test alone, the timings LOADING_SAVE_FLOOR_SECONDS,
+ * LOADING_STALL_SECONDS and how often it looks at a restore's reads, as JSON
+ * ({"floorMs","stallMs","pollMs"}): shorter than an installation may set them, as the end-to-end
+ * run's proof of a revocation does. No installation's manifests set it.
+ */
+export const LOADING_SAVE_TEST_TIMINGS_VARIABLE = "ALASIO_LOADING_SAVE_TEST_TIMINGS";
+
+/**
  * How long an agent holds a request for what its node holds (`GET /holdings`), asked as of
  * what alasio has of it, before it answers that nothing changed: alasio asks again at once, so
  * what it keeps of every node changes as the node's does, and an agent gone is found within it.

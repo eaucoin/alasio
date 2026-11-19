@@ -154,7 +154,7 @@ const stopReleases = meter.createCounter("alasio.sandbox.stop_releases", {
 const RELEASES_PER_NODE = 2;
 
 const liveCheckpoints = meter.createCounter("alasio.sandbox.live_checkpoints", {
-  description: "Snapshots of running sessions taken live, their sandboxes running on, by outcome: taken, or failed; and spent, as the session moved on from one",
+  description: "Snapshots of running sessions taken live, their sandboxes running on, by outcome: taken; failed; deferred, as the sandbox's restore from the bucket read it still; and spent, as the session moved on from one",
 });
 
 const restores = meter.createCounter("alasio.sandbox.restores", {
@@ -242,6 +242,12 @@ const RESTORED_SNAPSHOT = new RegExp(`^${SNAPSHOT_ID}$`, "u");
 
 /** How many workspaces' snapshots are read at once, as what releases they name is read. */
 const READS_AT_ONCE = 8;
+
+/**
+ * What a node agent answers of a live checkpoint it did not take, its sandbox's restore from the
+ * bucket reading it still (../node-agent/agent.ts LiveSaveDeferred): nothing of it changed.
+ */
+const DEFERRED_STATUS = 425;
 
 /** Whether `error`, a checkpoint's, says its sandbox can be saved no more. */
 const unsaveable = (error: NodeAgentError | KubeApiError): boolean => error._tag === "NodeAgentError" && error.status === UNSAVEABLE_STATUS;
@@ -1101,6 +1107,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       if (taken._tag === "Failure" && unsaveable(taken.failure)) {
         yield* counted("unsaveable");
         return "unsaveable" as const;
+      }
+      if (taken._tag === "Failure" && taken.failure._tag === "NodeAgentError" && taken.failure.status === DEFERRED_STATUS) {
+        yield* counted("deferred");
+        yield* Effect.logInfo(`did not snapshot ${named(pool, workspace)} live, which runs on, as its restore from the bucket reads it still: ${taken.failure.message}`);
+        return null;
       }
       if (taken._tag === "Failure" || taken.success.live === undefined) {
         yield* counted("failed");

@@ -21,7 +21,8 @@
  *   `{ state: "failed", status, error }`, `status` 500, whose error says why, and that the
  *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept; 410 where its
  *   sandbox can be saved no more, its restore having failed to read some of its pages, as
- *   every checkpoint of it after will. 404 when it has none the agent keeps (./operations.ts).
+ *   every checkpoint of it after will; 425 where a live one was not taken, its restore from the
+ *   bucket reading the sandbox still, which changes nothing of it. 404 when it has none the agent keeps (./operations.ts).
  * - `POST /prepare`, `{ environment, workspace, manifest, gofer? }`: starts preparing the
  *   workspace's snapshot of `manifest`, its current one as alasio read it, for a restore on
  *   this node, from this node's cache, or else from the bucket, which the restore reads as it
@@ -166,6 +167,7 @@ import {
   CopyRequest,
   type Holdings,
   holdingsTag,
+  type LiveSaveDeferred,
   makeNodeAgent,
   type Manifest,
   type NodeAgent,
@@ -186,6 +188,8 @@ import {
   CONTAINERD,
   GVISOR_RELEASES,
   HOLDINGS_WAIT_MS,
+  LOADING_SAVE_TEST_TIMINGS_VARIABLE,
+  LOADING_STALL_SECONDS_VARIABLE,
   META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
@@ -247,6 +251,15 @@ const SyncRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schem
 /** What `POST /stop` is given. */
 const StopRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schema.NonEmptyString, containerId: Schema.NonEmptyString, hook: Schema.Array(Schema.String.check(Schema.isPattern(/^\S+$/u))).check(Schema.isMinLength(1)) });
 
+/** The least a test's look interval may be (LOADING_SAVE_TEST_TIMINGS_VARIABLE pollMs): one look of the proxy's restores every 100 ms at the most. */
+const LOADING_POLL_LEAST_MS = 100;
+/** What LOADING_SAVE_TEST_TIMINGS_VARIABLE gives, for a test alone: a release's save's floor, stall window and look's interval, whole ms each, the look's LOADING_POLL_LEAST_MS at least. */
+const LoadingSaveTestTimings = Schema.fromJsonString(Schema.Struct({
+  floorMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be 1 ms or more" }))),
+  stallMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be 1 ms or more" }))),
+  pollMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(LOADING_POLL_LEAST_MS, { message: `must be ${LOADING_POLL_LEAST_MS} ms or more` }))),
+}));
+
 /** The status each failure of the agent's is answered with; any other is 500. */
 const STATUS: Readonly<Record<string, number>> = {
   NoSnapshot: 404,
@@ -260,6 +273,7 @@ const STATUS: Readonly<Record<string, number>> = {
   PodNotRunning: 504,
   KubeApiError: 503,
   SandboxUnsaveable: 410,
+  LiveSaveDeferred: 425,
   JuicefsError: 503,
   StandbyImageRefused: 403,
   StandbyUnavailable: 409,
@@ -332,7 +346,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   standbys = makeStandbyRestores(),
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
-  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable>(scope, failureOf);
+  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred>(scope, failureOf);
   const prepares = yield* makeOperations<Prepared, PrepareError>(scope, failureOf);
   const started = answer(202, { state: "running" });
   /** Done as the agent's API stops, before it waits for the requests under way to end: those held for a change (`GET /holdings`) are refused at once. */
@@ -558,8 +572,10 @@ const CONDITIONS_TRIES = Schedule.min([Schedule.exponential("1 second"), Schedul
  * every snapshot then fetched into the cache first), its pod's address (POD_IP_VARIABLE),
  * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
  * as on its socket on the node, beside its restores' tokens (NODE_AGENT_RUN_DIR, unless
- * NODE_AGENT_RUN_DIR_VARIABLE says), and how long a resumed restore may read it there
- * (BACKGROUND_READ_SECONDS_VARIABLE). What a
+ * NODE_AGENT_RUN_DIR_VARIABLE says), how long a resumed restore may read it there
+ * (BACKGROUND_READ_SECONDS_VARIABLE), and how long a release's save of a sandbox whose
+ * restore reads it still may see no byte of it served (LOADING_STALL_SECONDS_VARIABLE; and, for
+ * a test alone, LOADING_SAVE_TEST_TIMINGS_VARIABLE). What a
  * stopped agent left half written in the cache is removed first; what is attached on the node
  * is kept to the pods the cluster has on it (./attachments.ts), which it reads as its
  * ServiceAccount, of no other right. Once it serves, the bucket's store is proved to honour
@@ -574,6 +590,8 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const restoresFromBucketSince = yield* Config.String(RESTORES_FROM_BUCKET_SINCE_VARIABLE).pipe(Config.withDefault(""));
   const current = yield* Config.String(GVISOR_RELEASE_VARIABLE);
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
+  const loadingStallSeconds = yield* Config.Int(LOADING_STALL_SECONDS_VARIABLE);
+  const testTimings = yield* Config.schema(LoadingSaveTestTimings, LOADING_SAVE_TEST_TIMINGS_VARIABLE).pipe(Config.option);
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
   const cache = makeSnapshotCache({ root: SNAPSHOT_CACHE_DIR, budget, graceMs: EVICTION_GRACE_MS });
   yield* cache.clean;
@@ -597,6 +615,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     host,
     restoresFromBucketSince,
     backgroundReadMs: backgroundReadSeconds * 1000,
+    loadingSave: { stallMs: loadingStallSeconds * 1000, ...Option.getOrElse(testTimings, () => ({})) },
     pods: podChanges(kube),
   });
   // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.

@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
-import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schedule, Scope, Stream } from "effect";
+import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Queue, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -42,6 +42,9 @@ import {
   NoSnapshot,
   type NodeAgent,
   type NodeAgentOptions,
+  loadingSaveRevocation,
+  PAGES_UNREAD,
+  recentReads,
   PoliciesNotInForce,
   holdingsTag,
   type Prepared,
@@ -57,7 +60,7 @@ import {
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
-import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
+import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
 import { NODE_PINS } from "../cli/src/cluster/node.ts";
@@ -243,6 +246,8 @@ interface NodeOptions {
   readonly preparedForMs?: number;
   /** How long its runsc may take to describe an image in the bucket. */
   readonly inspectTimeoutMs?: number;
+  /** How its agent bounds a release's save of a sandbox whose restore reads the bucket still (NodeAgentOptions loadingSave). */
+  readonly loadingSave?: NodeAgentOptions["loadingSave"];
   /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
   readonly pods?: NodeAgentOptions["pods"];
   /** Its cache as `cache` changes it. */
@@ -254,7 +259,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -280,6 +285,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
         backgroundReadMs: BACKGROUND_READ_MS,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
+        ...(loadingSave === undefined ? {} : { loadingSave }),
         pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
       });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod };
@@ -1928,13 +1934,13 @@ const tokenIn = (imagePath: string) => {
   return { accessKeyId: credentials.access_key_id, secretAccessKey: credentials.secret_access_key };
 };
 
-/** The status of a GET of `key` through `node`'s proxy of the bucket, signed with `token`. */
-const throughProxy = (node: Node, token: { readonly accessKeyId: string; readonly secretAccessKey: string }, key: string): Effect.Effect<number> =>
+/** The status of a GET of `key` through `node`'s proxy of the bucket, signed with `token`, of `range` if given. */
+const throughProxy = (node: Node, token: { readonly accessKeyId: string; readonly secretAccessKey: string }, key: string, range?: string): Effect.Effect<number> =>
   Effect.promise(() =>
     new Promise<number>((resolve, reject) => {
       const url = new URL(node.storeProxy.endpoint);
       const empty = createHash("sha256").update("").digest("hex");
-      const headers: Record<string, string> = { host: url.host, "x-amz-date": new Date().toISOString().replace(/[-:]|\.\d{3}/gu, ""), "x-amz-content-sha256": empty };
+      const headers: Record<string, string> = { host: url.host, "x-amz-date": new Date().toISOString().replace(/[-:]|\.\d{3}/gu, ""), "x-amz-content-sha256": empty, ...(range === undefined ? {} : { range }) };
       headers["authorization"] = sigV4Authorization({ method: "GET", path: `/snapshots/${key}`, query: {}, headers: { ...headers }, payloadHash: empty }, { region: "us-east-1", service: "s3" }, token);
       const asked = httpRequest({ host: url.hostname, port: url.port, path: `/snapshots/${key}`, headers }, (response) => {
         response.resume();
@@ -1995,6 +2001,8 @@ test("a restore from the bucket reads its own images through the agent by a toke
       writeFileSync(join(stateDirIn(volume), "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
       writeFileSync(join(stateDirIn(volume), "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
       other.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
+      // Its reads quiet past their quiet, done reading, as a live checkpoint waits for.
+      yield* Effect.sleep("300 millis");
       yield* other.agent.checkpoint(live("fs-abc"));
       assert.equal(yield* throughProxy(other, third, own), 403);
       // And at its release, its sandbox ending.
@@ -2190,6 +2198,230 @@ test("a restore from the bucket's images are fetched into the cache once it is d
       assert.deepEqual(imagesOf(there, "fs-abc"), []);
       yield* there.agent.abandon({ ...workspace, namespace: SESSIONS, pod: POD, uid: POD_UID });
       yield* fetched(there, manifest);
+    })
+  ));
+
+test("whether a release's save of a sandbox still loading has its restore's token revoked: not before its floor, from as it started; then on a stall, or a rate whose bytes left end past the latest it may wait, both since the save started and of its recent window; and at that latest whatever", () => {
+  const timings = { floorMs: 60_000, stallMs: 90_000, latestMs: 600_000 };
+  const save = { askedAt: 0, startedAt: 10_000, now: 10_000, movedAt: 10_000, servedAtStart: 0, served: 0, expected: 1_000_000 as number | null, recentFrom: 10_000, servedAtRecentFrom: 0 };
+  // A stall before the floor, from as the save started, not as it was asked: nothing yet.
+  assert.equal(loadingSaveRevocation({ ...save, now: 69_000, movedAt: 0 }, { ...timings, stallMs: 1_000 }), null);
+  assert.equal(
+    loadingSaveRevocation({ ...save, now: 70_000 }, { ...timings, stallMs: 1_000 }),
+    "no byte of its pages has been served for 60 s while its release's save, running 60 s, waits",
+  );
+  // Past the floor: no byte served for the stall window.
+  assert.equal(loadingSaveRevocation({ ...save, now: 99_000 }, timings), null);
+  assert.equal(loadingSaveRevocation({ ...save, now: 100_000 }, timings), "no byte of its pages has been served for 90 s while its release's save, running 90 s, waits");
+  // Served as it saves, at a rate that ends in time: nothing, however slow.
+  assert.equal(loadingSaveRevocation({ ...save, now: 110_000, movedAt: 109_000, served: 200_000 }, timings), null);
+  // At a rate whose bytes left would end past the latest from its ask, since the save started and of its recent window
+  // alike: revoked, said with both.
+  assert.equal(
+    loadingSaveRevocation({ ...save, now: 110_000, movedAt: 109_000, served: 100_000 }, timings),
+    "its 900000 bytes of pages left would be served only past the 490 s its release's save may wait on them still: in 900 s at the 1000 bytes a second served since the save started 100 s ago, in 900 s at the 1000 bytes a second of the last 100 s",
+  );
+  // Its recent window fast enough: nothing.
+  assert.equal(loadingSaveRevocation({ ...save, now: 110_000, movedAt: 109_000, served: 100_000, recentFrom: 100_000, servedAtRecentFrom: 50_000 }, timings), null);
+  // Its bytes not known: a stall alone.
+  assert.equal(loadingSaveRevocation({ ...save, now: 110_000, movedAt: 109_000, served: 100_000, expected: null }, timings), null);
+  assert.equal(loadingSaveRevocation({ ...save, now: 110_000, movedAt: 109_000, served: 100_000, expected: Number.POSITIVE_INFINITY }, timings), null);
+  // At the latest from its ask: revoked, however it reads.
+  assert.equal(
+    loadingSaveRevocation({ ...save, now: 600_000, movedAt: 599_000, served: 999_000 }, timings),
+    "its release's save, asked 600 s ago, may wait on it no longer, 600 s at the most",
+  );
+});
+
+test("a release's save whose restore's reads paused for less than the stall window, then went on at a rate that serves the rest in time, has nothing revoked, its recent window from the pause's end, though its rate since the save started misses", () => {
+  const MiB = 1024 ** 2;
+  const timings = { floorMs: 60_000, stallMs: 90_000, latestMs: 600_000 };
+  // Looked at every 5 s: nothing served for 50 s, then 4 MiB/s, 600 MiB left at 60 s.
+  const seen = [...Array.from({ length: 11 }, (_, index) => ({ at: index * 5_000, served: 0 })), { at: 55_000, served: 20 * MiB }, { at: 60_000, served: 40 * MiB }];
+  const recent = recentReads(seen, timings.stallMs);
+  assert.deepEqual(recent, { at: 50_000, served: 0 });
+  const save = { askedAt: 0, startedAt: 0, now: 60_000, movedAt: 60_000, servedAtStart: 0, served: 40 * MiB, expected: 640 * MiB, recentFrom: recent.at, servedAtRecentFrom: recent.served };
+  // It ends at some 210 s, within the 600 s: nothing.
+  assert.equal(loadingSaveRevocation(save, timings), null);
+  // By its rate since the save started alone, 0.67 MiB/s, it would end past them.
+  assert.match(loadingSaveRevocation({ ...save, recentFrom: 0, servedAtRecentFrom: 0 }, timings) ?? "", /^its 629145600 bytes of pages left would be served only past the 540 s /u);
+  // Gone on as slowly as before the pause, 0.2 MiB/s: revoked.
+  const slow = [...seen.slice(0, 11), { at: 55_000, served: MiB }, { at: 60_000, served: 2 * MiB }];
+  const slowly = recentReads(slow, timings.stallMs);
+  assert.match(loadingSaveRevocation({ ...save, served: 2 * MiB, expected: 602 * MiB, recentFrom: slowly.at, servedAtRecentFrom: slowly.served }, timings) ?? "", /of the last 10 s$/u);
+  // The recent window no further back than the stall window, and none at all where the last look saw nothing more.
+  const steady = Array.from({ length: 30 }, (_, index) => ({ at: index * 5_000, served: index * MiB }));
+  assert.deepEqual(recentReads(steady, timings.stallMs), { at: 55_000, served: 11 * MiB });
+  assert.deepEqual(recentReads([...steady, { at: 150_000, served: 29 * MiB }], timings.stallMs), { at: 150_000, served: 29 * MiB });
+});
+
+test("a release's save of a sandbox whose restore from the bucket reads it still has that restore's token revoked, said why, once it has run its floor from as runsc's save started and no byte of the restore's pages has been served for its stall window, or they come too slowly to end in time, so its loading fails and the save with it; one served steadily, one that ends first, and one of a sandbox done reading revoke nothing", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const holder = "main/fs-abc";
+      const taker = yield* node("node-1");
+      const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
+      /** How the restored sandbox's runsc saves it, as each case has it: as the stand-in does unless told. */
+      let saving = (release: string, options: CheckpointOptions, runsc: Runsc): Effect.Effect<void, RunscError | ReleaseNotInstalled> => runsc.checkpoint(release, options);
+      const savingRunsc = (runsc: Runsc): Runsc => ({ ...runsc, checkpoint: (release, options) => saving(release, options, runsc) });
+      // A floor of 1 s, a stall window of 0.4 s, a latest of a minute; and one whose latest, 4 s, a slow rate cannot meet;
+      // each looking every 200 ms, longer than the 150 ms between the reads a steady restore is served below.
+      const there = yield* node("node-2", { loadingSave: { floorMs: 1000, stallMs: 400, latestMs: 60_000, pollMs: 200 }, runsc: savingRunsc });
+      const tight = yield* node("node-3", { loadingSave: { floorMs: 1000, stallMs: 5000, latestMs: 4000, pollMs: 200 }, runsc: savingRunsc });
+      for (const each of [there, tight]) writeFileSync(join(each.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      /** The sandbox restored from the bucket on `on`, its restore reading it still, told its bytes: the token it reads by, and the key of its own image's pages. */
+      const restored = (on: Node) =>
+        Effect.gen(function*() {
+          const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+          // Its image's pages and a layer's, 45056 bytes in all, as runsc says of the image: put again, as a save that
+          // failed forgets the workspace's.
+          s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
+          yield* on.cache.clear("main", "fs-abc");
+          const prepared = yield* preparing(on.agent, workspace);
+          assert.equal(prepared.source, "bucket");
+          // Read before its resume, which removes its gofer's options.
+          const token = tokenIn(prepared.imagePath);
+          yield* on.agent.resume(resumeRequest(manifest.snapshot));
+          yield* Effect.sync(() => on.storeProxy.readingOf(holder)?.expected).pipe(
+            Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (expected) => expected === 45056 }),
+            Effect.timeout("10 seconds"),
+          );
+          return { token, own: `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img` };
+        });
+      const logged: string[] = [];
+      /** The release's save of the sandbox on `on`, what the agent logs meanwhile kept: how it ended. */
+      const released = (on: Node) =>
+        on.agent.checkpoint(request("fs-abc")).pipe(
+          Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push([message].flat().join(" ")))])),
+          Effect.exit,
+        );
+      const revoked = () => logged.filter((line) => line.startsWith(`revoked the token of the restore of ${holder} from the bucket`));
+      /** Its save, as of a sandbox whose loading failed once the restore reads no more, its token revoked: when runsc's save started, and when it ended. */
+      let times = { started: 0, ended: 0 };
+      const waitsUntilRevoked = (on: Node, served: Effect.Effect<void>) => (release: string): Effect.Effect<void, RunscError> =>
+        Effect.sync(() => void (times = { started: Date.now(), ended: 0 })).pipe(
+          Effect.andThen(served.pipe(Effect.repeat({ schedule: Schedule.spaced("150 millis"), until: () => on.storeProxy.readingOf(holder) === null }))),
+          Effect.timeout("10 seconds"),
+          Effect.orDie,
+          Effect.andThen(Effect.sync(() => void (times.ended = Date.now()))),
+          Effect.andThen(Effect.fail(new RunscError({ release, command: "checkpoint", reason: `checkpoint failed: saving kernel: ${PAGES_UNREAD}: GetObject: AccessDenied` }))),
+        );
+      /** 512 bytes more of the layer's pages served to the restore of `token` through `on`'s proxy, the next each time. */
+      let offset = 0;
+      const servedMore = (on: Node, token: { readonly accessKeyId: string; readonly secretAccessKey: string }) =>
+        Effect.suspend(() => {
+          const from = offset;
+          offset += 512;
+          return throughProxy(on, token, layer, `bytes=${from}-${from + 511}`).pipe(Effect.asVoid);
+        });
+
+      // A save that waits on pages the restore is served none of, as of a store away: once it has run its floor, from as
+      // runsc's save started, and nothing has been served for the stall window, the token is revoked, its loading fails,
+      // and so the save does, as runsc says of a sandbox whose loading failed.
+      const stalled = yield* restored(there);
+      saving = waitsUntilRevoked(there, Effect.void);
+      assert.match(failure(yield* released(there)), /^the sandbox of main\/fs-abc can be saved no more, its restore having failed to read some of its pages: .*previous async page loading failed/u);
+      assert.ok(times.ended - times.started >= 1000, `revoked ${times.ended - times.started} ms after runsc's save started`);
+      assert.equal(yield* throughProxy(there, stalled.token, stalled.own), 403);
+      assert.equal(revoked().length, 1);
+      assert.match(revoked()[0] ?? "", /^revoked the token of the restore of main\/fs-abc from the bucket, as no byte of its pages has been served for 1 s while its release's save, running 1 s, waits, 0 of 45056 bytes of its pages served: its reads are refused from now, so its loading fails, and its save with it, rather than hold its sandbox paused past what alasio waits for the save; the session comes back from bayma's checkpoints$/u);
+
+      // One served steadily, however slowly, at a rate that ends in time: nothing revoked past its floor and stall window.
+      logged.length = 0;
+      offset = 0;
+      const steady = yield* restored(there);
+      saving = (release, options, runsc) =>
+        servedMore(there, steady.token).pipe(
+          Effect.repeat({ schedule: Schedule.spaced("150 millis"), times: 16 }),
+          Effect.andThen(Effect.sync(() => assert.notEqual(there.storeProxy.readingOf(holder), null))),
+          Effect.andThen(runsc.checkpoint(release, options)),
+        );
+      assert.ok(Exit.isSuccess(yield* released(there)));
+      assert.deepEqual(revoked(), []);
+
+      // One served steadily at a rate whose bytes left would end past the latest it may wait: revoked once its floor has passed.
+      logged.length = 0;
+      offset = 0;
+      const slow = yield* restored(tight);
+      saving = waitsUntilRevoked(tight, servedMore(tight, slow.token));
+      assert.match(failure(yield* released(tight)), /can be saved no more/u);
+      assert.ok(times.ended - times.started >= 1000, `revoked ${times.ended - times.started} ms after runsc's save started`);
+      assert.equal(revoked().length, 1);
+      assert.match(revoked()[0] ?? "", /, as its \d+ bytes of pages left would be served only past the \d s its release's save may wait on them still: in \d+ s at the \d+ bytes a second served since the save started 1 s ago, in \d+ s at the \d+ bytes a second of the last 1 s, \d+ of 45056 bytes of its pages served: /u);
+
+      // One that ends before its floor: its restore's token held as it saves, then ended with its sandbox, as a release's
+      // is, and nothing revoked past it.
+      logged.length = 0;
+      yield* restored(there);
+      saving = (release, options, runsc) =>
+        Effect.sleep("100 millis").pipe(
+          Effect.andThen(Effect.sync(() => assert.notEqual(there.storeProxy.readingOf(holder), null))),
+          Effect.andThen(runsc.checkpoint(release, options)),
+        );
+      assert.ok(Exit.isSuccess(yield* released(there)));
+      yield* Effect.sleep("1500 millis");
+      assert.deepEqual(revoked(), []);
+
+      // One of a sandbox done reading, served every byte of its pages, however long it runs: nothing revoked.
+      logged.length = 0;
+      const done = yield* restored(there);
+      assert.equal(yield* throughProxy(there, done.token, done.own), 200);
+      assert.equal(yield* throughProxy(there, done.token, layer), 200);
+      assert.equal(there.storeProxy.readingOf(holder), null);
+      saving = (release, options, runsc) => Effect.sleep("2 seconds").pipe(Effect.andThen(runsc.checkpoint(release, options)));
+      assert.ok(Exit.isSuccess(yield* released(there)));
+      assert.deepEqual(revoked(), []);
+    })
+  ));
+
+test("a live checkpoint of a sandbox whose restore from the bucket reads it still is not taken, said so, nothing of it saved nor changed; once the restore is done reading, it is", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const holder = "main/fs-abc";
+      const taker = yield* node("node-1");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
+      s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
+      let saves = 0;
+      const there = yield* node("node-2", { runsc: (runsc) => ({ ...runsc, checkpoint: (release, options) => Effect.sync(() => void (saves += 1)).pipe(Effect.andThen(runsc.checkpoint(release, options))) }) });
+      writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      const prepared = yield* preparing(there.agent, workspace);
+      assert.equal(prepared.source, "bucket");
+      const token = tokenIn(prepared.imagePath);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* Effect.sync(() => there.storeProxy.readingOf(holder)?.expected).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (expected) => expected === 45056 }),
+        Effect.timeout("10 seconds"),
+      );
+      // Its sandbox, running with bayma's state directory in the workspace it attaches, as a live checkpoint reads it.
+      const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+      mkdirSync(stateDirIn(volume), { recursive: true });
+      writeFileSync(join(stateDirIn(volume), "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      writeFileSync(join(stateDirIn(volume), "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
+      there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
+      const logged: string[] = [];
+      const deferred = yield* there.agent.checkpoint(live("fs-abc")).pipe(
+        Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push([message].flat().join(" ")))])),
+        Effect.exit,
+      );
+      const said = "the sandbox of main/fs-abc is not saved live while its restore from the bucket reads it still, 0 of 45056 bytes of its pages served: its release saves it";
+      assert.equal(failure(deferred), said);
+      assert.ok(logged.includes(said), logged.join("\n"));
+      assert.equal(saves, 0);
+      // Its restore reading on, its token held.
+      assert.equal(yield* throughProxy(there, token, layer, "bytes=0-511"), 206);
+      // Nothing of its snapshot changed.
+      assert.equal((yield* there.agent.current(workspace))?.snapshot, manifest.snapshot);
+      // Done reading, served every byte of its pages: saved live.
+      assert.equal(yield* throughProxy(there, token, `main/fs-abc/layers/${manifest.layers[0]?.digest}/pages.img`), 200);
+      assert.equal(yield* throughProxy(there, token, layer), 200);
+      assert.equal(there.storeProxy.readingOf(holder), null);
+      const taken = yield* there.agent.checkpoint(live("fs-abc"));
+      assert.deepEqual(taken.live, { stateDir: STATE_DIR, ...CAUGHT });
+      assert.equal(saves, 1);
     })
   ));
 
@@ -3951,6 +4183,7 @@ test("the agent runs as its own process from its environment, and stops when tol
     ALASIO_NODE_AGENT_TOKEN: "the token",
     ALASIO_GVISOR_RELEASE: RELEASE,
     ALASIO_BACKGROUND_READ_SECONDS: "600",
+    ALASIO_LOADING_STALL_SECONDS: "90",
     S3_ENDPOINT: s3.endpoint,
     S3_REGION: "us-east-1",
     S3_BUCKET: "snapshots",
@@ -3970,6 +4203,12 @@ test("the agent runs as its own process from its environment, and stops when tol
     const refused = start(unnamed);
     assert.equal(await refused.exited, 1);
     assert.match(refused.output(), /NODE_NAME/u);
+    // A test's timings, where given, whole and positive, looked at no more often than every 100 ms.
+    for (const timings of ['{"pollMs":10}', '{"floorMs":0}', '{"stallMs":1.5}', "fast"]) {
+      const untimed = start({ ...env, ALASIO_LOADING_SAVE_TEST_TIMINGS: timings });
+      assert.equal(await untimed.exited, 1, timings);
+      assert.match(untimed.output(), /ALASIO_LOADING_SAVE_TEST_TIMINGS/u, timings);
+    }
 
     const running = start(env);
     const holdings = await (async () => {

@@ -16,7 +16,7 @@ import { memoryBytes, memoryText } from "../capacity.ts";
 import { EVICTION_MAX_POD_GRACE_SECONDS } from "../cluster/k3s.ts";
 import { POOLS, restorePodName } from "../../../src/gateway/names.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, SOCKET_PATH_MAX, standbyContainerSocket } from "../../../src/kube/sandbox-shape.ts";
-import { NODE_AGENT_MEMORY_FLOOR } from "../../../src/node-agent/names.ts";
+import { LOADING_STALL_LEAST_SECONDS, LOADING_STALL_MOST_SECONDS, LOADING_STALL_SECONDS, NODE_AGENT_MEMORY_FLOOR } from "../../../src/node-agent/names.ts";
 import { IMAGES } from "../release.ts";
 
 /** The install configuration is not what alasio installs from; the message says which key and why. */
@@ -308,6 +308,24 @@ const Snapshots = Schema.Struct({
       return (seconds > 15 && seconds <= most) || `must be a duration of more than 15s and at most ${most}s, as its pod stops within what kubelet gives one it evicts, such as 60s`;
     })),
     "60s",
+  ),
+  /**
+   * How long a session's release may wait on a restore of its sandbox from the bucket that
+   * still reads it, its save waiting for the pages it has not read, without one byte of them
+   * served: past it, once the save has run a minute, that restore's reads are refused, so its
+   * save fails, and the session comes back from bayma's checkpoints, rather than stay paused as
+   * long as the store is away. A store that answers, however slowly, is not cut while it can
+   * serve the rest within what alasio waits for a save (src/node-agent/names.ts
+   * LOADING_SAVE_FLOOR_SECONDS). A duration of 30s at least, bayma's hook's own bound, and 9m at
+   * most, such as 90s.
+   */
+  loadingStallWait: defaulted(
+    Schema.String.check(Schema.makeFilter((duration) => {
+      const seconds = durationSeconds(duration) ?? 0;
+      return (seconds >= LOADING_STALL_LEAST_SECONDS && seconds <= LOADING_STALL_MOST_SECONDS) ||
+        `must be a duration of ${LOADING_STALL_LEAST_SECONDS}s to ${LOADING_STALL_MOST_SECONDS / 60}m, such as 90s`;
+    })),
+    `${LOADING_STALL_SECONDS}s`,
   ),
   /** The most of snapshots each node keeps on its disk, for restores there. */
   nodeCache: defaulted(Size, "5Gi"),

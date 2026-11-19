@@ -25,6 +25,13 @@
  * checkpoint's commit, and a copy's, are written whatever the bucket holds, as each is the
  * workspace's latest, of its one sandbox or of a fork none runs from yet, and read nothing it
  * holds; a compaction's, which compacts the snapshot it read, only as the bucket holds that one.
+ * A release's checkpoint of a sandbox whose restore from the bucket still reads it waits for
+ * the pages it saves as they load, as long as the restore asks, which one of a store away does
+ * as long as its sandbox runs: once those reads have stalled, or go too slowly to end in time
+ * (./names.ts LOADING_SAVE_FLOOR_SECONDS), that restore's token is revoked, so its loading
+ * fails, and the checkpoint with it (boundWhileLoading). A live checkpoint of such a sandbox is
+ * not taken (LiveSaveDeferred): it would pause an exec that runs for as long as the pages it
+ * saves take to load, for a snapshot its release takes anyway.
  *
  * A snapshot a release's checkpoint commits whose chain of images is due (compactionDue)
  * is compacted, after its commit and beside whatever else the agent does, one at a time on
@@ -103,7 +110,17 @@ import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCach
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
 import { makeLoading } from "./loading.ts";
-import { backgroundReadSeconds, RESTORE_RUNNING_WAIT_MS, restoresFromBucket, runscVersion, STORE_SOCKET_ENDPOINT } from "./names.ts";
+import {
+  backgroundReadSeconds,
+  LOADING_SAVE_FLOOR_SECONDS,
+  LOADING_SAVE_LATEST_SECONDS,
+  LOADING_STALL_SECONDS,
+  RESTORE_RUNNING_WAIT_MS,
+  restoresFromBucket,
+  runscVersion,
+  SAVE_HOOK_SECONDS,
+  STORE_SOCKET_ENDPOINT,
+} from "./names.ts";
 import { type ListedContainer, type ReleaseNotInstalled, type Runsc, RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import { type S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
@@ -433,6 +450,92 @@ export class SandboxUnsaveable extends Schema.TaggedError<SandboxUnsaveable>()("
 }
 
 /**
+ * A live checkpoint not taken, its sandbox's restore from the bucket reading it still: the save
+ * would pause the exec that runs for as long as the pages it saves take to load, for a snapshot
+ * its release takes anyway. Nothing of the workspace's snapshot changes.
+ */
+export class LiveSaveDeferred extends Schema.TaggedError<LiveSaveDeferred>()("LiveSaveDeferred", {
+  environment: Schema.String,
+  workspace: Schema.String,
+  served: Schema.Number,
+  expected: Schema.NullOr(Schema.Number),
+}) {
+  override get message(): string {
+    const of = this.expected === null || !Number.isFinite(this.expected) ? "" : ` of ${this.expected}`;
+    return `the sandbox of ${this.environment}/${this.workspace} is not saved live while its restore from the bucket reads it still, ${this.served}${of} bytes of its pages served: its release saves it`;
+  }
+}
+
+/** How a release's save of a sandbox whose restore reads the bucket still has gone, as boundWhileLoading looks at it: times in ms since the epoch, sizes in bytes. */
+export interface LoadingSave {
+  /** When the checkpoint was asked, and when runsc's save of it started, the workspace's lock held. */
+  readonly askedAt: number;
+  readonly startedAt: number;
+  /** Now, and when the restore was last served a byte of its pages, or the save started, if later. */
+  readonly now: number;
+  readonly movedAt: number;
+  /** The bytes of pages it had been served as the save started, and has been now; and those it reads, null or Infinity where not known. */
+  readonly servedAtStart: number;
+  readonly served: number;
+  readonly expected: number | null;
+  /** When the window its recent rate is measured over began (recentReads), and the bytes it had been served then. */
+  readonly recentFrom: number;
+  readonly servedAtRecentFrom: number;
+}
+
+/**
+ * Why the token of the restore `save` is of is to be revoked now, as boundWhileLoading says;
+ * null where it is not: its save asked `latestMs` ago or longer; or, once it has run `floorMs`,
+ * no byte of the restore's pages served for `stallMs`, or those left not served before
+ * `latestMs` from its ask at the rate they were served since it started, nor at the rate of
+ * its recent window (recentReads), so that a pause shorter than `stallMs`, which drags the
+ * one down, does not have a store that serves the rest in time since cut.
+ */
+export function loadingSaveRevocation(save: LoadingSave, { floorMs, stallMs, latestMs }: { readonly floorMs: number; readonly stallMs: number; readonly latestMs: number }): string | null {
+  const { askedAt, startedAt, now, movedAt, servedAtStart, served, expected, recentFrom, servedAtRecentFrom } = save;
+  const seconds = (ms: number) => `${Math.round(ms / 1000)} s`;
+  if (now - askedAt >= latestMs) return `its release's save, asked ${seconds(now - askedAt)} ago, may wait on it no longer, ${seconds(latestMs)} at the most`;
+  if (now - startedAt < floorMs) return null;
+  if (now - movedAt >= stallMs) return `no byte of its pages has been served for ${seconds(now - movedAt)} while its release's save, running ${seconds(now - startedAt)}, waits`;
+  if (expected === null || !Number.isFinite(expected) || served >= expected || now <= recentFrom) return null;
+  const left = expected - served;
+  const late = (rate: number) => rate <= 0 || now + left / rate > askedAt + latestMs;
+  const rate = (served - servedAtStart) / (now - startedAt);
+  const recent = (served - servedAtRecentFrom) / (now - recentFrom);
+  if (rate <= 0 || !late(rate) || !late(recent)) return null;
+  const takes = (at: number) => (at > 0 ? `in ${seconds(left / at)}` : "never");
+  return `its ${left} bytes of pages left would be served only past the ${seconds(askedAt + latestMs - now)} its release's save may wait on them still: ${takes(rate)} at the ${Math.round(rate * 1000)} bytes a second served since the save started ${seconds(now - startedAt)} ago, ${takes(recent)} at the ${Math.round(recent * 1000)} bytes a second of the last ${seconds(now - recentFrom)}`;
+}
+
+/** What boundWhileLoading saw of a restore's reads at one of its looks: when, and the bytes of pages it had been served. */
+export interface ReadsSeen {
+  readonly at: number;
+  readonly served: number;
+}
+
+/**
+ * The window a restore's recent rate is measured over, of `seen`, its looks in order, the first
+ * as its save started: from its last pause's end, the last look that found no more served than
+ * the one before, and no further back than the last look at or before `stallMs` before the
+ * last; the look it begins at, when and what it saw. The last look finding no more served, it
+ * is that look alone, empty.
+ */
+export function recentReads(seen: readonly ReadsSeen[], stallMs: number): ReadsSeen {
+  const first = seen[0];
+  const last = seen.at(-1);
+  if (first === undefined || last === undefined) throw new Error("recentReads needs a look");
+  let resumed = first;
+  for (let index = seen.length - 1; index > 0; index -= 1) {
+    if (seen[index]!.served <= seen[index - 1]!.served) {
+      resumed = seen[index]!;
+      break;
+    }
+  }
+  const windowed = seen.findLast((look) => look.at <= last.at - stallMs);
+  return windowed !== undefined && windowed.at > resumed.at ? windowed : resumed;
+}
+
+/**
  * What runsc says of a checkpoint of a sandbox whose restore failed to read some of its pages
  * in the background: as a whole save waits for them all (pgalloc's AwaitLoadAll), and, from
  * 20261102.0-eaucoin.9 on, as a delta save waits for those of them it reads, the pages dirtied
@@ -533,7 +636,7 @@ export type ResumeError = PodNotRunning | KubeApiError | PoliciesNotInForce | Co
 /** What a node agent does; see makeNodeAgent. */
 export interface NodeAgent {
   /** Checkpoints a workspace's sandbox and makes it the workspace's snapshot: its manifest. */
-  readonly checkpoint: (request: CheckpointRequest) => Effect.Effect<Manifest, CheckpointFailed | SandboxUnsaveable>;
+  readonly checkpoint: (request: CheckpointRequest) => Effect.Effect<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred>;
   /** The workspace's snapshot of the request's manifest in this node's cache, checked against it, for a restore on this node. */
   readonly prepare: (request: PrepareRequest) => Effect.Effect<Prepared, PrepareError>;
   /** The manifest of the workspace's current snapshot, or null. */
@@ -593,6 +696,14 @@ export interface NodeAgentOptions {
    * (./names.ts backgroundReadSeconds).
    */
   readonly backgroundReadMs: number;
+  /**
+   * How a release's save of a sandbox whose restore from the bucket still reads it is bounded
+   * (boundWhileLoading): how long no byte of the restore's pages may be served
+   * (LOADING_STALL_SECONDS unless told), how long the save runs at least before that or a rate
+   * too slow counts (LOADING_SAVE_FLOOR_SECONDS), how long from its ask it may wait at the most
+   * (LOADING_SAVE_LATEST_SECONDS), and how often the restore's reads are looked at (5 s), in ms.
+   */
+  readonly loadingSave?: { readonly stallMs?: number; readonly floorMs?: number; readonly latestMs?: number; readonly pollMs?: number };
   /** How long runsc may take to say how many bytes of pages a restore from the bucket reads, INSPECT_TIMEOUT_MS unless told. */
   readonly inspectTimeoutMs?: number;
   /**
@@ -673,11 +784,6 @@ const StateGenerationFile = Schema.fromJsonString(Schema.Struct({ schemaVersion:
 const LastSaveFile = Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1), generation: Count, running: Running }));
 /** How the agent reads a state file's bytes as text: those that are not UTF-8 fail it. */
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
-/**
- * How long bayma's hook may take to ready the sandbox for its save, and to go on after one
- * taken live, as it bounds itself in those (sandbox/agent/start.sh).
- */
-export const SAVE_HOOK_SECONDS = 30;
 /**
  * How long bayma's hook may take as runsc bounds it, of a sandbox whose restore from the
  * bucket reads its pages through the agent for up to `backgroundReadMs`: runsc keeps the
@@ -860,7 +966,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1091,9 +1197,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /**
    * The snapshot of the sandbox `request` names, taken and committed as the module says:
    * its manifest. A delta of its base, its sandbox tracking its writes and the base's image
-   * in the cache; whole otherwise.
+   * in the cache; whole otherwise. Its save bounded while its sandbox loads, as one asked at
+   * `askedAt`, where given (boundWhileLoading).
    */
-  const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
+  const take = (request: CheckpointRequest, askedAt: number | null): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, podTemplate } = request;
       const running = yield* ofPod(containerId, request.namespace, request.pod);
@@ -1117,26 +1224,28 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.parent": parent?.snapshot ?? "" });
       yield* cache.room(memoryLimitOf(podTemplate), spared).pipe(Effect.flatMap(logEvicted));
       const staged = yield* cache.stage(environment, workspace, snapshot);
-      return yield* commit(request, snapshot, takenAt, staged, parent, running);
+      return yield* commit(request, snapshot, takenAt, staged, parent, running, askedAt);
     });
 
   /**
    * Saves the sandbox `request` names into `staged`, a delta of `parent`'s image if given,
    * and commits it as the snapshot `snapshot`: its manifest. What it staged goes if it fails.
+   * Its save bounded while its sandbox loads, as one asked at `askedAt`, where given (boundWhileLoading).
    */
-  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, container: RunningContainer): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
+  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, container: RunningContainer, askedAt: number | null): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, hook, podTemplate, live } = request;
       const { release } = container;
       const [own] = parent?.layers ?? [];
-      const [pauseMs] = yield* timed(runsc.checkpoint(release, {
+      const saved = runsc.checkpoint(release, {
         containerId,
         imagePath: staged,
         hook,
         hookTimeout: `${restoreHookSeconds(backgroundReadMs)}s`,
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
         live: live !== undefined,
-      }));
+      });
+      const [pauseMs] = yield* timed(askedAt === null ? saved : boundWhileLoading(request, askedAt, saved));
       // What the save caught, as bayma's hook wrote it as the sandbox was saved.
       const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
       const image = yield* runsc.inspect(release, staged);
@@ -1403,22 +1512,79 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   const evict: Effect.Effect<void, CacheError> = Effect.suspend(() => cache.evict(spared)).pipe(Effect.flatMap(logEvicted));
 
-  const checkpoint = (request: CheckpointRequest): Effect.Effect<Manifest, CheckpointFailed | SandboxUnsaveable> => {
+  const timings = {
+    floorMs: loadingSave.floorMs ?? LOADING_SAVE_FLOOR_SECONDS * 1000,
+    stallMs: loadingSave.stallMs ?? LOADING_STALL_SECONDS * 1000,
+    latestMs: loadingSave.latestMs ?? LOADING_SAVE_LATEST_SECONDS * 1000,
+  };
+  const loadingPollMs = loadingSave.pollMs ?? 5000;
+
+  /**
+   * `saving`, runsc's save of the sandbox a release's checkpoint, `request`, asked at
+   * `askedAt`, names, from as it starts, the workspace's lock held: where the sandbox's restore
+   * from the bucket reads it still, its reads are looked at every loadingPollMs as the save runs,
+   * their recent window kept (recentReads), and its token revoked, said why, as
+   * loadingSaveRevocation says (./names.ts
+   * LOADING_SAVE_FLOOR_SECONDS). A save waits for the pages it saves that the restore has not
+   * loaded yet, which a restore whose store is away asks for again as long as its sandbox runs,
+   * its token lasting as it asks (./store-proxy.ts), the sandbox paused meanwhile, past what
+   * alasio waits for the checkpoint. Revoked, its reads are refused, which its gofer does not
+   * retry: its loading fails, and so the save does, as one of a sandbox saved no more
+   * (PAGES_UNREAD), or as its hook's, where bayma's hook waited on the pages first. Nothing where
+   * the save ends first, its sandbox ended with it, or the restore is done reading, or the
+   * sandbox was not restored from the bucket.
+   */
+  const boundWhileLoading = <A, E>(request: CheckpointRequest, askedAt: number, saving: Effect.Effect<A, E>): Effect.Effect<A, E> => {
+    const holder = prefixOf(request);
+    const watching = Effect.gen(function*() {
+      const startedAt = yield* Clock.currentTimeMillis;
+      const first = storeProxy.readingOf(holder);
+      if (first === null) return;
+      let movedAt = startedAt;
+      let last = first.served;
+      // Its looks, those within the stall window and the one before them kept, which its recent rate is measured over.
+      let seen: ReadsSeen[] = [{ at: startedAt, served: first.served }];
+      for (;;) {
+        yield* Effect.sleep(loadingPollMs);
+        const now = yield* Clock.currentTimeMillis;
+        const reading = storeProxy.readingOf(holder);
+        if (reading === null) return;
+        if (reading.served > last) {
+          last = reading.served;
+          movedAt = now;
+        }
+        seen.push({ at: now, served: reading.served });
+        const before = seen.findLastIndex((look) => look.at <= now - timings.stallMs);
+        if (before > 0) seen = seen.slice(before);
+        const recent = recentReads(seen, timings.stallMs);
+        const why = loadingSaveRevocation({ askedAt, startedAt, now, movedAt, servedAtStart: first.served, served: reading.served, expected: reading.expected, recentFrom: recent.at, servedAtRecentFrom: recent.served }, timings);
+        if (why === null) continue;
+        storeProxy.revoke(holder);
+        const of = reading.expected === null || !Number.isFinite(reading.expected) ? "" : ` of ${reading.expected}`;
+        return yield* Effect.logWarning(
+          `revoked the token of the restore of ${holder} from the bucket, as ${why}, ${reading.served}${of} bytes of its pages served: its reads are refused from now, so its loading fails, and its save with it, rather than hold its sandbox paused past what alasio waits for the save; the session comes back from bayma's checkpoints`,
+        );
+      }
+    });
+    return watching.pipe(Effect.forkScoped, Effect.andThen(saving), Effect.scoped);
+  };
+
+  const checkpoint = (request: CheckpointRequest): Effect.Effect<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred> => {
     /** How the checkpoint fails for `error`, saying `reason`: unsaveable where runsc says its sandbox is, as it will of every checkpoint after. */
     const failed = (error: { readonly message: string }, reason: string) =>
       error.message.includes(PAGES_UNREAD)
         ? new SandboxUnsaveable({ environment: request.environment, workspace: request.workspace, reason })
         : new CheckpointFailed({ environment: request.environment, workspace: request.workspace, reason });
     const moved = "as the workspace has moved on since it was taken";
-    const taken = take(request).pipe(Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))));
-    const committed = request.live === undefined
+    const taken = (askedAt: number | null) => take(request, askedAt).pipe(Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))));
+    const committed = (askedAt: number | null) => request.live === undefined
       // Of a container not there, or another pod's, nothing is saved, nor ended, by this checkpoint, so what was saved of
       // the workspace before is kept: as a release asked again once its sandbox has ended, its last checkpoint the one that
       // ended it, finds.
       ? ofPod(request.containerId, request.namespace, request.pod).pipe(
         Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))),
         Effect.mapError((error) => failed(error, `${error.message}; its snapshot is kept, as no sandbox of the container was reached`)),
-        Effect.andThen(taken.pipe(
+        Effect.andThen(taken(askedAt).pipe(
           Effect.catch((error) =>
             forgetNow(request).pipe(
               Effect.matchEffect({
@@ -1435,7 +1601,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           })),
         )),
       )
-      : taken.pipe(
+      : taken(null).pipe(
         // The sandbox runs on from the image it was saved to, which its next checkpoint saves what
         // changed since, all of its memory read now: its restore reads the bucket no more.
         Effect.tap((manifest) => Effect.sync(() => {
@@ -1446,7 +1612,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         Effect.tapError(() => Effect.sync(() => bases.delete(request.containerId))),
         Effect.mapError((error) => failed(error, `${error.message}; its snapshot is kept, as a live checkpoint that fails changes nothing`)),
       );
-    return exclusive([request], committed.pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))))).pipe(
+    // A release's save is bounded while its sandbox loads, as one asked now, its wait for the workspace counted.
+    const asked: Effect.Effect<number | null> = request.live === undefined ? Clock.currentTimeMillis : Effect.succeed(null);
+    // A live one of a sandbox whose restore reads the bucket still is not taken, said so.
+    const deferred: Effect.Effect<void, LiveSaveDeferred> = Effect.suspend(() => {
+      const reading = request.live === undefined ? null : storeProxy.readingOf(prefixOf(request));
+      if (reading === null) return Effect.void;
+      const error = new LiveSaveDeferred({ environment: request.environment, workspace: request.workspace, served: reading.served, expected: reading.expected });
+      return Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag })).pipe(
+        Effect.andThen(Effect.logInfo(error.message)),
+        Effect.andThen(Effect.fail(error)),
+      );
+    });
+    return deferred.pipe(
+      Effect.andThen(asked),
+      Effect.flatMap((at) => exclusive([request], committed(at).pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message))))))),
       // A release's: compacted once it no longer holds the workspace, where its chain is due.
       Effect.tap((manifest) => (request.live === undefined ? compactLater(manifest) : Effect.void)),
       Effect.tap((manifest) =>
@@ -1460,7 +1640,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           Effect.andThen(Effect.logInfo(`took the snapshot ${manifest.snapshot} of ${prefixOf(manifest)}${manifest.live === undefined ? "" : ` live, at bayma's generation ${manifest.live.generation}`}: ${manifest.bytes} bytes, paused ${manifest.pauseMs} ms, uploaded in ${manifest.uploadMs} ms`)),
         )
       ),
-      Effect.tapError((error) => Effect.logWarning(error.message)),
+      Effect.tapError((error) => (error._tag === "LiveSaveDeferred" ? Effect.void : Effect.logWarning(error.message))),
       withAlasioSpan("alasio.node_agent.checkpoint", { attributes: { ...spanAttributes(request), "alasio.snapshot.live": request.live !== undefined } }),
     );
   };

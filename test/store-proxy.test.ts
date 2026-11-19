@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Effect, Fiber, Logger, type Scope } from "effect";
+import { Effect, Fiber, Logger, Schedule, type Scope } from "effect";
 
 import { sigV4Authorization } from "../src/node-agent/s3.ts";
 import { answerStart, keyOf, makeStoreProxy, SKEW_MS, type StoreProxy, type StoreProxyOptions, type StoreToken, withRange } from "../src/node-agent/store-proxy.ts";
@@ -575,6 +575,71 @@ test("a restore is done reading through the proxy once it has been served every 
       // Of a token there is not, at once.
       assert.equal(yield* doneWithin("ALASIONONE", 100), true);
     }), { quietMs: 100, preparedForMs: 4000 }));
+
+test("how far a restore has read through the proxy is said while it reads, by its workspace: the bytes of pages it was served, and those it was told; nothing once it is done reading, or its token is gone", () =>
+  withProxy(({ proxy }) =>
+    Effect.gen(function*() {
+      // None held: nothing.
+      assert.equal(proxy.readingOf("main/fs-abc"), null);
+      const token = minted(proxy);
+      // Prepared, its bytes not known yet: reading, none served.
+      proxy.expect(token.accessKeyId, Number.POSITIVE_INFINITY);
+      assert.deepEqual(proxy.readingOf("main/fs-abc"), { served: 0, expected: Number.POSITIVE_INFINITY });
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect(token.accessKeyId, 4096);
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, range: "bytes=0-1023" }))), "206 ");
+      yield* sleep(50);
+      assert.deepEqual(proxy.readingOf("main/fs-abc"), { served: 1024, expected: 4096 });
+      // Of another workspace: nothing.
+      assert.equal(proxy.readingOf("main/fs-other"), null);
+      // Served the rest: done reading.
+      assert.equal(refusal(yield* Effect.promise(() => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, range: "bytes=1024-4095" }))), "206 ");
+      yield* sleep(50);
+      assert.equal(proxy.readingOf("main/fs-abc"), null);
+      // Another restore of it, reading, then revoked: nothing.
+      const again = minted(proxy);
+      proxy.expect(again.accessKeyId, null);
+      assert.deepEqual(proxy.readingOf("main/fs-abc"), { served: 0, expected: null });
+      proxy.revoke("main/fs-abc");
+      assert.equal(proxy.readingOf("main/fs-abc"), null);
+    }), { quietMs: 100 }));
+
+test("how far a restore has read counts the bytes of a pages file as they are handed its gofer, before its answer ends, so that a slow read shows as it goes", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const big = `${PREFIX}${"c".repeat(64)}/pages.img`;
+      const size = 32 * 1024 ** 2;
+      s3.objects.set(big, Buffer.alloc(size, 9));
+      const token = minted(proxy);
+      proxy.resumed("main/fs-abc", 60_000);
+      proxy.expect(token.accessKeyId, size);
+      // A read whose client takes its first part, then no more, as a gofer on a slow connection: under way.
+      const url = new URL(proxy.endpoint);
+      const headers: Record<string, string> = { host: url.host, "x-amz-date": amzDate(new Date()), "x-amz-content-sha256": EMPTY };
+      headers["authorization"] = sigV4Authorization({ method: "GET", path: `/snapshots/${big}`, query: {}, headers: { ...headers }, payloadHash: EMPTY }, { region: "us-east-1", service: "s3" }, token);
+      const asked = httpRequest({ host: url.hostname, port: url.port, path: `/snapshots/${big}`, headers });
+      const ended = new Promise<boolean>((resolve) => {
+        asked.once("response", (response) => {
+          response.once("data", () => response.pause());
+          response.once("end", () => resolve(true));
+          response.once("close", () => resolve(false));
+        });
+        asked.once("error", () => resolve(false));
+      });
+      asked.end();
+      const served = yield* Effect.sync(() => proxy.readingOf("main/fs-abc")?.served ?? 0).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("20 millis"), until: (bytes) => bytes > 0 }),
+        Effect.timeout("10 seconds"),
+      );
+      assert.ok(served > 0 && served < size, `${served} bytes served of ${size}`);
+      assert.equal(proxy.readingOf("main/fs-abc")?.expected, size);
+      // Ended short, what it gave counted once, as served.
+      asked.destroy();
+      assert.equal(yield* Effect.promise(() => ended), false);
+      yield* sleep(100);
+      const after = proxy.readingOf("main/fs-abc")?.served ?? 0;
+      assert.ok(after >= served && after < size, `${after} bytes served once it ended`);
+    })));
 
 test("what the proxy is told of a restore's bytes is of the token it names, never of a later token of the same workspace", () =>
   withProxy(({ proxy }) =>

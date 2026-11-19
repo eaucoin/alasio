@@ -35,6 +35,7 @@ import {
   CPU_FEATURES_CONTAINER,
   GVISOR_RELEASE_VARIABLE,
   GVISOR_RELEASES,
+  LOADING_STALL_SECONDS_VARIABLE,
   META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
@@ -49,7 +50,7 @@ import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { sessionsNamespace } from "./alasio.ts";
 import { componentName, given, imagePullSecrets, labels, MAIN_ENVIRONMENT, NAMESPACE, otelEnv, selectorLabels, TINI_SUBREAPER } from "./common.ts";
-import type { InstallConfig } from "./config.ts";
+import { durationSeconds, type InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { WORKSPACE_QUOTAS } from "./workspace-storage.ts";
@@ -154,6 +155,8 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: GVISOR_RELEASE_VARIABLE, value: currentGvisorRelease() },
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
+              // How long a release's save of a sandbox its restore from the bucket still reads may see no byte of it served (src/node-agent/agent.ts).
+              { name: LOADING_STALL_SECONDS_VARIABLE, value: String(durationSeconds(sessions.snapshots.loadingStallWait) ?? 0) },
               // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.
               { name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),

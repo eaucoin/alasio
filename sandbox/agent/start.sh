@@ -30,7 +30,7 @@ mkdir -p "$HOME/.local/share/bayma"
 ln -sfn /opt/bayma-data/bayma/toolbelt "$HOME/.local/share/bayma/toolbelt"
 cd "$workspace"
 # bayma's hook, as gVisor runs it to ready the sandbox for a save, or to go on after one
-# taken live, has 30 s (src/node-agent/agent.ts SAVE_HOOK_SECONDS), past which it is killed
+# taken live, has 30 s (src/node-agent/names.ts SAVE_HOOK_SECONDS), past which it is killed
 # and the save fails. runsc's own bound is a restore's, as long as a restore's start may
 # take while its pages are read lazily, which runsc keeps with the sandbox from its save.
 case "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE:-}" in

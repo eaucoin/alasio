@@ -15,11 +15,11 @@
  * at least ASKED_WINDOW_MS from then, so that a bucket away for a while delays the restore's
  * reads, which its gofer retries, rather than ending its token under them; never past
  * RESUMED_CEILING_MS from its resume. It is revoked before as the workspace's restore is done
- * with (revoke). A request the proxy takes is a GET of an object under that restore's layers
- * prefix, in the snapshots bucket, signed by its token, as the official signer
- * (@smithy/signature-v4) signs it, within SKEW_MS of now, its host, its date, its payload's
- * hash, its range and every header of Amazon's it sends among what it signs, for the
- * bucket's region and S3. Anything else is refused, as S3 refuses it. What it takes, it asks
+ * with, or as a release's save of its sandbox has waited on its reads too long (revoke). A
+ * request the proxy takes is a GET of an object under that restore's layers prefix, in the
+ * snapshots bucket, signed by its token, as the official signer (@smithy/signature-v4) signs
+ * it, within SKEW_MS of now, its host, its date, its payload's hash, its range and every header
+ * of Amazon's it sends among what it signs, for the bucket's region and S3. Anything else is refused, as S3 refuses it. What it takes, it asks
  * of the bucket again, signed with the agent's own credentials, and streams the answer back
  * as the bucket gives it, its status and its body, a request its client ends ending the
  * bucket's too.
@@ -129,6 +129,13 @@ export interface StoreProxy {
    * its reads are quiet; or its token is gone, revoked as its restore ended, or past its time.
    */
   readonly readsDone: (accessKeyId: string) => Effect.Effect<void>;
+  /**
+   * How far the restore `holder` names has read through the proxy, while it reads still, as
+   * readsDone tells: the bytes of pages it was served, those of its answers under way among
+   * them as they are handed its gofer, so that a slow read shows as it goes; and those it reads
+   * (expect); null where it holds no token, or is done reading.
+   */
+  readonly readingOf: (holder: string) => { readonly served: number; readonly expected: number | null } | null;
 }
 
 /** The proxy could not listen where it was told. */
@@ -248,6 +255,8 @@ interface HeldToken {
   readonly served: Map<string, [number, number][]>;
   /** How many bytes those ranges hold, together. */
   servedBytes: number;
+  /** How many bytes of pages files its answers under way have handed its gofer so far, which their ranges count once they end. */
+  streaming: number;
   /** Whether it has been served every byte it was expected to, as the proxy logs once. */
   servedAll: boolean;
 }
@@ -286,7 +295,7 @@ function tokensKept(file: string, now: number, askedWindowMs: number): { readonl
   return {
     tokens: new Map(decoded.value.tokens.flatMap(({ accessKeyId, ...token }) => {
       const until = token.resumed && now < token.ceiling ? Math.max(token.until, Math.min(token.ceiling, now + askedWindowMs)) : token.until;
-      return until > now ? [[accessKeyId, { ...token, until, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false }] as const] : [];
+      return until > now ? [[accessKeyId, { ...token, until, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, streaming: 0, servedAll: false }] as const] : [];
     })),
   };
 }
@@ -508,7 +517,8 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       if (token.resumed) asked(token);
       // Under way until its answer ends, however it ends; the bytes of a pages file it gave
       // counted as served then, from where the bucket said they begin, however much of it was
-      // given, as its gofer asks again for the rest alone.
+      // given, as its gofer asks again for the rest alone; and, as they are given, as streaming,
+      // which readingOf tells as they come.
       token.under += 1;
       token.lastAt = Date.now();
       let start: number | null = null;
@@ -516,12 +526,14 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       response.once("close", () => {
         token.under -= 1;
         token.lastAt = Date.now();
+        if (start !== null) token.streaming -= given;
         if (start !== null && given > 0) served(token, key, start, start + given);
       });
       await forward(request, response, path, query, (from) => {
         start = isPagesFile(key) ? from : null;
       }, (bytes) => {
         given += bytes;
+        if (start !== null) token.streaming += bytes;
       });
     })().catch((error: unknown) => {
       if (response.headersSent) response.destroy();
@@ -612,7 +624,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
       const accessKeyId = `ALASIO${randomBytes(10).toString("hex").toUpperCase()}`;
       const secretAccessKey = randomBytes(32).toString("base64url");
       const now = Date.now();
-      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, transport, until: now + preparedForMs, resumed: false, ceiling: now + preparedForMs, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, servedAll: false });
+      tokens.set(accessKeyId, { secretAccessKey, prefix, holder, transport, until: now + preparedForMs, resumed: false, ceiling: now + preparedForMs, under: 0, lastAt: now, expected: null, served: new Map(), servedBytes: 0, streaming: 0, servedAll: false });
       held.set(holder, accessKeyId);
       keep();
       return { accessKeyId, secretAccessKey };
@@ -652,5 +664,11 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
         Effect.repeat({ schedule: Schedule.spaced(READS_POLL), until: (done) => done }),
         Effect.asVoid,
       ),
+    readingOf: (holder) => {
+      const accessKeyId = held.get(holder);
+      const token = tokens.get(accessKeyId ?? "");
+      if (accessKeyId === undefined || token === undefined || doneReading(accessKeyId)) return null;
+      return { served: token.servedBytes + token.streaming, expected: token.expected };
+    },
   };
 });
