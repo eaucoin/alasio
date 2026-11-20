@@ -8,7 +8,10 @@
  * most once every `idlePollMs` a pod, and not before it could be idle for long enough, as the
  * last exec it ran, its binding's Lease's active stamp (written as the Lease names its pod, and
  * as requests of it come), and its pod's making say (lingered, which whatever else binds through
- * the binder asks its pods by too).
+ * the binder asks its pods by too). A bayma that has not answered for `releaseAfterMs`, as one
+ * stuck on pages its sandbox cannot load hangs, is idle as the binding's Lease and its pod's
+ * making say alone: the front stamps the Lease as it relays each request of it, so one no
+ * request has come to for as long is released, and one its caller still asks of is not.
  */
 import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect, Schema } from "effect";
@@ -56,22 +59,42 @@ export interface BaymaIdlenessOptions {
   readonly bindingKey: Buffer;
 }
 
-/** Whether the binding `lease`, of its pod `pod`, is idle at `now`, as its bayma says, as the module says. */
-export const baymaIdleness = ({ podPort, releaseAfterMs, idlePollMs = IDLE_POLL_MS, bindingKey }: BaymaIdlenessOptions) =>
-(lease: BindingLease, pod: V1Pod | null, now: number): Effect.Effect<Idleness> =>
-  Effect.gen(function*() {
-    const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
-    const address = pod?.status?.podIP;
-    if (!address) return notIdle(now, idlePollMs);
-    const token = bindingToken(bindingKey, { key, binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });
-    const status = yield* Effect.tryPromise(async (signal) => {
-      const response = await fetch(`http://${address}:${podPort}/status`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(STATUS_TIMEOUT_MS)]) });
-      if (!response.ok) throw new Error(`it answered ${response.status}`);
-      return await response.text();
-    }).pipe(Effect.flatMap((text) => Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text)), Effect.option);
-    if (status._tag === "None" || status.value.execsRunning > 0 || status.value.execsQueued > 0 || status.value.idleSinceMs === null) return notIdle(now, idlePollMs);
-    return lingered(status.value.idleSinceMs, lease, pod, now, { releaseAfterMs, idlePollMs });
-  });
+/**
+ * Whether the binding `lease`, of its pod `pod`, is idle at `now`, as its bayma says, or, where
+ * it has not answered for `releaseAfterMs`, as its Lease and its pod's making say, as the module
+ * says.
+ */
+export const baymaIdleness = ({ podPort, releaseAfterMs, idlePollMs = IDLE_POLL_MS, bindingKey }: BaymaIdlenessOptions) => {
+  /** Since when each binding's bayma has not answered, and when it was last asked, by its Lease's uid, while it does not. */
+  const unanswered = new Map<string, { readonly since: number; readonly asked: number }>();
+  return (lease: BindingLease, pod: V1Pod | null, now: number): Effect.Effect<Idleness> =>
+    Effect.gen(function*() {
+      // Of a binding not asked of for twice as long as one that does not answer waits to be asked again, let go meanwhile
+      // (by another replica, or its caller), nothing more.
+      for (const [binding, { asked }] of unanswered) if (now - asked > 2 * (releaseAfterMs + idlePollMs)) unanswered.delete(binding);
+      const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
+      const binding = lease.metadata?.uid ?? "";
+      const address = pod?.status?.podIP;
+      if (!address) return notIdle(now, idlePollMs);
+      const token = bindingToken(bindingKey, { key, binding, namespace: lease.metadata?.namespace ?? "" });
+      const status = yield* Effect.tryPromise(async (signal) => {
+        const response = await fetch(`http://${address}:${podPort}/status`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(STATUS_TIMEOUT_MS)]) });
+        if (!response.ok) throw new Error(`it answered ${response.status}`);
+        return await response.text();
+      }).pipe(Effect.flatMap((text) => Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text)), Effect.option);
+      if (status._tag === "None") {
+        const since = unanswered.get(binding)?.since ?? now;
+        unanswered.set(binding, { since, asked: now });
+        if (now - since < releaseAfterMs) return notIdle(now, idlePollMs);
+        const idle = lingered(0, lease, pod, now, { releaseAfterMs, idlePollMs });
+        if (idle.idle) unanswered.delete(binding);
+        return idle;
+      }
+      unanswered.delete(binding);
+      if (status.value.execsRunning > 0 || status.value.execsQueued > 0 || status.value.idleSinceMs === null) return notIdle(now, idlePollMs);
+      return lingered(status.value.idleSinceMs, lease, pod, now, { releaseAfterMs, idlePollMs });
+    });
+};
 
 /** What makeSweep is given: the pools there are now, how a bound pod is found idle, and how a binding is released, and how that went. */
 export interface SweepOptions<E> {
