@@ -2236,23 +2236,39 @@ test("whether a release's save of a sandbox still loading has its restore's toke
 test("a release's save whose restore's reads paused for less than the stall window, then went on at a rate that serves the rest in time, has nothing revoked, its recent window from the pause's end, though its rate since the save started misses", () => {
   const MiB = 1024 ** 2;
   const timings = { floorMs: 60_000, stallMs: 90_000, latestMs: 600_000 };
-  // Looked at every 5 s: nothing served for 50 s, then 4 MiB/s, 600 MiB left at 60 s.
-  const seen = [...Array.from({ length: 11 }, (_, index) => ({ at: index * 5_000, served: 0 })), { at: 55_000, served: 20 * MiB }, { at: 60_000, served: 40 * MiB }];
+  // Looked at every 5 s: nothing served for 50 s, then 4 MiB/s for 35 s, 1000 MiB left at 85 s.
+  const paused = Array.from({ length: 11 }, (_, index) => ({ at: index * 5_000, served: 0 }));
+  const seen = [...paused, ...Array.from({ length: 7 }, (_, index) => ({ at: 55_000 + index * 5_000, served: (index + 1) * 20 * MiB }))];
   const recent = recentReads(seen, timings.stallMs);
   assert.deepEqual(recent, { at: 50_000, served: 0 });
-  const save = { askedAt: 0, startedAt: 0, now: 60_000, movedAt: 60_000, servedAtStart: 0, served: 40 * MiB, expected: 640 * MiB, recentFrom: recent.at, servedAtRecentFrom: recent.served };
-  // It ends at some 210 s, within the 600 s: nothing.
+  const save = { askedAt: 0, startedAt: 0, now: 85_000, movedAt: 85_000, servedAtStart: 0, served: 140 * MiB, expected: 1140 * MiB, recentFrom: recent.at, servedAtRecentFrom: recent.served };
+  // It ends at some 335 s, within the 600 s: nothing.
   assert.equal(loadingSaveRevocation(save, timings), null);
-  // By its rate since the save started alone, 0.67 MiB/s, it would end past them.
-  assert.match(loadingSaveRevocation({ ...save, recentFrom: 0, servedAtRecentFrom: 0 }, timings) ?? "", /^its 629145600 bytes of pages left would be served only past the 540 s /u);
+  // By its rate since the save started alone, 1.65 MiB/s, it would end past them.
+  assert.match(loadingSaveRevocation({ ...save, recentFrom: 0, servedAtRecentFrom: 0 }, timings) ?? "", /^its 1048576000 bytes of pages left would be served only past the 515 s /u);
   // Gone on as slowly as before the pause, 0.2 MiB/s: revoked.
-  const slow = [...seen.slice(0, 11), { at: 55_000, served: MiB }, { at: 60_000, served: 2 * MiB }];
+  const slow = [...paused, ...Array.from({ length: 7 }, (_, index) => ({ at: 55_000 + index * 5_000, served: index + 1 }))].map(({ at, served }) => ({ at, served: served * MiB }));
   const slowly = recentReads(slow, timings.stallMs);
-  assert.match(loadingSaveRevocation({ ...save, served: 2 * MiB, expected: 602 * MiB, recentFrom: slowly.at, servedAtRecentFrom: slowly.served }, timings) ?? "", /of the last 10 s$/u);
+  assert.match(loadingSaveRevocation({ ...save, served: 7 * MiB, expected: 1007 * MiB, recentFrom: slowly.at, servedAtRecentFrom: slowly.served }, timings) ?? "", /of the last 35 s$/u);
   // The recent window no further back than the stall window, and none at all where the last look saw nothing more.
   const steady = Array.from({ length: 30 }, (_, index) => ({ at: index * 5_000, served: index * MiB }));
   assert.deepEqual(recentReads(steady, timings.stallMs), { at: 55_000, served: 11 * MiB });
   assert.deepEqual(recentReads([...steady, { at: 150_000, served: 29 * MiB }], timings.stallMs), { at: 150_000, served: 29 * MiB });
+});
+
+test("a release's save whose restore is served in bursts, a look's worth after each look that found nothing more, is measured over a third of the stall window at least, so the burst after its last pause does not hold off the rate rule", () => {
+  const MiB = 1024 ** 2;
+  const timings = { floorMs: 60_000, stallMs: 90_000, latestMs: 600_000 };
+  // Looked at every 5 s: 10 MiB served at every other look, 1 MiB/s in all, 2 MiB/s over the last look alone; 640 MiB left at 60 s.
+  const seen = Array.from({ length: 13 }, (_, index) => ({ at: index * 5_000, served: Math.floor(index / 2) * 10 * MiB }));
+  const recent = recentReads(seen, timings.stallMs);
+  assert.deepEqual(recent, { at: 30_000, served: 30 * MiB });
+  const save = { askedAt: 0, startedAt: 0, now: 60_000, movedAt: 60_000, servedAtStart: 0, served: 60 * MiB, expected: 700 * MiB, recentFrom: recent.at, servedAtRecentFrom: recent.served };
+  assert.match(loadingSaveRevocation(save, timings) ?? "", /in 640 s at the 1048576 bytes a second of the last 30 s$/u);
+  // Measured from its last pause's end alone, the one look's burst, it would have been held off.
+  assert.equal(loadingSaveRevocation({ ...save, recentFrom: 55_000, servedAtRecentFrom: 50 * MiB }, timings), null);
+  // Before a third of the stall window has passed, the window is all the looks there are.
+  assert.deepEqual(recentReads(seen.slice(0, 5), timings.stallMs), { at: 0, served: 0 });
 });
 
 test("a release's save of a sandbox whose restore from the bucket reads it still has that restore's token revoked, said why, once it has run its floor from as runsc's save started and no byte of the restore's pages has been served for its stall window, or they come too slowly to end in time, so its loading fails and the save with it; one served steadily, one that ends first, and one of a sandbox done reading revoke nothing", () =>
@@ -2348,7 +2364,7 @@ test("a release's save of a sandbox whose restore from the bucket reads it still
       assert.match(failure(yield* released(tight)), /can be saved no more/u);
       assert.ok(times.ended - times.started >= 1000, `revoked ${times.ended - times.started} ms after runsc's save started`);
       assert.equal(revoked().length, 1);
-      assert.match(revoked()[0] ?? "", /, as its \d+ bytes of pages left would be served only past the \d s its release's save may wait on them still: in \d+ s at the \d+ bytes a second served since the save started 1 s ago, in \d+ s at the \d+ bytes a second of the last 1 s, \d+ of 45056 bytes of its pages served: /u);
+      assert.match(revoked()[0] ?? "", /, as its \d+ bytes of pages left would be served only past the \d s its release's save may wait on them still: in \d+ s at the \d+ bytes a second served since the save started 1 s ago, in \d+ s at the \d+ bytes a second of the last \d+ s, \d+ of 45056 bytes of its pages served: /u);
 
       // One that ends before its floor: its restore's token held as it saves, then ended with its sandbox, as a release's
       // is, and nothing revoked past it.

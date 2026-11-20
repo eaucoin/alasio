@@ -514,11 +514,20 @@ export interface ReadsSeen {
 }
 
 /**
- * The window a restore's recent rate is measured over, of `seen`, its looks in order, the first
- * as its save started: from its last pause's end, the last look that found no more served than
- * the one before, and no further back than the last look at or before `stallMs` before the
- * last; the look it begins at, when and what it saw. The last look finding no more served, it
- * is that look alone, empty.
+ * The share of the stall window a restore's recent window spans at least once its reads have
+ * gone on after a pause (recentReads): a third, 30 s of 90 s, so that the burst one look finds
+ * after a short pause is not taken for the rate of a store that serves in bursts, which would
+ * hold the rate rule off for as long as it keeps pausing.
+ */
+const RECENT_LEAST_SHARE = 1 / 3;
+
+/**
+ * Where the window a restore's recent rate is measured over begins, of `seen`, its looks in
+ * order, the first as its save started: the look it begins at. It begins as its last pause
+ * ended, at the last look that found no more served than the one before, but no further back
+ * than the last look `stallMs` or more before the last, nor later than the last look a third
+ * of that (RECENT_LEAST_SHARE) or more before the last, or the first. Where the last look
+ * found no more served, the window is that look alone, empty: a pause is the stall rule's.
  */
 export function recentReads(seen: readonly ReadsSeen[], stallMs: number): ReadsSeen {
   const first = seen[0];
@@ -531,8 +540,11 @@ export function recentReads(seen: readonly ReadsSeen[], stallMs: number): ReadsS
       break;
     }
   }
+  if (resumed === last) return last;
   const windowed = seen.findLast((look) => look.at <= last.at - stallMs);
-  return windowed !== undefined && windowed.at > resumed.at ? windowed : resumed;
+  const begins = windowed !== undefined && windowed.at > resumed.at ? windowed : resumed;
+  const least = seen.findLast((look) => look.at <= last.at - stallMs * RECENT_LEAST_SHARE) ?? first;
+  return begins.at > least.at ? least : begins;
 }
 
 /**
