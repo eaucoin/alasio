@@ -137,6 +137,23 @@ describe("claude transcripts against the store", () => {
     );
   });
 
+  test("a reconcile reads each line of a transcript, ended by a carriage return and a line feed or by its file's end too, and leaves blank lines and a torn last one", async () => {
+    const store = await makeStore();
+    const dir = join(home, "work");
+    const sessionId = randomUUID();
+    const stored = message("11111111-1111-4111-8111-111111111111", "one");
+    const { projectKey, main } = writeLocal(dir, sessionId, [stored]);
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] }));
+    const lines = (...entries: SessionStoreEntry[]) => entries.map((entry) => JSON.stringify(entry));
+    const [crlf, unterminated] = lines(message("22222222-2222-4222-8222-222222222222", "two"), message("33333333-3333-4333-8333-333333333333", "three"));
+    writeFileSync(main, `${lines(stored)[0]}\n\n${crlf}\r\n   \n${unterminated}`);
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] }));
+    // And, written past it, a line a crash tore.
+    writeFileSync(main, `${lines(stored)[0]}\n${crlf}\r\n${unterminated}\n{"type":"user","uuid":"44444444`);
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] }));
+    assert.deepEqual((await store.load({ projectKey, sessionId }))?.map((e) => e.uuid), ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"]);
+  });
+
   test("a transcript several times the size of the heap is reconciled a line at a time, holding what it matches by and a batch alone", async () => {
     const schema = `transcripts_${process.pid}_${++schemas}`;
     const store = await makeStore(schema);
@@ -149,7 +166,9 @@ describe("claude transcripts against the store", () => {
     const turn = (n: number) => message(`00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, `${n} `.padEnd(64 * 1024, "x"));
     const prompt = (n: number) => ({ type: "last-prompt", lastPrompt: `prompt ${n}`, sessionId });
     const turns = Array.from({ length: 4096 }, (_, n) => n);
-    await store.append(key, turns.flatMap((n) => [{ ...turn(n), message: { role: "user", content: "brief" } }, prompt(n)]));
+    // The first megabyte of turns not stored, so they are appended as the rest is read.
+    const unstored = 16;
+    await store.append(key, turns.flatMap((n) => [...(n < unstored ? [] : [{ ...turn(n), message: { role: "user", content: "brief" } }]), prompt(n)]));
     const file = openSync(main, "w");
     for (const n of turns) writeSync(file, `${JSON.stringify(turn(n))}\n${JSON.stringify(prompt(n))}\n`);
     // And what the mirror dropped.
@@ -165,6 +184,9 @@ describe("claude transcripts against the store", () => {
       `import { adoptTranscripts } from ${JSON.stringify(new URL("../src/harness/claude/transcripts.ts", import.meta.url).href)};`,
       `const pool = new pg.Pool({ connectionString: ${JSON.stringify(database?.url)} });`,
       `const store = new NeonSessionStore(pool, { schema: ${JSON.stringify(schema)} });`,
+      // Each append answered a second late, as a busy database answers, the transcript not read on meanwhile.
+      "const append = store.append.bind(store);",
+      "store.append = async (...appended) => { await new Promise((resolve) => setTimeout(resolve, 1000)); return append(...appended); };",
       `await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId: ${JSON.stringify(sessionId)}, workingDirectory: ${JSON.stringify(dir)} }] }));`,
       "await pool.end();",
     ].join("\n");
@@ -172,7 +194,7 @@ describe("claude transcripts against the store", () => {
 
     const stored = (await store.load(key)) ?? [];
     assert.equal(stored.length, 2 * turns.length + 2);
-    assert.deepEqual(stored.slice(-2).map((e) => e.uuid ?? e.type), ["99999999-9999-4999-8999-999999999999", "cost-state"]);
+    assert.deepEqual(stored.slice(-unstored - 2).map((e) => e.uuid ?? e.type), [...turns.slice(0, unstored).map((n) => turn(n).uuid), "99999999-9999-4999-8999-999999999999", "cost-state"]);
   });
 
   test("a session with no local transcript is left to the store", async () => {

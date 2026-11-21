@@ -17,7 +17,6 @@ import { importSessionToStore, type SessionKey, type SessionStoreEntry } from "@
 import { createReadStream, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { createInterface } from "node:readline";
 import { Effect, Schema } from "effect";
 
 import { withLogScope } from "../../shared/log.ts";
@@ -134,20 +133,36 @@ export const ensureLocalTranscript = Effect.fnUntraced(function*(
 
 /**
  * A local transcript's entries, each line as Claude Code wrote it, with its length: read a
- * line at a time, as a long session's transcript runs to hundreds of MB.
+ * line at a time, as a long session's transcript runs to hundreds of MB, and a chunk of the
+ * file read only once the lines of the one before have been taken. Not through readline,
+ * whose lines read ahead of a consumer that waits, as one appending to the store does, until
+ * a thousand of them are held: of a tool's output, tens of MB.
  */
 async function* readJsonl(path: string): AsyncGenerator<{ readonly entry: SessionStoreEntry; readonly length: number }> {
-  for await (const line of createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity })) {
-    if (!line.trim()) continue;
-    let entry: SessionStoreEntry;
+  const parsed = (line: string): { readonly entry: SessionStoreEntry; readonly length: number } | null => {
+    if (!line.trim()) return null;
     try {
-      entry = JSON.parse(line);
+      return { entry: JSON.parse(line), length: line.length };
     } catch {
       // A torn last line from a crash: Claude Code ignores it too.
-      continue;
+      return null;
     }
-    yield { entry, length: line.length };
+  };
+  // The line read so far, of the chunks it spans.
+  let pieces: string[] = [];
+  for await (const chunk of createReadStream(path, { encoding: "utf8" }) as AsyncIterable<string>) {
+    let start = 0;
+    for (let end = chunk.indexOf("\n"); end !== -1; end = chunk.indexOf("\n", start)) {
+      pieces.push(chunk.slice(start, end));
+      const line = parsed(pieces.join(""));
+      pieces = [];
+      start = end + 1;
+      if (line) yield line;
+    }
+    if (start < chunk.length) pieces.push(chunk.slice(start));
   }
+  const last = parsed(pieces.join(""));
+  if (last) yield last;
 }
 
 /** Where a session's local transcript lives: its project directory, if any. */
