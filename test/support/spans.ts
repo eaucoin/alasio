@@ -26,6 +26,15 @@ export function endedSpan(name: string): ReadableSpan {
   return span;
 }
 
+/** The first span named `name` to end once `since` spans had ended, as it ends, within ten seconds: of work that runs on in the background. */
+export async function endedLater(name: string, since: number): Promise<ReadableSpan> {
+  for (const deadline = Date.now() + 10_000;; await new Promise((resolve) => setTimeout(resolve, 10))) {
+    const span = ended().slice(since).find((each) => each.name === name);
+    if (span !== undefined) return span;
+    if (Date.now() >= deadline) throw new Error(`no span ${name} ended within ten seconds`);
+  }
+}
+
 /** The spans that ended whose parent is `parent`, in the order they began. */
 export const childrenOf = (parent: ReadableSpan): readonly ReadableSpan[] =>
   ended()

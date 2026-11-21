@@ -68,3 +68,26 @@ test("what pauses is told to as the first restore begins loading, at once where 
       assert.deepEqual(late, [true, false]);
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   ));
+
+test("a restore's load, as it ends, tells how long work yielded to restores while it loaded, paused or waiting for quiet, to it or to another beside it; and none of one that does not load", () =>
+  Effect.runPromise(
+    Effect.gen(function*() {
+      const loading = yield* makeLoading;
+      yield* loading.begin("main/fs-a", 60_000);
+      // Nothing yields for a second, then something is paused for two.
+      yield* TestClock.adjust("1 second");
+      const stop = loading.pausing(() => {});
+      yield* TestClock.adjust("2 seconds");
+      stop();
+      // Then something waits for quiet, three seconds as fs-a loads, and one more as fs-b, begun after, does alone.
+      const waiting = yield* Effect.forkChild(loading.quiet);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("3 seconds");
+      yield* loading.begin("main/fs-b", 60_000);
+      assert.equal(yield* loading.end("main/fs-a"), 5_000);
+      yield* TestClock.adjust("1 second");
+      assert.equal(yield* loading.end("main/fs-b"), 1_000);
+      yield* Fiber.join(waiting);
+      assert.equal(yield* loading.end("main/fs-b"), null);
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  ));

@@ -18,12 +18,13 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
+import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Queue, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
 import { added, collected } from "./support/metrics.ts";
-import { descendsFrom, endedNamed, endedSpan } from "./support/spans.ts";
+import { childrenOf, descendsFrom, ended, endedLater, endedNamed, endedSpan } from "./support/spans.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
 import {
@@ -851,6 +852,87 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
       })
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=compacted": 1 })));
+
+/** The names of `spans`, in their order. */
+const namesOf = (spans: readonly ReadableSpan[]): string[] => spans.map(({ name }) => name);
+
+test("a checkpoint is traced step by step: its wait for the workspace, runsc's save and the pause it took, its image's inspection and layers, its cache, its files' digests, each file's upload, what it refers to looked at in the bucket, runsc's verification beside, and the commit that makes it durable", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const manifest = yield* here.agent.checkpoint(request("fs-abc"));
+      const steps = childrenOf(endedSpan("alasio.node_agent.checkpoint"));
+      const step = (name: string) => steps.find((span) => span.name === `alasio.node_agent.checkpoint.${name}`);
+      // Verified as it is uploaded, beside it.
+      assert.deepEqual(namesOf(steps).filter((name) => name !== "alasio.node_agent.checkpoint.verify"), ["lock", "runsc", "inspect", "layers", "cache", "digest", "upload", "heads", "commit"].map((name) => `alasio.node_agent.checkpoint.${name}`));
+      assert.ok(step("verify"));
+      assert.ok(steps.every((span) => span.attributes["alasio.sandbox.name"] === "fs-abc"));
+      assert.equal(step("runsc")?.attributes["alasio.snapshot.pause_ms"], manifest.pauseMs);
+      const upload = step("upload");
+      assert.ok(upload);
+      const [image] = manifest.layers;
+      assert.deepEqual(
+        childrenOf(upload).map((span) => [span.name, span.attributes["alasio.snapshot.file"], span.attributes["alasio.snapshot.bytes"]]),
+        image?.files.map(({ path, bytes }) => ["alasio.node_agent.checkpoint.upload.put", path, bytes]),
+      );
+    }).pipe(Effect.provide(TracingLayer))
+  ));
+
+test("a restore's prepare and resume are traced step by step, from the node's cache or from the bucket; the load its resume leaves under way, and the fetch into the cache its prepare leaves for after it, each a trace of its own linked to theirs", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      yield* taker.agent.checkpoint(request("fs-abc"));
+      // From the cache of the node that took it.
+      yield* preparing(taker.agent, workspace);
+      const prepareSteps = (names: readonly string[]) => names.map((name) => `alasio.node_agent.prepare.${name}`);
+      assert.deepEqual(namesOf(childrenOf(endedSpan("alasio.node_agent.prepare"))), prepareSteps(["lock", "intact", "cache", "verify"]));
+      // From the bucket, on another node, then resumed there.
+      const there = yield* node("node-2");
+      const { manifest } = yield* preparing(there.agent, workspace);
+      const prepare = endedSpan("alasio.node_agent.prepare");
+      assert.deepEqual(namesOf(childrenOf(prepare)), prepareSteps(["lock", "intact", "heads", "token", "gofer"]));
+      const since = ended().length;
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      const resume = endedSpan("alasio.node_agent.resume");
+      const resumeSteps = childrenOf(resume);
+      assert.deepEqual(namesOf(resumeSteps), ["pod_running", "policies", "containers", "conntrack", "runsc", "accepting"].map((name) => `alasio.node_agent.resume.${name}`));
+      assert.equal(resumeSteps[1]?.attributes["alasio.resume.policy_wait_ms"], resume.attributes["alasio.resume.policy_wait_ms"]);
+      const loading = yield* Effect.promise(() => endedLater("alasio.node_agent.loading", since));
+      assert.deepEqual([loading.parentSpanContext, loading.links.map(({ context }) => context.spanId)], [undefined, [resume.spanContext().spanId]]);
+      assert.equal(typeof loading.attributes["alasio.loading.yield_ms"], "number");
+      yield* fetched(there, manifest);
+      const fetch = yield* Effect.promise(() => endedLater("alasio.node_agent.fetch", since));
+      assert.deepEqual([fetch.parentSpanContext, fetch.links.map(({ context }) => context.spanId)], [undefined, [prepare.spanContext().spanId]]);
+    }).pipe(Effect.provide(TracingLayer))
+  ));
+
+test("a compaction is a trace of its own, linked to the checkpoint's it runs after, traced step by step: runsc's compaction, its image's inspection, its upload, file by file, and its commit", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      yield* taker.agent.checkpoint(request("fs-abc"));
+      const there = yield* node("node-2");
+      const { manifest } = yield* preparing(there.agent, workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* fetched(there, manifest);
+      // The sandbox wrote over as much as its base holds: its chain is due.
+      writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
+      const since = ended().length;
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      const checkpoint = endedSpan("alasio.node_agent.checkpoint");
+      yield* compactedFrom(there.agent, delta.snapshot);
+      const compaction = yield* Effect.promise(() => endedLater("alasio.node_agent.compaction", since));
+      assert.deepEqual([compaction.parentSpanContext, compaction.links.map(({ context }) => context.spanId)], [undefined, [checkpoint.spanContext().spanId]]);
+      const steps = childrenOf(compaction);
+      assert.deepEqual(namesOf(steps), ["compact", "inspect", "upload", "commit"].map((name) => `alasio.node_agent.compaction.${name}`));
+      const upload = steps[2];
+      assert.ok(upload && childrenOf(upload).length > 0 && childrenOf(upload).every(({ name }) => name === "alasio.node_agent.compaction.upload.put"));
+    }).pipe(Effect.provide(TracingLayer))
+  ));
 
 test("a spend of a snapshot spends the one compacted from it, which a compaction committed as its restore ran, and a collection keeps what it holds while the compacted one is the latest", () =>
   withBucket(({ s3, node }) =>

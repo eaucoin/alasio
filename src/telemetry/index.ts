@@ -78,8 +78,13 @@ export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = Layer.effect(Tra
 export interface AlasioSpanOptions {
   readonly kind?: SpanKind;
   readonly attributes?: Attributes;
-  /** A traceparent to continue, or null to start a trace of its own; the active span when absent. */
-  readonly parent?: string | null | undefined;
+  /**
+   * A trace to continue, its traceparent or the W3C trace context it is with its tracestate,
+   * or null to start a trace of its own; the active span when absent.
+   */
+  readonly parent?: string | TraceCarrier | null | undefined;
+  /** The spans it is linked to, by their traceparents: those of the work it was begun by, which it outlives. */
+  readonly links?: readonly string[] | undefined;
 }
 
 /** A call withRpcCall records. */
@@ -104,9 +109,18 @@ const rpcDuration = meter.createHistogram("rpc.client.call.duration", {
   unit: "s",
 });
 
-/** The context a traceparent continues, or the root context for none. */
-function contextOf(traceparent: string | null): OtelContext {
-  return traceparent ? propagation.extract(ROOT_CONTEXT, { traceparent }) : ROOT_CONTEXT;
+/** The context a trace's traceparent, or its W3C trace context, continues, or the root context for none. */
+function contextOf(trace: string | TraceCarrier | null): OtelContext {
+  if (trace === null) return ROOT_CONTEXT;
+  return propagation.extract(ROOT_CONTEXT, typeof trace === "string" ? { traceparent: trace } : trace);
+}
+
+/** The links to the spans `traceparents` name, as Effect makes them: none of one that names no span. */
+function linksOf(traceparents: readonly string[]): Tracer.SpanLink[] {
+  return traceparents.flatMap((traceparent) => {
+    const linked = trace.getSpanContext(contextOf(traceparent));
+    return linked && isSpanContextValid(linked) ? [{ span: OtelTracer.makeExternalSpan(linked), attributes: {} }] : [];
+  });
 }
 
 /** The `error.type` of what an effect failed with. */
@@ -139,14 +153,14 @@ const labelFailure = <E>(cause: Cause.Cause<E>): Effect.Effect<void> =>
 
 /**
  * `effect` in a span of alasio's: its parent the active span, unless `parent` is given (a
- * traceparent to continue, or null to start a trace of its own), and what it fails with
- * recorded on it and labelling it (`error.type`).
+ * trace to continue, or null to start a trace of its own), linked to the spans `links` name,
+ * and what it fails with recorded on it and labelling it (`error.type`).
  */
-export const withAlasioSpan = (name: string, { kind = SpanKind.INTERNAL, attributes = {}, parent }: AlasioSpanOptions = {}) =>
+export const withAlasioSpan = (name: string, { kind = SpanKind.INTERNAL, attributes = {}, parent, links = [] }: AlasioSpanOptions = {}) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => {
     const spanned = effect.pipe(
       Effect.tapCause(labelFailure),
-      Effect.withSpan(name, { kind: effectSpanKind(kind), attributes, ...(parent === null ? { root: true } : {}) }),
+      Effect.withSpan(name, { kind: effectSpanKind(kind), attributes, links: linksOf(links), ...(parent === null ? { root: true } : {}) }),
     );
     if (parent === null) return spanned;
     // Effect makes a span with no parent of its own a root, so the active span (the
@@ -199,6 +213,26 @@ export function traceCarrier(): TraceCarrier | null {
 export function currentTraceparent(): string | null {
   return traceCarrier()?.traceparent ?? null;
 }
+
+/**
+ * What `hold` comes to, which runs `held` once it holds what it waits for, as a lock: its wait
+ * in a span of alasio's, `name`, under the active span, from its start until `held` begins, or
+ * until it ends without it, as one given up waiting does; `held` runs under the active span.
+ */
+export const withWaitSpan = (name: string, attributes: Attributes = {}) =>
+  <A, E, R, B, F, S>(hold: (held: Effect.Effect<A, E, R>) => Effect.Effect<B, F, S>, held: Effect.Effect<A, E, R>): Effect.Effect<B, F, S> =>
+    Effect.flatMap(Effect.makeSpan(name, { attributes }), (span) => {
+      let ended = false;
+      const end = (exit: Exit.Exit<unknown, unknown>) =>
+        Effect.clockWith((clock) =>
+          Effect.sync(() => {
+            if (ended) return;
+            ended = true;
+            span.end(clock.currentTimeNanosUnsafe(), exit);
+          })
+        );
+      return hold(Effect.andThen(end(Exit.void), held)).pipe(Effect.onExit((exit: Exit.Exit<B, F>) => end(exit)));
+    });
 
 /**
  * `effect` outside every trace, for work that outlives the span it starts in. Its parent
