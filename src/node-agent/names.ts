@@ -289,6 +289,55 @@ export const LOADING_STALL_SECONDS_VARIABLE = "ALASIO_LOADING_STALL_SECONDS";
 export const LOADING_SAVE_TEST_TIMINGS_VARIABLE = "ALASIO_LOADING_SAVE_TEST_TIMINGS";
 
 /**
+ * Whether gVisor's `release` bounds a save's waits for the pages that its sandbox's restore has
+ * not loaded yet (runsc checkpoint --load-wait): for those it saves, and bayma's hook's for those
+ * it touches, past which runsc kills the hook. Past it, the save fails, what it wrote
+ * incomplete, and the sandbox runs on as it was. One at or past `since`, the first release
+ * that does, as cluster/node/pins.json says it (gvisor.savesWithLoadWaitSince) and the
+ * installation gives the node agent it (SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE); none where `since`
+ * names none.
+ */
+export const savesWithLoadWait = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that bounds a save's wait for pages still loading (savesWithLoadWait). */
+export const SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE = "ALASIO_GVISOR_SAVES_WITH_LOAD_WAIT_SINCE";
+
+/**
+ * How long a save, of a release that bounds it (savesWithLoadWait), waits for the pages that its
+ * sandbox's restore from the bucket has not loaded yet (./agent.ts SaveDeferred): those it saves,
+ * and those bayma's hook touches, the hook's own time aside. 5 minutes, well within the
+ * OPERATION_LIMIT_SECONDS alasio waits for it, bayma's hook's time and the upload after included.
+ * A store that comes back within it is waited for; one away for longer defers the save, its
+ * sandbox running on, for the next to take. runsc does not bound writing the save, nor the
+ * hook's time, which its timeout bounds (./agent.ts restoreHookSeconds). A release's save is given
+ * less where that, the hook's own bound (SAVE_HOOK_SECONDS) and LOAD_WAIT_WATCHDOG_MARGIN_SECONDS
+ * would end past the latest it may be bounded as its sandbox loads (LOADING_SAVE_LATEST_SECONDS
+ * from its ask, its wait for the workspace's lock counted), and none where nothing is left
+ * (./agent.ts loadWaitOf).
+ */
+export const SAVE_LOAD_WAIT_SECONDS = 5 * 60;
+
+/**
+ * How long past its load wait (SAVE_LOAD_WAIT_SECONDS) and bayma's hook's own bound
+ * (SAVE_HOOK_SECONDS) a save of a release that bounds its waits may run before the
+ * agent bounds it while its sandbox loads all the same (./agent.ts boundWhileLoading), as a
+ * watchdog should runsc not defer it: a minute, for its pause and the writing of the pages
+ * dirtied since its wait, which runsc does not bound. The load wait is cut so that all of it ends
+ * by LOADING_SAVE_LATEST_SECONDS from the save's ask, which bounds it whatever its floor.
+ */
+export const LOAD_WAIT_WATCHDOG_MARGIN_SECONDS = 60;
+
+/**
+ * How long a workspace's release saves may have been deferred, as their waits for its pages
+ * still loading expired (./agent.ts SaveDeferred), before its next is bounded as one of a release
+ * that does not bound it (boundWhileLoading): an hour. Its restore's token is then revoked once
+ * its reads have stalled, its loading fails and so does the save, and the session comes back
+ * from bayma's checkpoints, as a session whose store stays away must, its node keeping its pod
+ * and memory meanwhile.
+ */
+export const SAVES_DEFERRED_FOR_SECONDS = 60 * 60;
+
+/**
  * How long an agent holds a request for what its node holds (`GET /holdings`), asked as of
  * what alasio has of it, before it answers that nothing changed: alasio asks again at once, so
  * what it keeps of every node changes as the node's does, and an agent gone is found within it.

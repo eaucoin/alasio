@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
-import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Queue, Schedule, Scope, Stream } from "effect";
+import { Cause, ConfigProvider, Deferred, type Duration, Effect, Exit, Fiber, Layer, Logger, Option, Queue, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -43,6 +43,8 @@ import {
   type NodeAgent,
   type NodeAgentOptions,
   loadingSaveRevocation,
+  LOAD_WAIT_EXPIRED,
+  loadWaitWatchdogMs,
   PAGES_UNREAD,
   recentReads,
   PoliciesNotInForce,
@@ -51,6 +53,7 @@ import {
   type PrepareError,
   type PrepareRequest,
   type ResumeRequest,
+  restoreHookSeconds,
   SnapshotOutlived,
   STATE_FILE_BYTES,
   STATE_READ_TIMEOUT_MS,
@@ -60,11 +63,11 @@ import {
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
-import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags } from "../src/node-agent/runsc.ts";
+import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags, SandboxGone } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
 import { NODE_PINS } from "../cli/src/cluster/node.ts";
-import { NODE_AGENT_PORT, restoresFromBucket, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
+import { backgroundReadSeconds, LOAD_WAIT_WATCHDOG_MARGIN_SECONDS, LOADING_SAVE_LATEST_SECONDS, NODE_AGENT_PORT, restoresFromBucket, SAVE_HOOK_SECONDS, SAVE_LOAD_WAIT_SECONDS, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
 import { podChanges, serveNodeAgent } from "../src/node-agent/server.ts";
 import type { Workspaces } from "../src/node-agent/workspaces.ts";
@@ -248,6 +251,11 @@ interface NodeOptions {
   readonly inspectTimeoutMs?: number;
   /** How its agent bounds a release's save of a sandbox whose restore reads the bucket still (NodeAgentOptions loadingSave). */
   readonly loadingSave?: NodeAgentOptions["loadingSave"];
+  /** The first release that bounds a save's wait for pages still loading, none unless given, and how its agent waits (NodeAgentOptions loadWait). */
+  readonly savesWithLoadWaitSince?: string;
+  readonly loadWait?: NodeAgentOptions["loadWait"];
+  /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
+  readonly backgroundReadMs?: number;
   /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
   readonly pods?: NodeAgentOptions["pods"];
   /** Its cache as `cache` changes it. */
@@ -259,7 +267,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -283,7 +291,9 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         storeProxy,
         host: host.host,
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
-        backgroundReadMs: BACKGROUND_READ_MS,
+        savesWithLoadWaitSince,
+        ...(loadWait === undefined ? {} : { loadWait }),
+        backgroundReadMs,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
         ...(loadingSave === undefined ? {} : { loadingSave }),
         pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
@@ -452,6 +462,59 @@ test("the node's containers are read with the runsc of the release its runtime s
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a checkpoint under a release that bounds a save's wait for pages still loading gives runsc that wait, SAVE_LOAD_WAIT_SECONDS; one under a release before the first that does gives none", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      for (const [since, flags] of [[RELEASE, [`--load-wait=${SAVE_LOAD_WAIT_SECONDS}s`]], ["20261102.0-eaucoin.10", []]] as const) {
+        const here = yield* node(`node-${since}`, { savesWithLoadWaitSince: since, loadingSave: { latestMs: ROOMY_LATEST_MS } });
+        yield* here.agent.checkpoint(request("fs-abc"));
+        const [checkpointed] = here.releases.calls(RELEASE);
+        assert.deepEqual(checkpointed?.slice(4, -3), ["--compression=none", ...flags], `since ${since}`);
+      }
+    })
+  ));
+
+/** A stall window's latest, from a release's ask, that leaves its save's load wait whole (loadWaitOf). */
+const ROOMY_LATEST_MS = (SAVE_HOOK_SECONDS + LOAD_WAIT_WATCHDOG_MARGIN_SECONDS + SAVE_LOAD_WAIT_SECONDS + 60) * 1000;
+
+/** The load wait, in seconds, that the runsc command `args` gives, or undefined. */
+const loadWaitIn = (args: readonly string[] | undefined): number | undefined => {
+  const given = args?.find((arg) => arg.startsWith("--load-wait="));
+  return given === undefined ? undefined : Number(/^--load-wait=(\d+)s$/u.exec(given)?.[1]);
+};
+
+test("a release's save is given a load wait cut so that it, bayma's save hook's own bound (SAVE_HOOK_SECONDS) and LOAD_WAIT_WATCHDOG_MARGIN_SECONDS end before the latest it may be bounded as its sandbox loads, its wait for the workspace's lock counted, and none where nothing is left; a 3 GiB sandbox's, asked at once, is the full SAVE_LOAD_WAIT_SECONDS, however long the timeout runsc gives its hook", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      // A 3 GiB sandbox: the timeout runsc gives its hook is restoreHookSeconds, near 800 s, more than the limit leaves,
+      // which its load wait is not cut by.
+      const big = backgroundReadSeconds(3 * 1024 ** 3) * 1000;
+      const large = yield* node("node-0", { savesWithLoadWaitSince: RELEASE, backgroundReadMs: big });
+      yield* large.agent.checkpoint(request("fs-abc"));
+      const [checkpointed] = large.releases.calls(RELEASE).filter((args) => args.includes("checkpoint"));
+      assert.ok(restoreHookSeconds(big) > LOADING_SAVE_LATEST_SECONDS - SAVE_LOAD_WAIT_SECONDS, `restoreHookSeconds of a 3 GiB sandbox: ${restoreHookSeconds(big)}`);
+      assert.ok(checkpointed?.includes(`--save-restore-exec-timeout=${restoreHookSeconds(big)}s`), `${checkpointed?.join(" ")} gives the hook no timeout of ${restoreHookSeconds(big)} s`);
+      assert.equal(loadWaitIn(checkpointed), SAVE_LOAD_WAIT_SECONDS);
+      const latestMs = (SAVE_HOOK_SECONDS + LOAD_WAIT_WATCHDOG_MARGIN_SECONDS + 100) * 1000;
+      // 100 s left past the hook's bound and the margin, less what the save waits for the workspace, which another
+      // checkpoint holds 3 s.
+      let held = 1;
+      const roomy = yield* node("node-1", {
+        savesWithLoadWaitSince: RELEASE,
+        loadingSave: { latestMs },
+        runsc: (runsc) => ({ ...runsc, checkpoint: (release, options) => (held-- > 0 ? Effect.sleep("3 seconds") : Effect.void).pipe(Effect.andThen(runsc.checkpoint(release, options))) }),
+      });
+      yield* Effect.all([roomy.agent.checkpoint(request("fs-abc")), Effect.sleep("100 millis").pipe(Effect.andThen(roomy.agent.checkpoint(request("fs-abc"))))], { concurrency: 2 });
+      const [first, second] = roomy.releases.calls(RELEASE).filter((args) => args.includes("checkpoint")).map(loadWaitIn);
+      assert.ok(first !== undefined && first >= 98 && first <= 100, `the first save's load wait: ${first} s, want the 100 s left`);
+      assert.ok(second !== undefined && second >= 95 && second <= 97, `the second save's load wait: ${second} s, want the 100 s left less the 3 s it waited for the workspace`);
+      // None left.
+      const tight = yield* node("node-2", { savesWithLoadWaitSince: RELEASE, loadingSave: { latestMs: latestMs - 100_000 } });
+      yield* tight.agent.checkpoint(request("fs-abc"));
+      assert.equal(loadWaitIn(tight.releases.calls(RELEASE)[0]), undefined);
+    })
+  ));
 
 test("a checkpoint saves the sandbox with its release's runsc, uploads its image under its digest, checks the bucket holds it as put, then writes its manifest and commits it", () =>
   withBucket(({ s3, node }) =>
@@ -2388,6 +2451,184 @@ test("a release's save of a sandbox whose restore from the bucket reads it still
       saving = (release, options, runsc) => Effect.sleep("2 seconds").pipe(Effect.andThen(runsc.checkpoint(release, options)));
       assert.ok(Exit.isSuccess(yield* released(there)));
       assert.deepEqual(revoked(), []);
+    })
+  ));
+
+test("a release's save of a sandbox whose restore from the bucket reads it still, under a release that bounds its wait for pages still loading, has runsc wait so long, nothing revoked as it waits; one whose wait expired is deferred, its snapshot kept, its restore's token held, its sandbox running on; once its saves have been deferred for their limit, the next is bounded as one under a release that does not bound it, its token revoked as its reads stall", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const holder = "main/fs-abc";
+      const taker = yield* node("node-1");
+      const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
+      /** How the restored sandbox's runsc saves it, as each case has it, and the load wait each save was given. */
+      let saving = (release: string, options: CheckpointOptions, runsc: Runsc): Effect.Effect<void, RunscError | ReleaseNotInstalled> => runsc.checkpoint(release, options);
+      const waits: (number | undefined)[] = [];
+      const savingRunsc = (runsc: Runsc): Runsc => ({ ...runsc, checkpoint: (release, options) => Effect.sync(() => void waits.push(options.loadWaitSeconds)).pipe(Effect.andThen(saving(release, options, runsc))) });
+      // Its release bounds its wait, for 1 s, and its saves may be deferred for 2 s; a stall window of 0.4 s from a floor
+      // of 1 s, which would revoke its token as a save of 1.5 s waits on reads served nothing, were it bounded so.
+      const there = yield* node("node-2", { savesWithLoadWaitSince: RELEASE, loadWait: { waitSeconds: 1, deferredForMs: 2000 }, loadingSave: { floorMs: 1000, stallMs: 400, latestMs: ROOMY_LATEST_MS, pollMs: 200 }, runsc: savingRunsc });
+      writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
+      yield* there.cache.clear("main", "fs-abc");
+      const prepared = yield* preparing(there.agent, workspace);
+      assert.equal(prepared.source, "bucket");
+      const token = tokenIn(prepared.imagePath);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* Effect.sync(() => there.storeProxy.readingOf(holder)?.expected).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (expected) => expected === 45056 }),
+        Effect.timeout("10 seconds"),
+      );
+      const logged: string[] = [];
+      const released = there.agent.checkpoint(request("fs-abc")).pipe(
+        Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push([message].flat().join(" ")))])),
+        Effect.exit,
+      );
+      const revoked = () => logged.filter((line) => line.startsWith(`revoked the token of the restore of ${holder} from the bucket`));
+
+      // A save that waits 1.5 s on pages the restore is served none of, past its floor and stall window, then fails as
+      // runsc says of one whose wait expired: deferred, nothing revoked, its snapshot kept, its restore reading on.
+      saving = (release) =>
+        Effect.sleep("1500 millis").pipe(
+          Effect.andThen(Effect.fail(new RunscError({ release, command: "checkpoint", reason: `checkpoint failed: checkpointing container: save waited 1s for 45056 bytes of pages still loading: ${LOAD_WAIT_EXPIRED}` }))),
+        );
+      const first = yield* released;
+      assert.match(failure(first), /^the save of main\/fs-abc is deferred, the pages it saves still loading from the bucket past its wait: .*; its snapshot is kept, and its sandbox runs on$/u);
+      assert.deepEqual(waits, [1]);
+      assert.deepEqual(revoked(), []);
+      assert.notEqual(there.storeProxy.readingOf(holder), null);
+      assert.equal((yield* there.agent.current(workspace))?.snapshot, manifest.snapshot);
+      assert.equal(yield* throughProxy(there, token, layer, "bytes=0-511"), 206);
+
+      // Deferred again within the limit: waited so long again.
+      const second = yield* released;
+      assert.match(failure(second), /is deferred/u);
+      assert.deepEqual(waits, [1, 1]);
+
+      // Its saves deferred for the limit since the first was, the next is bounded as its sandbox loads, its wait not
+      // bounded: its token revoked as nothing is served, its loading failing, and the save with it.
+      yield* Effect.sleep("2 seconds");
+      saving = (release) =>
+        Effect.sync(() => there.storeProxy.readingOf(holder)).pipe(
+          Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: (reading) => reading === null }),
+          Effect.timeout("10 seconds"),
+          Effect.orDie,
+          Effect.andThen(Effect.fail(new RunscError({ release, command: "checkpoint", reason: `checkpoint failed: saving kernel: ${PAGES_UNREAD}: GetObject: AccessDenied` }))),
+        );
+      assert.match(failure(yield* released), /can be saved no more/u);
+      assert.deepEqual(waits, [1, 1, undefined]);
+      assert.equal(revoked().length, 1);
+      assert.ok(logged.some((line) => /^the release saves of main\/fs-abc have been deferred for \d+ min, its pages still loading from the bucket: this one is bounded as its sandbox loads/u.test(line)), `no line says the deferrals' limit passed: ${logged.join("\n")}`);
+    })
+  ));
+
+/** How a test's runsc saves a sandbox: as `runsc` would, or otherwise. */
+type Saving = (release: string, options: CheckpointOptions, runsc: Runsc) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+
+/**
+ * fs-abc, checkpointed on node-1, then restored on node-2 from the bucket and resumed, its
+ * restore reading the bucket still, node-2's agent made with `options`: its agent, its runsc's
+ * saves as the returned `saving.as` has them, the load wait each was given (`waits`), its
+ * release's checkpoint asked again each time `released` runs, and the warnings its agent logged
+ * of revoking the restore's token.
+ */
+const restoredLoading = (s3: FakeS3, node: (name: string, options?: NodeOptions) => Effect.Effect<Node, never, Scope.Scope>, options: NodeOptions) =>
+  Effect.gen(function*() {
+    const workspace = { environment: "main", workspace: "fs-abc" };
+    const holder = "main/fs-abc";
+    const taker = yield* node("node-1");
+    const layer = `main/fs-abc/layers/${"b".repeat(64)}/pages.img`;
+    const saving: { as: Saving } = { as: (release, checkpointed, runsc) => runsc.checkpoint(release, checkpointed) };
+    const waits: (number | undefined)[] = [];
+    const savingRunsc = (runsc: Runsc): Runsc => ({ ...runsc, checkpoint: (release, checkpointed) => Effect.sync(() => void waits.push(checkpointed.loadWaitSeconds)).pipe(Effect.andThen(saving.as(release, checkpointed, runsc))) });
+    const there = yield* node("node-2", { savesWithLoadWaitSince: RELEASE, ...options, runsc: (runsc, releases) => savingRunsc(options.runsc?.(runsc, releases) ?? runsc) });
+    writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
+    const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+    s3.objects.set(layer, Buffer.alloc(45056 - 4096, 7));
+    yield* there.cache.clear("main", "fs-abc");
+    const prepared = yield* preparing(there.agent, workspace);
+    assert.equal(prepared.source, "bucket");
+    const token = tokenIn(prepared.imagePath);
+    yield* there.agent.resume(resumeRequest(manifest.snapshot));
+    yield* Effect.sync(() => there.storeProxy.readingOf(holder)?.expected).pipe(
+      Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (expected) => expected === 45056 }),
+      Effect.timeout("10 seconds"),
+    );
+    const logged: string[] = [];
+    const released = (asked: CheckpointRequest = request("fs-abc")) =>
+      there.agent.checkpoint(asked).pipe(
+        Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push([message].flat().join(" ")))])),
+        Effect.exit,
+      );
+    const revoked = () => logged.filter((line) => line.startsWith(`revoked the token of the restore of ${holder} from the bucket`));
+    return { there, manifest, holder, layer, token, saving, waits, released, logged, revoked };
+  });
+
+/** A save that runsc defers, its wait for pages still loading expired after `after`. */
+const deferring = (after: Duration.Input): Saving => (release) =>
+  Effect.sleep(after).pipe(
+    Effect.andThen(Effect.fail(new RunscError({ release, command: "checkpoint", reason: `checkpoint failed: checkpointing container: save waited 1s for 45056 bytes of pages still loading: ${LOAD_WAIT_EXPIRED}` }))),
+  );
+
+/** A save that waits for its restore's token to be revoked, then fails as the pages it reads do. */
+const failingOnceRevoked = (holder: string, there: Node): Saving => (release) =>
+  Effect.sync(() => there.storeProxy.readingOf(holder)).pipe(
+    Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: (reading) => reading === null }),
+    Effect.timeout("10 seconds"),
+    Effect.orDie,
+    Effect.andThen(Effect.fail(new RunscError({ release, command: "checkpoint", reason: `checkpoint failed: saving kernel: ${PAGES_UNREAD}: GetObject: AccessDenied` }))),
+  );
+
+test("a release's save under a release that bounds its waits for pages still loading is bounded while its sandbox loads only past what that bound and bayma's hook's let it run, as a watchdog should runsc not defer it: its token revoked as its reads stall then, not before", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      assert.equal(loadWaitWatchdogMs(SAVE_LOAD_WAIT_SECONDS), (SAVE_LOAD_WAIT_SECONDS + SAVE_HOOK_SECONDS + LOAD_WAIT_WATCHDOG_MARGIN_SECONDS) * 1000);
+      // A watchdog of 1.5 s past a floor of 0.2 s and a stall window of 0.4 s, which would revoke the token sooner.
+      const { there, holder, saving, waits, released, revoked } = yield* restoredLoading(s3, node, { loadWait: { waitSeconds: 1, watchdogMs: 1500 }, loadingSave: { floorMs: 200, stallMs: 400, latestMs: ROOMY_LATEST_MS, pollMs: 100 } });
+      saving.as = failingOnceRevoked(holder, there);
+      const started = Date.now();
+      assert.match(failure(yield* released()), /can be saved no more/u);
+      const took = Date.now() - started;
+      assert.deepEqual(waits, [1]);
+      assert.equal(revoked().length, 1);
+      assert.ok(took >= 1500 && took < 10_000, `revoked after ${took} ms, want after the watchdog's 1500`);
+    })
+  ));
+
+test("a release's save of a sandbox whose pod ends as it is saved, its bayma holding its stop, is given no load wait, as a deferral would save nothing of it, but bounded while its sandbox loads", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const { there, holder, saving, waits, released, revoked } = yield* restoredLoading(s3, node, { loadWait: { waitSeconds: 1 }, loadingSave: { floorMs: 200, stallMs: 400, latestMs: 60_000, pollMs: 100 } });
+      saving.as = failingOnceRevoked(holder, there);
+      assert.match(failure(yield* released({ ...request("fs-abc"), ending: true })), /can be saved no more/u);
+      assert.deepEqual(waits, [undefined]);
+      assert.equal(revoked().length, 1);
+    })
+  ));
+
+test("the time a workspace's release saves have been deferred is counted anew once its sandbox is resumed again, or a checkpoint finds no sandbox of its container, as of a sandbox its deferrals were not of", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      // Its saves may be deferred for no time at all: a save after one that was is the backstop's, given no load wait,
+      // unless their count began anew.
+      let gone = false;
+      const { there, manifest, saving, waits, released } = yield* restoredLoading(s3, node, {
+        loadWait: { waitSeconds: 1, deferredForMs: 0 },
+        loadingSave: { latestMs: ROOMY_LATEST_MS },
+        runsc: (runsc) => ({ ...runsc, container: (id) => (gone ? Effect.fail(new SandboxGone({ containerId: id, reason: "it is not there" })) : runsc.container(id)) }),
+      });
+      saving.as = deferring("10 millis");
+      assert.match(failure(yield* released()), /is deferred/u);
+      // Resumed again, as a sandbox restored anew is.
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      assert.match(failure(yield* released()), /is deferred/u);
+      // Its container found nowhere.
+      gone = true;
+      assert.match(failure(yield* released()), /no sandbox of the container was reached/u);
+      gone = false;
+      assert.match(failure(yield* released()), /is deferred/u);
+      assert.deepEqual(waits, [1, 1, 1]);
     })
   ));
 
