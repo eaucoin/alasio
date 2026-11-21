@@ -11,6 +11,10 @@
  * beside the file at `path` of its workspace, shown as an image is; for a prompt `login`, after a
  * request of its model provider's Responses API, as Codex calls it, with the bearer its
  * provider's env_key names, beside what the provider answered (`login <status>`); for a prompt
+ * `bayma exec MS SESSION`, its next lines code, after its first tool call, MS milliseconds into the turn, as the model's
+ * thinking takes them: an exec of the code in the session SESSION of the thread's bayma, its request in a span of its own
+ * whose trace the sandbox gateway continues, beside how it went (`bayma exec: ok <its span's trace id> <its span's id> <its
+ * milliseconds>`); for a prompt
  * `bayma later N`, at once, a command left running in the background, its terminal listed,
  * which N seconds on asks the thread's bayma, as its config names it, to initialize, as Codex's
  * MCP client does, and says what bayma answered on its standard error (`bayma later: <status>`),
@@ -39,6 +43,10 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { context, propagation, type Span, SpanKind, trace } from "@opentelemetry/api";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { NodeSDK } from "@opentelemetry/sdk-node";
@@ -208,6 +216,50 @@ async function serve(args: readonly string[]): Promise<void> {
       return `unreached: ${error instanceof Error ? error.message : String(error)}`;
     }
   };
+  /**
+   * The turn's first tool call, `thinkMs` into the turn, as the model's thinking takes it: an exec of `code` in the session
+   * `sessionId` of the thread's bayma, its control taken and given back around it, as Codex's MCP client calls bayma. The
+   * exec's request alone is sent in a span of its own, `bayma.exec`, a child of the turn's `parent`, its traceparent with
+   * it, which the sandbox gateway's front continues, so the front's span of that request, under it, is told from the
+   * others' of the turn's trace: `ok <the span's trace id> <its id> <the exec's milliseconds>`, or why it failed.
+   */
+  const execInBayma = async (threadId: string, sessionId: string, code: string, thinkMs: number, parent: Span): Promise<string> => {
+    const bayma = baymaOf.get(threadId);
+    if (!bayma) return "no bayma";
+    await new Promise((resolve) => setTimeout(resolve, thinkMs));
+    /** The trace context the transport's next requests carry: the exec's alone. */
+    const carrier: Record<string, string> = {};
+    const transport = new StreamableHTTPClientTransport(new URL(bayma.url), {
+      requestInit: { headers: { ...bayma.http_headers } },
+      fetch: (url, init) => fetch(url, { ...init, headers: { ...Object.fromEntries(new Headers(init?.headers)), ...carrier } }),
+    });
+    const client = new Client({ name: "codex-stand-in", version: "1.0.0" });
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = (await client.callTool({ name, arguments: args }, undefined, { timeout: 900_000 })) as CallToolResult;
+      const text = result.content.find((part) => part.type === "text")?.text ?? "";
+      if (result.isError) throw new Error(`bayma's ${name} failed: ${text}`);
+      return (result.structuredContent ?? JSON.parse(text)) as { readonly exec_id?: string; readonly done?: boolean; readonly next_seq?: number; readonly error_text?: string };
+    };
+    try {
+      // The SDK declares its sessionId `string | undefined` where Transport has it optional.
+      await client.connect(transport as Transport);
+      await call("session.acquire_controller", { session_id: sessionId });
+      const span = tracer.startSpan("bayma.exec", { kind: SpanKind.CLIENT }, trace.setSpan(context.active(), parent));
+      propagation.inject(trace.setSpan(context.active(), span), carrier);
+      const started = performance.now();
+      let answer = await call("exec", { session_id: sessionId, code, yield_time_ms: 300_000 });
+      for (const key of Object.keys(carrier)) delete carrier[key];
+      while (answer.done === false) answer = await call("wait", { session_id: sessionId, exec_id: answer.exec_id, from_seq: answer.next_seq, yield_time_ms: 300_000 });
+      const ms = performance.now() - started;
+      span.end();
+      await call("session.release_controller", { session_id: sessionId });
+      return answer.error_text ? `failed: ${answer.error_text}` : `ok ${span.spanContext().traceId} ${span.spanContext().spanId} ${ms.toFixed(1)}`;
+    } catch (error) {
+      return `failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      await client.close();
+    }
+  };
   /** The client's name, once it has initialized. */
   let client: string | undefined;
   const write = (message: object) => process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -278,6 +330,7 @@ async function serve(args: readonly string[]): Promise<void> {
       span.setAttribute("turn.id", turn.id);
       const text = input.map((item) => (item.type === "text" ? item.text : "")).join("");
       const shown = /^show (\S+)$/u.exec(text)?.[1];
+      const exec = /^bayma exec (\d+) (\S+)\n([\s\S]+)$/u.exec(text);
       const said = shown ? `${ANSWER}\n\n![shown](${shown})` : ANSWER;
       const answer = agentMessage(randomUUID(), said, "final_answer");
       // What the turn finds out besides its answer, said after it: its model provider asked, as Codex asks it; its bayma asked at once, as its
@@ -286,6 +339,8 @@ async function serve(args: readonly string[]): Promise<void> {
         ? providerStatus(settings).then((status) => `login ${status}`)
         : text === "bayma bound"
         ? initializeBayma(threadId, { bindsNothing: true }).then((status) => `bayma bound: ${status}`)
+        : exec
+        ? execInBayma(threadId, exec[2] ?? "", exec[3] ?? "", Number(exec[1]), span).then((how) => `bayma exec: ${how}`)
         : text === "tools"
         ? Promise.resolve(`tools: ${environments()}`)
         : Promise.resolve(null);
