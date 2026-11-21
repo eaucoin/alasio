@@ -86,6 +86,7 @@ import { join } from "node:path";
 import { Clock, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
+import { withAlasioSpan } from "../telemetry/index.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
@@ -112,6 +113,15 @@ export class WorkspaceRefused extends Schema.TaggedError<WorkspaceRefused>()("Wo
 }
 
 const refused = (status: number, reason: string) => new WorkspaceRefused({ status, reason });
+
+/** The attributes of the spans of an attach of the workspace `ref` into the pod `pod`, of its environment's namespace. */
+const attachAttributes = ({ environment, workspace }: WorkspaceRef, pod: string) => ({
+  "alasio.environment": environment,
+  "alasio.workspace": workspace,
+  "alasio.sandbox.name": workspace,
+  "k8s.namespace.name": environment,
+  "k8s.pod.name": pod,
+});
 
 /** A workspace, by its environment and its id. */
 export interface WorkspaceRef {
@@ -648,7 +658,9 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
         yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
         const found = yield* host.run(["test", "-d", files]);
         if (found.exitCode !== 0) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
-        yield* quotaHeld(ref, files, `${ref.environment}/${ref.workspace} could not be attached`, quotaHeldWithinMs);
+        yield* quotaHeld(ref, files, `${ref.environment}/${ref.workspace} could not be attached`, quotaHeldWithinMs).pipe(
+          withAlasioSpan("alasio.node_agent.attach.quota", { attributes: attachAttributes(ref, pod) }),
+        );
         const ws = join(directory, "ws");
         yield* Effect.promise(async () => {
           await mkdir(ws);
@@ -664,7 +676,7 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
           await writeFile(join(directory, "token"), token, { mode: 0o400 });
           await chown(join(directory, "token"), agentUid, agentUid);
         });
-      }),
+      }).pipe(withAlasioSpan("alasio.node_agent.attach", { attributes: attachAttributes(ref, pod) })),
 
     bindFree: (namespace, pod, { uid, gid }, binding) =>
       Effect.gen(function*() {
