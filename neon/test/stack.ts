@@ -1092,6 +1092,19 @@ export function neonStack(): void {
       /** The pod of a part's address, as SeaweedFS names a server: its name in its headless Service, and a port. */
       const podOfAddress = (address: string) => address.split(".")[0] ?? "";
 
+      test("each bucket written in parts holds SeaweedFS's rule for its uploads left incomplete, which the gateway, ready, gave it as an identity that may write it, and workspace storage's none", async () => {
+        const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+        /** The IDs of `bucket`'s lifecycle rules; none where it has no configuration of them. */
+        const rules = async (bucket: string): Promise<string[]> => {
+          const answer = await onGateway(gateway, `s3api 127.0.0.1:8333 get-bucket-lifecycle-configuration --bucket ${bucket} 2>&1 || true`);
+          if (answer.includes("NoSuchLifecycleConfiguration")) return [];
+          const { Rules }: { Rules: { ID: string }[] } = JSON.parse(answer);
+          return Rules.map(({ ID }) => ID);
+        };
+        for (const bucket of ["neon", "lake", "backups", "snapshots"]) assert.deepEqual(await rules(bucket), ["abort-incomplete-uploads"], bucket);
+        assert.deepEqual(await rules("workspaces"), []);
+      });
+
       test("the object store's lifecycle pass expires what of Neon's bucket Neon needs no more: its replaced objects, its delete markers left alone, and its full WAL segments wholly a segment below their timeline's remote consistent LSN, none of those where the storage controller cannot tell it; and Neon reads, writes and restarts on what is left", { timeout: 1_800_000 }, async () => {
         const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
         // SeaweedFS's own rule of the bucket: its uploads left incomplete aborted after a day, alone.
