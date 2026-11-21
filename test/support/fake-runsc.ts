@@ -43,8 +43,8 @@
  *   the restore has read every page; or fails, saying so, while a file `fail-wait` is;
  * - `exec ID ARGV...`: says nothing; or fails, saying so, while a file `fail-exec` is beside it;
  * - `cpu-features`: the node's, from `cpu-features`, comma-separated;
- * - `state ID`: the container's sandbox's process, its status, running unless
- *   FakeReleases.held says another, and its pod's annotations, as
+ * - `state ID`: the container's sandbox's process and its status, running, unless
+ *   FakeReleases.held says others, and its pod's annotations, as
  *   `containers.json` beside the releases says (FakeReleases.runs), or fails for one it
  *   does not hold, or while a file `fail-state` is beside it; that process's program, in
  *   the stand-in's /proc, is the runsc of the release that runs it, and its arguments
@@ -242,8 +242,11 @@ export interface FakeReleases {
    * false, its spec, in its bundle, mounting `mounts`, and its pod's uid `uid`, POD_UID unless given.
    */
   readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean, mounts?: readonly OciMount[], uid?: string) => void;
-  /** Makes runsc's state say the container, which runs, is `status`: `paused`, as one restored and not yet resumed is. */
-  readonly held: (containerId: string, status: string) => void;
+  /**
+   * Makes runsc's state say the container, which runs, is `status`: `paused`, as one restored and not yet resumed is; and,
+   * given `pid`, name that process of its sandbox, -1 as runsc names none.
+   */
+  readonly held: (containerId: string, status: string, pid?: number) => void;
   /** Makes containerd's annotations say the container is its pod's own, its sandbox's root container, as a pod's pause container is. */
   readonly rooted: (containerId: string) => void;
   /**
@@ -300,9 +303,9 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     };
     writeFileSync(containers, JSON.stringify(held));
   };
-  const held = (containerId: string, status: string) => {
+  const held = (containerId: string, status: string, pid?: number) => {
     const kept = JSON.parse(readFileSync(containers, "utf8")) as Record<string, Record<string, unknown>>;
-    kept[containerId] = { ...kept[containerId], status };
+    kept[containerId] = { ...kept[containerId], status, ...(pid === undefined ? {} : { pid }) };
     writeFileSync(containers, JSON.stringify(kept));
   };
   const rooted = (containerId: string) => {
