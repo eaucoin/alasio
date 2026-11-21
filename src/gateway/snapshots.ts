@@ -418,9 +418,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * the snapshot it took; kept, as its pod runs no bayma under gVisor; lost, its sandbox ended
    * by a save that failed; unsaveable, as the agent says no save of it will be taken; or
    * failed, its sandbox running on, why said. Its pool's template is recorded with it, which
-   * its restore makes its pod of.
+   * its restore makes its pod of. `ending` says its pod ends as it is saved, its bayma holding
+   * its stop for the save, so that the agent does not defer it (CheckpointRequest's ending).
    */
-  const take = (pool: Pool, workspace: string, name: string): Effect.Effect<Taken, KubeApiError> =>
+  const take = (pool: Pool, workspace: string, name: string, ending = false): Effect.Effect<Taken, KubeApiError> =>
     Effect.gen(function*() {
       const pod = yield* podOf(pool, name);
       const containerId = baymaId(pod);
@@ -433,7 +434,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         yield* Effect.logWarning(`${pool.namespace}/${workspace} is not snapshotted: its pod runs no bayma under gVisor`);
         return { outcome: "kept" } as const;
       }
-      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...templateOfPod(pod) } }).pipe(Effect.result);
+      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...templateOfPod(pod) }, ...(ending ? { ending } : {}) }).pipe(Effect.result);
       if (taken._tag === "Success") {
         const { snapshot, release, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted ${pool.namespace}/${workspace} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
@@ -1088,7 +1089,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           yield* counted("late");
           return null;
         }
-        const taken = yield* take(pool, workspace, name);
+        const taken = yield* take(pool, workspace, name, true);
         if (taken.outcome === "snapshotted") {
           yield* counted("snapshotted");
           return { ...taken.saved, pod: name };

@@ -176,6 +176,13 @@ export interface CheckpointOptions {
    * a pause that writes what it changed meanwhile.
    */
   readonly live?: boolean;
+  /**
+   * How long the save waits at the most for the pages that the sandbox's restore has not loaded
+   * yet, in seconds, those it saves and those its hook touches, where its release bounds that
+   * wait (./names.ts savesWithLoadWait): past it, runsc fails the save, what it wrote incomplete,
+   * as LOAD_WAIT_EXPIRED says, and the sandbox runs on as it was. Unbounded where not given.
+   */
+  readonly loadWaitSeconds?: number;
 }
 
 /**
@@ -413,11 +420,12 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
     releases,
     current,
 
-    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false }) =>
+    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds }) =>
       run(release, ["checkpoint"], [
         `--image-path=${imagePath}`,
         "--compression=none",
         ...(parentImagePath === undefined ? [] : [`--parent-image-path=${parentImagePath}`]),
+        ...(loadWaitSeconds === undefined ? [] : [`--load-wait=${loadWaitSeconds}s`]),
         // Its pages written as the sandbox runs, past the page cache, which the pause then waits on.
         ...(live ? ["--leave-running", "--precopy=auto", "--precopy-throttle=on", "--direct"] : []),
         // The hook told a live save from one that ends the sandbox, as gVisor tells it neither, and

@@ -176,6 +176,7 @@ import {
   PrepareRequest,
   ResumeRequest,
   type SandboxUnsaveable,
+  type SaveDeferred,
   WorkspaceRef,
 } from "./agent.ts";
 import { convergeAttachments } from "./attachments.ts";
@@ -197,6 +198,7 @@ import {
   RUNSC_ROOT,
   GVISOR_RELEASE_VARIABLE,
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
+  SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
   STORE_PROXY_PORT,
@@ -274,6 +276,7 @@ const STATUS: Readonly<Record<string, number>> = {
   KubeApiError: 503,
   SandboxUnsaveable: 410,
   LiveSaveDeferred: 425,
+  SaveDeferred: 503,
   JuicefsError: 503,
   StandbyImageRefused: 403,
   StandbyUnavailable: 409,
@@ -346,7 +349,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   standbys = makeStandbyRestores(),
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
-  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred>(scope, failureOf);
+  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred | SaveDeferred>(scope, failureOf);
   const prepares = yield* makeOperations<Prepared, PrepareError>(scope, failureOf);
   const started = answer(202, { state: "running" });
   /** Done as the agent's API stops, before it waits for the requests under way to end: those held for a change (`GET /holdings`) are refused at once. */
@@ -569,7 +572,8 @@ const CONDITIONS_TRIES = Schedule.min([Schedule.exponential("1 second"), Schedul
  * cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE), the gVisor release the node's runtime
  * starts sandboxes with (GVISOR_RELEASE_VARIABLE), the first gVisor release that
  * restores straight from the bucket (RESTORES_FROM_BUCKET_SINCE_VARIABLE; none unless given,
- * every snapshot then fetched into the cache first), its pod's address (POD_IP_VARIABLE),
+ * every snapshot then fetched into the cache first), the first that bounds a save's wait for
+ * pages still loading (SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE; none unless given), its pod's address (POD_IP_VARIABLE),
  * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
  * as on its socket on the node, beside its restores' tokens (NODE_AGENT_RUN_DIR, unless
  * NODE_AGENT_RUN_DIR_VARIABLE says), how long a resumed restore may read it there
@@ -588,6 +592,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
   const budget = yield* Config.Int(SNAPSHOT_CACHE_BYTES_VARIABLE).pipe(Config.withDefault(DEFAULT_CACHE_BYTES));
   const restoresFromBucketSince = yield* Config.String(RESTORES_FROM_BUCKET_SINCE_VARIABLE).pipe(Config.withDefault(""));
+  const savesWithLoadWaitSince = yield* Config.String(SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE).pipe(Config.withDefault(""));
   const current = yield* Config.String(GVISOR_RELEASE_VARIABLE);
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const loadingStallSeconds = yield* Config.Int(LOADING_STALL_SECONDS_VARIABLE);
@@ -614,6 +619,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     storeProxy,
     host,
     restoresFromBucketSince,
+    savesWithLoadWaitSince,
     backgroundReadMs: backgroundReadSeconds * 1000,
     loadingSave: { stallMs: loadingStallSeconds * 1000, ...Option.getOrElse(testTimings, () => ({})) },
     pods: podChanges(kube),

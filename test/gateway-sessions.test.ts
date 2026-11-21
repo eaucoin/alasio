@@ -96,7 +96,7 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
  * Node agents that record what they are asked, in order; a checkpoint does what `checkpoint`
  * says to the pod it saves: ends it saved, fails ending it, or fails leaving it running.
  */
-function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "outlasts alasio's wait" | "unsaveable" = "saves"): { agents: NodeAgents; attached: (AttachRequest & { node: string })[]; detached: string[]; asked: string[]; saved: CheckpointRequest[] } {
+function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "outlasts alasio's wait" | "is deferred" | "unsaveable" = "saves"): { agents: NodeAgents; attached: (AttachRequest & { node: string })[]; detached: string[]; asked: string[]; saved: CheckpointRequest[] } {
   const attached: (AttachRequest & { node: string })[] = [];
   const detached: string[] = [];
   const asked: string[] = [];
@@ -128,6 +128,10 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "outlasts a
           if (checkpoint === "unsaveable") return yield* new NodeAgentError({ node, call: "snapshot", status: 410, reason: "its restore from the bucket failed to read some of its pages" });
           // A save that waits for pages its sandbox's restore cannot read, its store away, which runsc goes on with, the sandbox in it.
           if (checkpoint === "outlasts alasio's wait") return yield* new NodeAgentError({ node, call: "snapshot", reason: "it had not ended within 900 seconds" });
+          // A save whose wait for pages its sandbox's restore has not loaded yet expired: what runsc wrote is unstaged, and the sandbox runs on.
+          if (checkpoint === "is deferred") {
+            return yield* new NodeAgentError({ node, call: "snapshot", status: 503, retryAfter: "5", reason: "the save of main/fs-abc123 is deferred, the pages it saves still loading from the bucket past its wait: checkpoint failed: save waited 5m0s for 45056 bytes of pages still loading: the save's load wait expired; its snapshot is kept, and its sandbox runs on" });
+          }
           if (checkpoint !== "fails") yield* Effect.promise(() => end(request));
           if (checkpoint !== "saves") return yield* new NodeAgentError({ node, call: "snapshot", status: 500, reason: "runsc checkpoint failed" });
           return { snapshot: "s-1" } as unknown as Manifest;
@@ -399,7 +403,7 @@ test("a bound pod whose bayma is idle is kept while a request of it came within 
   }
 });
 
-test("a bound gVisor pod idle for its wait is saved whole by its node's agent first, which ends it, then detached, then deleted with its binding", async () => {
+test("a bound gVisor pod idle for its wait is saved whole by its node's agent first, which ends it, then detached, then deleted with its binding, its save not said to be of a pod that ends", async () => {
   const env = await environment(1, { gvisor: true });
   const stand = await bayma();
   const recorded = agents();
@@ -417,6 +421,7 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     assert.deepEqual([saved?.environment, saved?.workspace, saved?.namespace, saved?.containerId], [env.namespace, "fs-abc123", env.namespace, "c-0"]);
     assert.deepEqual(saved?.hook, ["node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"]);
     assert.equal((saved?.podTemplate as { spec?: { runtimeClassName?: string } }).spec?.runtimeClassName, "gvisor");
+    assert.equal(saved?.ending, undefined);
   } finally {
     stand.close();
   }
@@ -642,8 +647,8 @@ test("a record of a workspace's release that cannot be read is written over by a
   assert.deepEqual(recorded.asked.filter((each) => each.startsWith("record")), []);
 });
 
-test("a release whose save fails, or outlasts alasio's wait for it, leaving the sandbox running keeps the binding, recording nothing, and one whose save fails ending it goes on, as bayma's checkpoints keep what ran", async () => {
-  for (const [outcome, kept] of [["fails", true], ["outlasts alasio's wait", true], ["fails, ending it", false]] as const) {
+test("a release whose save fails, outlasts alasio's wait for it, or is deferred as the pages it saves are still loading, leaving the sandbox running keeps the binding, recording nothing, and one whose save fails ending it goes on, as bayma's checkpoints keep what ran", async () => {
+  for (const [outcome, kept] of [["fails", true], ["outlasts alasio's wait", true], ["is deferred", true], ["fails, ending it", false]] as const) {
     const env = await environment(1, { gvisor: true });
     const stand = await bayma();
     const recorded = agents(outcome);
@@ -1765,7 +1770,7 @@ test("a restore whose snapshot cannot be prepared now is deferred, the bind refu
   assert.equal((await run(readLease(env.none, key)))?.spec?.holderIdentity, "none-0");
 });
 
-test("a bound pod ended by other than the gateway, as a drain ends one, is saved as its bayma holds its stop, its release recorded, its workspace detached once its containers stopped, and its binding let go", async () => {
+test("a bound pod ended by other than the gateway, as a drain ends one, is saved as its bayma holds its stop, its save said to be of a pod that ends, which its node's agent does not defer, its release recorded, its workspace detached once its containers stopped, and its binding let go", async () => {
   const env = await environment(1, { gvisor: true, holdsStop: true });
   const recorded = agents();
   const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
@@ -1785,6 +1790,7 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   });
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
   assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
+  assert.equal(recorded.saved[0]?.ending, true);
   // Counted, once its release is through, which lets its binding go first.
   for (const deadline = Date.now() + 10_000; (await releasedFor(env.namespace, "deleted")) === deletedBefore; await new Promise((resolve) => setTimeout(resolve, 50))) {
     assert.ok(Date.now() < deadline, "its release was not counted");
