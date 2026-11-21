@@ -23,6 +23,7 @@ import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
 import { added, collected } from "./support/metrics.ts";
+import { descendsFrom, endedNamed, endedSpan } from "./support/spans.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
 import {
@@ -70,6 +71,7 @@ import { podChanges, serveNodeAgent } from "../src/node-agent/server.ts";
 import type { Workspaces } from "../src/node-agent/workspaces.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
+import { TracingLayer, withAlasioSpan } from "../src/telemetry/index.ts";
 import { type FakeReleases, fakeReleases, POD_UID } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 import { clusterDns, filterTable, listChain, sessionPod } from "./support/kube-router-rules.ts";
@@ -3885,6 +3887,43 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
       const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest(snapshot), 0));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
     })
+  ));
+
+test("alasio's calls of an agent carry the trace they are made in, which the agent's spans of what it does for them continue, an operation's among them, which runs on past the call that began it", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const agents = yield* agentsOf(here.agent);
+      // Its checkpoint begun by one call and asked after by others, as it runs past the first.
+      const held = join(here.releases.dirOf(RELEASE), "hold-checkpoint");
+      writeFileSync(held, "");
+      const asked = yield* Effect.forkChild(agents.checkpoint("node-1", request("fs-abc")).pipe(withAlasioSpan("test.release")));
+      yield* Effect.sync(() => here.releases.calls(RELEASE).some((args) => args.includes("checkpoint"))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }));
+      rmSync(held);
+      yield* Fiber.join(asked);
+      const release = endedSpan("test.release");
+      const checkpoint = endedSpan("alasio.node_agent.checkpoint");
+      assert.equal(checkpoint.spanContext().traceId, release.spanContext().traceId);
+      assert.ok(descendsFrom(checkpoint, release));
+    }).pipe(Effect.provide(TracingLayer))
+  ));
+
+test("alasio's watch of what a node holds, begun by a restore that asked it first, carries none of the restore's trace, as it outlives it", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const agents = yield* agentsOf(here.agent);
+      yield* agents.held("node-1").pipe(withAlasioSpan("test.restore"));
+      const restore = endedSpan("test.restore");
+      // What the node holds changes, as a checkpoint caches its image: the watch is told it, and asks again.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      const asked = yield* Effect.sync(() => endedNamed("http.server GET").filter((span) => span.attributes["url.path"] === "/holdings")).pipe(
+        Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (spans) => spans.length >= 2 }),
+      );
+      // Asked by the restore in its trace; by the watch after, in none of it.
+      const [first, ...watched] = asked.map((span) => span.spanContext().traceId === restore.spanContext().traceId);
+      assert.deepEqual([first, watched.includes(true)], [true, false]);
+    }).pipe(Effect.provide(TracingLayer))
   ));
 
 test("alasio waits for a resume as long as reading the images its sandbox was restored from may take, and no longer", () =>

@@ -7,7 +7,9 @@
  * release before the gateway's, as its pod's version label says. What every release's agents
  * answer alike goes to whichever serves the node; what this release's answer otherwise, a
  * restore's choice of its node, its prepare and its resume, goes to this release's alone
- * (ownRelease), as one to an agent of another is never sent.
+ * (ownRelease), as one to an agent of another is never sent. Each call carries the W3C trace
+ * context of the span it is made in (traceparent, tracestate), which the agent's spans of what
+ * it does for it continue.
  */
 import type { V1DaemonSet, V1Pod } from "@kubernetes/client-node";
 import { Config, Duration, Effect, Exit, Redacted, Schedule, Schema, type Scope } from "effect";
@@ -20,6 +22,7 @@ import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, typ
 import { HOLDINGS_WAIT_MS, NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { type StandbyRestoreRequest, StandbyRestored } from "../node-agent/standby.ts";
 import { type PodOwner, Released, type StopRequest, type SyncRequest } from "../node-agent/workspaces.ts";
+import { outsideTraces, traceCarrier } from "../telemetry/index.ts";
 
 /**
  * Where the node agents are: their pods' namespace and labels, their DaemonSet's name, and the port they serve on; and the
@@ -331,11 +334,14 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         return yield* new NodeAgentError({ node, call: what, reason: `its agent is of ${agent.release === null ? "no release it says" : `release ${agent.release}`}, not this gateway's ${location.release}`, unsent: true });
       }
       const { base } = agent;
+      // In the trace of the span it is sent in, which what the agent does for it continues.
+      const trace = yield* Effect.sync(traceCarrier);
       const { status, ok, bytes, retryAfter, tag } = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`${base}${request.path}`, {
             method: request.method,
             headers: {
+              ...trace,
               authorization: `Bearer ${Redacted.value(token)}`,
               ...(request.body !== undefined ? { "content-type": "application/json" } : request.bytes !== undefined ? { "content-type": "application/octet-stream" } : {}),
               ...(request.seen !== undefined ? { "if-none-match": `"${request.seen}"` } : {}),
@@ -421,7 +427,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
    * Keeps what `node` holds, as kept now, as its agent says it each time it changes: asked as
    * of what is kept (holdingsSince), again as soon as it answers, in the background, until a
    * request fails, as one of an agent that stopped does; what is kept of it is then forgotten,
-   * for the next restore to ask it anew.
+   * for the next restore to ask it anew. Outside every trace, as it outlives the restore that
+   * began it.
    */
   const watchHoldings = (node: string): Effect.Effect<void> =>
     Effect.gen(function*() {
@@ -432,6 +439,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     }).pipe(
       Effect.catch((error) => Effect.logInfo(`what node ${node} holds is asked of its agent anew by the next restore: ${error.message}`)),
       Effect.ensuring(Effect.sync(() => kept.delete(node))),
+      outsideTraces,
       Effect.forkIn(scope),
       Effect.asVoid,
     );
