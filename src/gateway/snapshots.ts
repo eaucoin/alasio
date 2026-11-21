@@ -82,12 +82,16 @@ import type { Manifest } from "../node-agent/agent.ts";
 import { RESTORE_RUNNING_WAIT_MS } from "../node-agent/names.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
-import { meter, withAlasioSpan } from "../telemetry/index.ts";
+import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type GatewaySnapshots as SnapshotsConfig, ownDirectory, restorePodName } from "./names.ts";
 import { makeStandbys } from "./standbys.ts";
 
 /** Why a session with a snapshot was resumed without it. */
 export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
+
+/** `effect` in a span of alasio's, `name`, of the sandbox of the workspace `workspace` of `pool`, and what `attributes` say beside. */
+const sandboxSpan = (name: string, pool: Pool, workspace: string, attributes: Readonly<Record<string, string | number | boolean>> = {}) =>
+  withAlasioSpan(name, { attributes: { "alasio.sandbox.name": workspace, "k8s.namespace.name": pool.namespace, ...attributes } });
 
 /** Whether bayma's container `bayma` holds a stop it is given for a snapshot: one run with STOP_WAIT_ARG. Pure, for tests. */
 export function holdsStop(bayma: V1Container | undefined): boolean {
@@ -492,14 +496,15 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
   const save = (pool: Pool, workspace: string, name: string): Effect.Effect<Saved, KubeApiError> =>
     Effect.gen(function*() {
       // One whose record cannot be read keeps its binding, to be asked again.
-      const already = yield* savedAlready(pool, workspace, name).pipe(Effect.result);
+      const already = yield* savedAlready(pool, workspace, name).pipe(sandboxSpan("alasio.sandbox.release.record_read", pool, workspace), Effect.result);
       if (already._tag === "Failure") {
         yield* Effect.logWarning(`could not read what ${pool.namespace}/${workspace} was released into, so it is not saved now; it runs on, still bound: ${already.failure.message}`);
         return "keep" as const;
       }
       if (already.success) return { saved: already.success };
-      const taken = yield* take(pool, workspace, name);
+      const taken = yield* take(pool, workspace, name).pipe(sandboxSpan("alasio.sandbox.release.checkpoint", pool, workspace));
       releases.add(1, { "alasio.sandbox.release.outcome": taken.outcome });
+      yield* Effect.annotateCurrentSpan({ "alasio.sandbox.release.outcome": taken.outcome });
       if (taken.outcome === "failed") {
         yield* Effect.logWarning(`could not snapshot ${pool.namespace}/${workspace}: ${taken.why}; it runs on, still bound`);
         return "keep" as const;
@@ -515,9 +520,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       yield* agents.setReleased(ref(pool, workspace), saved && { ...saved, pod: name }).pipe(
         Effect.retry({ times: 3, schedule: Schedule.exponential("200 millis") }),
         Effect.catch((error) => Effect.logWarning(`${pool.namespace}/${workspace}'s release into ${saved?.snapshot ?? "no snapshot"} could not be recorded, so its next bind comes back from bayma's checkpoints: ${error.message}`)),
+        sandboxSpan("alasio.sandbox.release.record", pool, workspace),
       );
       return { saved };
-    }).pipe(withLogScope("snapshots"));
+    }).pipe(sandboxSpan("alasio.sandbox.release", pool, workspace, { "k8s.pod.name": name }), withLogScope("snapshots"));
 
   /** Forgets the workspace's snapshot, saying why; one that cannot be forgotten is said so too, and collected later. */
   const forget = (pool: Pool, workspace: string, why: string): Effect.Effect<void> =>
@@ -683,6 +689,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const policies = yield* kube.list("networking.k8s.io/v1", "NetworkPolicy", pool.namespace, "").pipe(
         Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, labels)).flatMap(({ metadata }) => metadata?.name ?? [])),
         Effect.mapError((error) => new RestoreRefused({ reason: error.message, resumed: false })),
+        sandboxSpan("alasio.sandbox.ready.policies", pool, workspace),
       );
       // Paused where its pod does not run, or goes, or its policies are not in force (504), where
       // the API server cannot be asked of it (503), or where the bucket fails (502), which may
@@ -698,9 +705,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const ran = error._tag === "NodeAgentError" && error.unsent !== true && (status === undefined || status === 500);
           return new RestoreRefused({ reason: error.message, resumed: ran, ...(status === 410 ? { stale: true } : {}) });
         }),
+        sandboxSpan("alasio.sandbox.ready.resume", pool, workspace, { "k8s.node.name": node }),
       );
       // Read until it runs, as its agent waits for it to: one that cannot start is refused, its agent's wait given up.
       const started = podOnce(pool, name, (pod) => (pod.status?.containerStatuses ?? []).length > 0 && (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running), "run").pipe(
+        sandboxSpan("alasio.sandbox.ready.pod_running", pool, workspace),
         Effect.andThen(Effect.never),
       );
       yield* Effect.raceFirst(resumed, started);
@@ -717,7 +726,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           Effect.retry(CLEAR_TRIES),
           Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)),
         ),
-      ], { concurrency: 2 });
+      ], { concurrency: 2 }).pipe(sandboxSpan("alasio.sandbox.ready.condition", pool, workspace));
       if (ready._tag === "Failure") return yield* new RestoreRefused({ reason: `its readiness could not be set: ${ready.failure.message}`, resumed: true });
     });
 
@@ -738,13 +747,15 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * (spendRestored), later each time it fails again (SPEND_AGAIN_MS). Its bind is through meanwhile, its binding's Lease no
    * longer held for it, so a release of it may be asked meanwhile, which commits the snapshot it takes: it is spent only
    * where the workspace's current snapshot is that one still (or one compacted from it), as the bucket holds it as it was
-   * read (../node-agent/agent.ts spendNow), so that release's stands.
+   * read (../node-agent/agent.ts spendNow), so that release's stands. A trace of its own, linked to the restore's it is begun
+   * by, where it is, which it outlives.
    */
   const spendLater = (pool: Pool, workspace: string, name: string, node: string, snapshot: string): Effect.Effect<void> =>
     Effect.suspend(() => {
       const pod = `${pool.namespace}/${name}`;
       if (spending.has(pod)) return Effect.void;
       spending.add(pod);
+      const begunIn = currentTraceparent();
       const it = named(pool, workspace);
       return agents.spend(node, ref(pool, workspace), snapshot).pipe(
         Effect.retry(SPEND_TRIES),
@@ -769,6 +780,11 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             ),
         }),
         Effect.ensuring(Effect.sync(() => void spending.delete(pod))),
+        withAlasioSpan("alasio.sandbox.ready.spend", {
+          attributes: { "alasio.sandbox.name": workspace, "k8s.namespace.name": pool.namespace, "k8s.pod.name": name, "alasio.snapshot": snapshot },
+          parent: null,
+          links: begunIn === null ? [] : [begunIn],
+        }),
         withLogScope("snapshots"),
         Effect.forkIn(scope),
         Effect.asVoid,
@@ -829,7 +845,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
         // Its record and its current snapshot read at once, the restore waiting on both.
-        const [record, current] = yield* Effect.all([agents.released(ref(pool, workspace)).pipe(Effect.result), agents.current(ref(pool, workspace)).pipe(Effect.result)], { concurrency: 2 });
+        const [record, current] = yield* Effect.all([agents.released(ref(pool, workspace)).pipe(Effect.result), agents.current(ref(pool, workspace)).pipe(Effect.result)], { concurrency: 2 }).pipe(
+          sandboxSpan("alasio.sandbox.restore.current", pool, workspace),
+        );
         const read = record._tag === "Success" ? current : record;
         if (read._tag === "Failure") return yield* (passing(read.failure) ? deferOr : fallBack)(pool, workspace, "unreadable", read.failure.message);
         const manifest = read.success;
@@ -847,7 +865,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         if (!kept) return yield* fallBack(pool, workspace, "release", `gVisor ${manifest.release}, which took it, is no longer kept`);
         const base = templateOf(mode, manifest.podTemplate as V1PodTemplateSpec);
         if (!base) return yield* fallBack(pool, workspace, "template", "the pool's template it was taken on is no longer kept");
-        const able = yield* nodesFor(manifest, base.spec?.tolerations ?? []).pipe(Effect.result);
+        const able = yield* nodesFor(manifest, base.spec?.tolerations ?? []).pipe(sandboxSpan("alasio.sandbox.restore.nodes", pool, workspace), Effect.result);
         if (able._tag === "Failure") return yield* deferOr(pool, workspace, "unreadable", able.failure.message);
         if (able.success.nodes.length === 0) {
           const none = `no node that takes its pod has gVisor ${manifest.release} and every CPU feature it was saved with`;
@@ -875,6 +893,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // binding's: the bind fails, as one whose pod's creation fails does, rather than make it another.
           const tried = standing === null ? null : yield* Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
             const standby = yield* standing.claim(pool, node, base, kept.runtimeClassName, labels, annotations).pipe(
+              Effect.tap((claimed) => Effect.annotateCurrentSpan({ "alasio.standby.claimed": claimed !== null })),
+              sandboxSpan("alasio.sandbox.restore.standby", pool, workspace, { "k8s.node.name": node }),
               Effect.mapError((error) => new BindStepFailed({ reason: error.message })),
             );
             if (standby === null) return null;
@@ -899,8 +919,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             // Restored into: the standby; its prepare failed, as one for a pod made for it may; or given up otherwise.
             return yield* restore(Effect.gen(function*() {
               const [prepared, attached] = yield* Effect.all([
-                agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(Effect.result),
-                attaching.attach(node, name, binding, stopReason, false).pipe(Effect.result),
+                agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(sandboxSpan("alasio.sandbox.restore.prepare", pool, workspace, { "k8s.node.name": node }), Effect.result),
+                attaching.attach(node, name, binding, stopReason, false).pipe(sandboxSpan("alasio.sandbox.restore.attach", pool, workspace, { "k8s.node.name": node, "k8s.pod.name": name }), Effect.result),
               ], { concurrency: 2 });
               if (attached._tag === "Failure") {
                 yield* giveUp(attached.failure.message);
@@ -911,7 +931,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
                 return { unprepared: prepared.failure } as const;
               }
               yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} into the standby ${name} from its snapshot ${manifest.snapshot}, taken at ${manifest.takenAt} under gVisor ${manifest.release}`);
-              const done = yield* agents.restoreStandby(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, imagePath: prepared.success.imagePath }).pipe(Effect.result);
+              const done = yield* agents.restoreStandby(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, imagePath: prepared.success.imagePath }).pipe(
+                sandboxSpan("alasio.sandbox.restore.standby_restore", pool, workspace, { "k8s.node.name": node, "k8s.pod.name": name }),
+                Effect.result,
+              );
               if (done._tag === "Failure") {
                 yield* unless(yield* giveUp(`its restore failed, so it is restored into a pod made for it: ${done.failure.message}`));
                 return { fellBack: true } as const;
@@ -937,8 +960,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           // starts, finds every file it held open.
           const name = restorePodName(pool.name, randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7));
           const [prepared, attached] = yield* Effect.all([
-            agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(Effect.result),
-            attaching.attach(node, name, binding, stopReason, true).pipe(Effect.result),
+            agents.prepare(node, ref(pool, workspace), manifest, kept.gofer ?? undefined).pipe(sandboxSpan("alasio.sandbox.restore.prepare", pool, workspace, { "k8s.node.name": node }), Effect.result),
+            attaching.attach(node, name, binding, stopReason, true).pipe(sandboxSpan("alasio.sandbox.restore.attach", pool, workspace, { "k8s.node.name": node, "k8s.pod.name": name }), Effect.result),
           ], { concurrency: 2 });
           if (prepared._tag === "Failure") {
             failures.push(prepared.failure);
@@ -972,6 +995,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
               affinity: { ...base.spec?.affinity, nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] }] } } },
             },
           }).pipe(
+            sandboxSpan("alasio.sandbox.restore.pod", pool, workspace, { "k8s.node.name": node, "k8s.pod.name": name }),
             Effect.tapError(() => attaching.detach(node, name)),
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
@@ -995,26 +1019,28 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
-        const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, of.labels).pipe(Effect.result);
-        if (done._tag === "Success") {
-          const now = yield* Clock.currentTimeMillis;
-          deferredSince.delete(named(pool, workspace));
-          restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
-          restoreDuration.record((now - of.started) / 1000);
-          // Its bind waits on none of its snapshot's spend, which a release of it asked meanwhile leaves be.
-          yield* spendLater(pool, workspace, of.pod, of.node, of.manifest.snapshot);
-          return;
-        }
-        const { reason: why, resumed, stale, failed } = done.failure;
-        // What was attached for it detached, once its pod, which its binder deletes, has gone.
-        yield* attaching.detach(of.node, of.pod);
-        // Its sandbox never having run, its restore is abandoned; one of a snapshot that holds the session no more, or that could not start from it, falls back at once.
-        if (resumed) yield* fallBack(pool, workspace, "restore", why);
-        else {
-          yield* abandon(pool, workspace, of.pod, of.node);
-          yield* (stale ? fallBack(pool, workspace, "stale", why) : failed ? fallBack(pool, workspace, "restore", why) : deferOr(pool, workspace, "restore", why)).pipe(Effect.ignore);
-        }
-        return yield* new BindStepFailed({ reason: `its restore did not come back: ${why}` });
+        yield* Effect.gen(function*() {
+          const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, of.labels).pipe(Effect.result);
+          if (done._tag === "Success") {
+            const now = yield* Clock.currentTimeMillis;
+            deferredSince.delete(named(pool, workspace));
+            restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
+            restoreDuration.record((now - of.started) / 1000);
+            // Its bind waits on none of its snapshot's spend, which a release of it asked meanwhile leaves be.
+            yield* spendLater(pool, workspace, of.pod, of.node, of.manifest.snapshot);
+            return;
+          }
+          const { reason: why, resumed, stale, failed } = done.failure;
+          // What was attached for it detached, once its pod, which its binder deletes, has gone.
+          yield* attaching.detach(of.node, of.pod);
+          // Its sandbox never having run, its restore is abandoned; one of a snapshot that holds the session no more, or that could not start from it, falls back at once.
+          if (resumed) yield* fallBack(pool, workspace, "restore", why);
+          else {
+            yield* abandon(pool, workspace, of.pod, of.node);
+            yield* (stale ? fallBack(pool, workspace, "stale", why) : failed ? fallBack(pool, workspace, "restore", why) : deferOr(pool, workspace, "restore", why)).pipe(Effect.ignore);
+          }
+          return yield* new BindStepFailed({ reason: `its restore did not come back: ${why}` });
+        }).pipe(sandboxSpan("alasio.sandbox.ready", pool, workspace, { "k8s.node.name": of.node, "k8s.pod.name": of.pod, "alasio.snapshot": of.snapshot }));
       }).pipe(withLogScope("snapshots"));
 
     return { make, ready };

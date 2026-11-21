@@ -21,6 +21,7 @@ import * as OtelTracer from "@effect/opentelemetry/OtelTracer";
 import * as Resource from "@effect/opentelemetry/Resource";
 import { Cause, Context, Effect, Exit, type Fiber, Layer, Tracer } from "effect";
 
+export type { Attributes } from "@opentelemetry/api";
 export { SpanKind } from "@opentelemetry/api";
 export {
   conversationTelemetryEnv,
