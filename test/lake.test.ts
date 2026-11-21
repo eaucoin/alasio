@@ -499,6 +499,20 @@ describe("Codex rollouts", () => {
       assert.deepEqual(await rows(db, `select home, count(*) as n from ${LAKE}.codex.lines group by home`), [{ home: "sessionfs", n: 7n }]);
     });
   });
+
+  test("a home whose tables the source is given after a loader's first load is loaded by its next", async () => {
+    await admin.query(`drop schema if exists ${SESSION_FS_SCHEMA} cascade`);
+    await withLake(async (db) => {
+      await syncLake(db);
+      // As alasio makes them once connected to Neon, after the lake's role (src/neon/connect.ts).
+      const sessionFs = new NeonRolloutStore(admin, { schema: SESSION_FS_SCHEMA });
+      await sessionFs.ensureSchema();
+      await syncLakeReads(admin, true);
+      await saveRollout("rollout-sessionfs-later.jsonl", whole, { store: sessionFs });
+      assert.equal((await syncLake(db)).codex.files, 1);
+      assert.deepEqual(await rows(db, `select home, count(*) as n from ${LAKE}.codex.lines group by home`), [{ home: "sessionfs", n: 7n }]);
+    });
+  });
 });
 
 // --- Telemetry ---------------------------------------------------------------------

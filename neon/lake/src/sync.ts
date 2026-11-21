@@ -49,8 +49,15 @@ export async function prepareLake(db: DuckDBConnection, { rebuild = false }: Reb
   return rebuilt;
 }
 
-/** One load of everything the source has that the lake does not. Returns what changed. */
+/**
+ * One load of everything the source has that the lake does not, of the source's tables as
+ * they are now. Returns what changed.
+ */
 export async function syncLake(db: DuckDBConnection, options: LakeSyncOptions = {}): Promise<LakeLoad> {
+  // DuckDB's postgres extension keeps what it first read of an attached database's tables, so
+  // a table made in the source after that, as alasio makes its session filesystems' rollouts
+  // once connected, after the lake's role, would be unseen by every load of a loader open since.
+  await db.run("call pg_clear_cache()");
   return { claude: await syncClaude(db, options), codex: await syncCodex(db, options) };
 }
 
