@@ -1,0 +1,118 @@
+name: images
+
+# alasio's images, built from the calling run's commit and pushed once, for every job of the run
+# that installs alasio to pull: under run-<id>-<attempt>, packages of the attempt's own, which
+# delete-images.yml deletes whole. A package GitHub's token makes here is linked to this public
+# repository, and public as it is, so alasio init and the clusters' nodes pull them without a
+# login. Called by ci.yml, whose upgrade shard also needs the harnesses' stand-ins on the release
+# it upgrades from, and by bench.yml.
+on:
+  workflow_call:
+    inputs:
+      upgrade:
+        description: "Whether the stand-ins are also built on the release the upgrade shard upgrades from"
+        type: boolean
+        default: false
+      # The release the upgrade shard upgrades from, which an installation runs before it
+      # upgrades to this: npm's latest, as the box's is, unless another is named.
+      previous:
+        description: "Release the upgrade shard upgrades from, as 10.0.22 (npm's latest if empty)"
+        type: string
+        default: ""
+    outputs:
+      registry:
+        description: "Where the images are, as ghcr.io/eaucoin/alasio-ci/run-<id>-<attempt>"
+        value: ${{ jobs.images.outputs.registry }}
+      previous:
+        description: "The release the upgrade shard upgrades from, where `upgrade` asks for its stand-ins"
+        value: ${{ jobs.images.outputs.previous }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/eaucoin/alasio-ci
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      registry: ${{ steps.push.outputs.registry }}
+      previous: ${{ steps.previous.outputs.previous }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # For tooling/node-image.ts, which says the node image's pins, and npm, which says the
+      # release the upgrade shard upgrades from.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - id: previous
+        name: Say the release the upgrade shard upgrades from
+        if: inputs.upgrade
+        env:
+          PREVIOUS: ${{ inputs.previous }}
+        run: |
+          previous=$(npm view "alasio@${PREVIOUS:-latest}" version)
+          [[ $previous =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::npm names no one release of alasio by ${PREVIOUS:-latest}: ${previous:-none}"; exit 1; }
+          echo "previous=$previous" | tee --append "$GITHUB_OUTPUT"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Pushes alasio's own images whole (tooling/push-whole.sh), as the release does, but the
+      # sessions' agent image, as eStargz (tooling/push-estargz.sh), which the clusters the
+      # end-to-end runs make pull lazily.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # All seven at once, each line said with its image's name, the node image with its pins
+      # (tooling/node-image.ts), whole, as Docker runs it, and on alasio's,
+      # alasio-harness-stand-ins, which the end-to-end runs install
+      # (test/e2e/harness-stand-ins.Dockerfile); and, for the upgrade shard, the stand-ins again,
+      # as alasio-harness-stand-ins-previous, on the published alasio image of the release it
+      # upgrades from; the step fails if any did.
+      - id: push
+        name: Build and push the images
+        shell: bash
+        env:
+          PUSH_TO: ${{ env.REGISTRY }}/run-${{ github.run_id }}-${{ github.run_attempt }}
+          SOURCE: https://github.com/${{ github.repository }}
+          PREVIOUS: ${{ steps.previous.outputs.previous }}
+        run: |
+          images=("alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node")
+          if [ -n "$PREVIOUS" ]; then images+=("alasio-harness-stand-ins-previous:test"); fi
+          declare -A pids
+          for image in "${images[@]}"; do
+            name=${image%%:*}
+            {
+              if [ "$name" = alasio-node ]; then
+                mapfile -t args < <(node tooling/node-image.ts)
+                docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
+                  docker push "$PUSH_TO/$name:e2e"
+              elif [ "$name" = alasio-harness-stand-ins-previous ]; then
+                tooling/push-estargz.sh "$PUSH_TO/$name:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
+                  --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS" --label "org.opencontainers.image.source=$SOURCE"
+              else
+                # alasio's own, with the commit it is built from, which its telemetry says.
+                revision=()
+                if [ "$name" = alasio ]; then revision=(--build-arg "REVISION=$GITHUB_SHA"); fi
+                # Whole, as the release pushes them, but the agent's, lazily pulled: the stand-ins on alasio's among them,
+                # which the runs install as alasio's.
+                push=tooling/push-whole.sh
+                if [ "$name" = alasio-agent ]; then push=tooling/push-estargz.sh; fi
+                "$push" "$PUSH_TO/$name:e2e" "${image#*:}" "${revision[@]}" --label "org.opencontainers.image.source=$SOURCE" &&
+                  if [ "$name" = alasio ]; then
+                    tooling/push-whole.sh "$PUSH_TO/alasio-harness-stand-ins:e2e" test --file test/e2e/harness-stand-ins.Dockerfile \
+                      --build-arg "ALASIO=$PUSH_TO/alasio:e2e" --label "org.opencontainers.image.source=$SOURCE"
+                  fi
+              fi
+            } 2>&1 | sed -u "s/^/$name: /" &
+            pids[$name]=$!
+          done
+          failed=0
+          for name in "${!pids[@]}"; do
+            wait "${pids[$name]}" || { echo "::error::$name was not built and pushed"; failed=1; }
+          done
+          echo "registry=$PUSH_TO" >>"$GITHUB_OUTPUT"
+          exit "$failed"
