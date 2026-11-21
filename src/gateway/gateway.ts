@@ -47,7 +47,7 @@ import {
 } from "./names.ts";
 import { makeFolders } from "./folders.ts";
 import { makeHarnesses } from "./harnesses.ts";
-import { makeSessions } from "./sessions.ts";
+import { makeSessions, sessionKeyAttributes } from "./sessions.ts";
 
 /** How often bound pods are looked at for one to release: each pod's bayma is asked no oftener than its poll (./sessions.ts). */
 const SWEEP_MS = 5_000;
@@ -73,7 +73,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
   const config = yield* loadConfig;
   const callerKey = yield* keyFrom(CALLER_KEY_VARIABLE);
   const bindingKey = yield* keyFrom(BINDING_KEY_VARIABLE);
-  const context = yield* Layer.build(Layer.mergeAll(Layer.provideMerge(Binder.layer({ waitMs: config.waitSeconds * 1000 }), KubeClient.layer), FetchHttpClient.layer));
+  const context = yield* Layer.build(Layer.mergeAll(Layer.provideMerge(Binder.layer({ waitMs: config.waitSeconds * 1000, attributesOf: sessionKeyAttributes }), KubeClient.layer), FetchHttpClient.layer));
   yield* Effect.gen(function*() {
     const binder = yield* Binder;
     const agents = yield* makeNodeAgents(config.nodeAgents);
@@ -220,6 +220,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
           Effect.map((addresses) => addresses.map(({ address }) => `${address}:${config.port}`).filter((peer) => !peer.startsWith(`${process.env["POD_IP"] ?? ""}:`))),
           Effect.orElseSucceed(() => []),
         ),
+      attributesOf: sessionKeyAttributes,
     });
     yield* Effect.logInfo(`the sandbox gateway serves on port ${served.port}, for ${(yield* environments.current).map(({ name }) => name).join(", ")}`);
   }).pipe(Effect.provide(context));
