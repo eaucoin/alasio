@@ -941,41 +941,51 @@ export function neonStack(): void {
         // Two of three keep the quorum while it is away.
         await kube.patch(set, { spec: { replicas: 2 } });
         await awaitReplaced([pod]);
-        // What its node has left, its room with it, taken by a pod of the floor that prefers its node and may run on any:
-        // all but what runs at the floor or above, as it takes the place of any pod below the floor there, a read
-        // replica's, which it does only where no other node takes it, so the others are cordoned until it runs.
+        // VPA's updater held until the safekeeper is back: a pod of the floor it resized in place as the pods the
+        // filler preempted ended would take the room the filler waits for, which it takes back from none of its own
+        // priority (as neon-proxy's first resize, of 20m to 78m, did).
+        const updater = ref("Deployment", componentName("vpa-updater"), NAMESPACE);
+        const updating = await kube.get<V1Deployment>(updater);
         const others = (await kube.list<V1Node>("Node")).map(({ metadata }) => metadata?.name ?? "").filter((other) => other !== node);
         const cordoned = (unschedulable: boolean) => Promise.all(others.map((other) => kube.patch(ref("Node", other), { spec: { unschedulable } })));
-        const allocatable = await kube.get<V1Node>(ref("Node", node));
-        const floor = (await kube.get<V1PriorityClass>(ref("PriorityClass", `${RELEASE}-floor`)))?.value ?? 0;
-        const pods = await kube.list<V1Pod>("Pod", { fieldSelector: `spec.nodeName=${node},status.phase!=Succeeded,status.phase!=Failed` });
-        const requested = pods.filter(({ spec }) => (spec?.priority ?? 0) >= floor).reduce((sum, { spec }) => sum + (spec ? cpuRequested(spec) : 0), 0);
-        const free = cpuMillis(allocatable?.status?.allocatable?.["cpu"] ?? "0") - requested;
-        assert.ok(free > 0, `${node} has ${free}m of CPU free`);
         const filler = `${RELEASE}-e2e-filler`;
-        const labels = { "app.kubernetes.io/name": "e2e-filler" };
-        const safekeepers = await kube.get<V1StatefulSet>(set);
-        const deployment: V1Deployment = {
-          apiVersion: "apps/v1",
-          kind: "Deployment",
-          metadata: { name: filler, namespace: NAMESPACE, labels },
-          spec: {
-            replicas: 1,
-            selector: { matchLabels: labels },
-            template: {
-              metadata: { labels },
-              spec: {
-                priorityClassName: `${RELEASE}-floor`,
-                affinity: { nodeAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [{ weight: 100, preference: { matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] } }] } },
-                automountServiceAccountToken: false,
-                terminationGracePeriodSeconds: 0,
-                securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
-                containers: [{ name: "filler", image: image(safekeepers), command: ["sleep", "infinity"], securityContext: restricted, resources: { requests: { cpu: `${free}m` } } }],
+        try {
+          if (updating) {
+            const updaters = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(updating.spec?.selector?.matchLabels ?? {}) });
+            await kube.patch(updater, { spec: { replicas: 0 } });
+            await awaitReplaced(updaters);
+          }
+          // What its node has left, its room with it, taken by a pod of the floor that prefers its node and may run on any:
+          // all but what runs at the floor or above, as it takes the place of any pod below the floor there, a read
+          // replica's, which it does only where no other node takes it, so the others are cordoned until it runs.
+          const allocatable = await kube.get<V1Node>(ref("Node", node));
+          const floor = (await kube.get<V1PriorityClass>(ref("PriorityClass", `${RELEASE}-floor`)))?.value ?? 0;
+          const pods = await kube.list<V1Pod>("Pod", { fieldSelector: `spec.nodeName=${node},status.phase!=Succeeded,status.phase!=Failed` });
+          const requested = pods.filter(({ spec }) => (spec?.priority ?? 0) >= floor).reduce((sum, { spec }) => sum + (spec ? cpuRequested(spec) : 0), 0);
+          const free = cpuMillis(allocatable?.status?.allocatable?.["cpu"] ?? "0") - requested;
+          assert.ok(free > 0, `${node} has ${free}m of CPU free`);
+          const labels = { "app.kubernetes.io/name": "e2e-filler" };
+          const safekeepers = await kube.get<V1StatefulSet>(set);
+          const deployment: V1Deployment = {
+            apiVersion: "apps/v1",
+            kind: "Deployment",
+            metadata: { name: filler, namespace: NAMESPACE, labels },
+            spec: {
+              replicas: 1,
+              selector: { matchLabels: labels },
+              template: {
+                metadata: { labels },
+                spec: {
+                  priorityClassName: `${RELEASE}-floor`,
+                  affinity: { nodeAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [{ weight: 100, preference: { matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] } }] } },
+                  automountServiceAccountToken: false,
+                  terminationGracePeriodSeconds: 0,
+                  securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
+                  containers: [{ name: "filler", image: image(safekeepers), command: ["sleep", "infinity"], securityContext: restricted, resources: { requests: { cpu: `${free}m` } } }],
+                },
               },
             },
-          },
-        };
-        try {
+          };
           await cordoned(true);
           await kube.apply(deployment);
           const placed = async () => (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(labels) })).find(({ spec, status }) => spec?.nodeName === node && status?.phase === "Running");
@@ -996,6 +1006,7 @@ export function neonStack(): void {
           await cordoned(false);
           await kube.remove(ref("Deployment", filler, NAMESPACE)).catch(() => {});
           await kube.patch(set, { spec: { replicas: 3 } });
+          if (updating) await kube.patch(updater, { spec: { replicas: updating.spec?.replicas ?? 1 } });
         }
         await awaitPodReady(name);
       });
