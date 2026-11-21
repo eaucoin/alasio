@@ -453,6 +453,26 @@ test("the node's containers are read with the runsc of the release its runtime s
   }
 });
 
+test("a container whose state names no process of its sandbox, not stopped, is one whose sandbox is gone, but one runsc is still creating, which it names none of either, is not", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-runsc-no-process-"));
+  try {
+    const releases = fakeReleases(root, [RELEASE]);
+    releases.runs(CONTAINER, RELEASE, SESSIONS, POD);
+    const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: RELEASE });
+    const read = async (status: string, pid: number) => {
+      releases.held(CONTAINER, status, pid);
+      const failed = await Effect.runPromise(Effect.flip(runsc.container(CONTAINER)));
+      return [failed._tag, failed.message];
+    };
+    for (const [status, pid] of [["running", -1], ["running", 0], ["paused", -1], ["created", -1]] as const) {
+      assert.deepEqual(await read(status, pid), ["SandboxGone", `the sandbox of ${CONTAINER} is gone: runsc's state names no process of its sandbox`], `${status} ${pid}`);
+    }
+    assert.deepEqual(await read("creating", -1), ["RunscError", `runsc state ${CONTAINER} of the node's failed: runsc's state says it is still being created`]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a checkpoint saves the sandbox with its release's runsc, uploads its image under its digest, checks the bucket holds it as put, then writes its manifest and commits it", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {

@@ -259,7 +259,8 @@ export interface Runsc {
    * sandbox tracks its writes, as the flags its process was started with say (its
    * runtime's options file when it started, which may have changed since). One whose sandbox is gone fails SandboxGone:
    * runsc's state says it stopped, as runsc says one whose sandbox died (of one it held paused too, from
-   * 20261102.0-eaucoin.7 on), or names no process of its sandbox, or one the node's /proc holds no more.
+   * 20261102.0-eaucoin.7 on), or names no process of its sandbox, or one the node's /proc holds no more. One runsc is
+   * still creating fails RunscError: its sandbox is not gone, but not yet one to read.
    */
   readonly container: (containerId: string) => Effect.Effect<RunningContainer, RunscError | SandboxGone>;
   /** The containers runsc keeps under the root, whichever release runs each, as `runsc list` says. */
@@ -479,6 +480,8 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         const { stdout } = yield* runCurrent(["state"], [containerId]);
         const state = yield* Effect.try({ try: () => Schema.decodeUnknownSync(ContainerState)(JSON.parse(stdout)), catch: (cause) => failed(`its state is not one: ${String(cause)}`) });
         if (state.status === "stopped") return yield* new SandboxGone({ containerId, reason: "runsc's state says it stopped" });
+        // Of one it is still creating, runsc names no process (container.go SandboxPid), as of one whose sandbox is gone.
+        if (state.status === "creating") return yield* failed("runsc's state says it is still being created");
         const { pid } = state;
         if (pid === undefined || pid <= 0) return yield* new SandboxGone({ containerId, reason: "runsc's state names no process of its sandbox" });
         const proc = join(procRoot, String(pid));
