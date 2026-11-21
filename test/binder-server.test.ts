@@ -995,19 +995,37 @@ test("a front that checks each environment's callers by its own key takes a toke
 });
 
 /** A stand-in for a bound pod at `host`, on `port` or one of its own: the bodies it was sent, in order, and how to stop it. */
-async function podAt(host: string, port = 0): Promise<{ port: number; bodies: string[]; close: () => Promise<void> }> {
+async function podAt(host: string, port = 0, drops: () => boolean = () => false): Promise<{ port: number; bodies: string[]; close: () => Promise<void> }> {
   const bodies: string[] = [];
   const server = createServer((incoming, outgoing) => {
     let body = "";
     incoming.on("data", (chunk: Buffer) => (body += chunk.toString()));
     incoming.on("end", () => {
       bodies.push(body);
-      outgoing.writeHead(200, { "content-type": "application/json" }).end("{}");
+      if (drops()) incoming.socket.destroy();
+      else outgoing.writeHead(200, { "content-type": "application/json" }).end("{}");
     });
   });
   server.listen(port, host);
   await once(server, "listening");
   return { port: (server.address() as AddressInfo).port, bodies, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+/**
+ * A pod's stand-in at 127.0.0.2 (podAt, dropping its connections unanswered while `drops` says so) and, at the same
+ * port, another's at 127.0.0.1, as a pod gone and the one bound in its place serve on one port. The first is given
+ * another port where another of the host's sockets holds its port at 127.0.0.1, ten times at most.
+ */
+async function podsOnOnePort(drops?: () => boolean): Promise<[Awaited<ReturnType<typeof podAt>>, Awaited<ReturnType<typeof podAt>>]> {
+  for (let tries = 1; ; tries++) {
+    const gone = await podAt("127.0.0.2", 0, drops);
+    const next = await podAt("127.0.0.1", gone.port).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EADDRINUSE" || tries === 10) throw error;
+      return null;
+    });
+    if (next !== null) return [gone, next];
+    await gone.close();
+  }
 }
 
 test("a binding is stamped active as its bind is through, so one whose bind took longer than the wait to release it, as a restore's may, is not idle as its first request comes", async () => {
@@ -1102,8 +1120,7 @@ test("a warm bind of a pool's free pod made long before releaseAfter, its bayma 
 
 test("a request on a route the front knew of, whose binding was released before its watch said so, binds its key anew and is passed there, its caller never told the pod was not reached", async () => {
   const of = await pool();
-  const gone = await podAt("127.0.0.2");
-  const next = await podAt("127.0.0.1", gone.port);
+  const [gone, next] = await podsOnOnePort();
   await freePods(of, 1, 0, "127.0.0.2");
   const served = await front(of, gone.port);
   try {
@@ -1128,8 +1145,7 @@ test("a request on a route the front knew of, whose binding was released before 
 
 test("a request of no stated length on a route of a binding gone is streamed to its pod once, never read whole to pass again: its caller is told it was passed to no pod, to send it again itself", async () => {
   const of = await pool();
-  const gone = await podAt("127.0.0.2");
-  const next = await podAt("127.0.0.1", gone.port);
+  const [gone, next] = await podsOnOnePort();
   await freePods(of, 1, 0, "127.0.0.2");
   const served = await front(of, gone.port);
   try {
@@ -1159,22 +1175,9 @@ test("a request on a route of a binding gone that reached its pod before its con
   const of = await pool();
   // Its pod takes the request, then drops its connection unanswered, as one ending under it would.
   let dropping = false;
-  const taken: string[] = [];
-  const old = createServer((incoming, outgoing) => {
-    let body = "";
-    incoming.on("data", (chunk: Buffer) => (body += chunk.toString()));
-    incoming.on("end", () => {
-      taken.push(body);
-      if (dropping) incoming.socket.destroy();
-      else outgoing.writeHead(200, { "content-type": "application/json" }).end("{}");
-    });
-  });
-  old.listen(0, "127.0.0.2");
-  await once(old, "listening");
-  const port = (old.address() as AddressInfo).port;
-  const next = await podAt("127.0.0.1", port);
+  const [old, next] = await podsOnOnePort(() => dropping);
   await freePods(of, 1, 0, "127.0.0.2");
-  const served = await front(of, port);
+  const served = await front(of, old.port);
   try {
     const key = "sessionfs:dropped";
     const asked = (body: string) => fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body });
@@ -1186,12 +1189,12 @@ test("a request on a route of a binding gone that reached its pod before its con
     // Its pod may have run it: not to be sent again, as the front says by neither header.
     assert.deepEqual([second.status, second.headers.get("retry-after"), second.headers.get(NOT_PASSED_HEADER)], [503, null, null]);
     assert.deepEqual(await second.json(), { error: `the pod of ${key} was not reached` });
-    assert.deepEqual(taken, ["first", "second"]);
+    assert.deepEqual(old.bodies, ["first", "second"]);
     assert.deepEqual(next.bodies, [], "passed again");
   } finally {
     await served.close();
     await next.close();
-    old.close();
+    await old.close();
   }
 });
 
