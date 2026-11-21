@@ -6,10 +6,12 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Deferred, Effect, Fiber, Layer } from "effect";
 
 import { added } from "./support/metrics.ts";
+import { childrenOf, ended, endedLater, endedSpan } from "./support/spans.ts";
 import { BIND_DURATION, BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
 import { type BindingLease, claim, markReleasing, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
 import { BINDING_LABEL, boundLabels, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL } from "../src/binder/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
+import { TracingLayer } from "../src/telemetry/index.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
 // Bindings on a real API server, as the races between binders are its to decide: each
@@ -470,6 +472,25 @@ test("a release with a step after is through once its step before is: the step a
   assert.deepEqual(happened, ["saved", `ended ${first.pod}`, "bound again"]);
   assert.notEqual(bound.pod, first.pod);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [bound.pod]);
+});
+
+test("a bind and a release are traced step by step, their spans saying the key, its pool and what the binder is told to say of it beside: a bind's Lease taken, its pod got, and its wait for it to serve; a release's step before, and its end, which runs on after it, a trace of its own linked to the release's", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf({ attributesOf: (key) => ({ "alasio.sandbox.name": key.slice("sessionfs:".length) }) });
+  const since = ended().length;
+  await bindIn(layer, (each) => each.bind(of, "sessionfs:fs-traced").pipe(Effect.provide(TracingLayer)));
+  const bind = endedSpan("alasio.binder.bind");
+  assert.deepEqual(childrenOf(bind).map(({ name }) => name), ["alasio.binder.lease", "alasio.binder.pod_for", "alasio.binder.serving"]);
+  assert.deepEqual(
+    ["alasio.sandbox.key", "alasio.sandbox.name", "alasio.binder.pool", "k8s.namespace.name", "alasio.binder.start"].map((name) => bind.attributes[name]),
+    ["sessionfs:fs-traced", "fs-traced", of.name, of.namespace, "warm"],
+  );
+  await bindIn(layer, (each) => each.release(of, "sessionfs:fs-traced", { before: () => Effect.void, after: () => Effect.void }).pipe(Effect.provide(TracingLayer)));
+  const release = endedSpan("alasio.binder.release");
+  assert.deepEqual([childrenOf(release).map(({ name }) => name), release.attributes["alasio.binder.release.outcome"]], [["alasio.binder.release.save"], "released"]);
+  const end = await endedLater("alasio.binder.release.end", since);
+  assert.deepEqual([end.parentSpanContext, end.links.map(({ context }) => context.spanId)], [undefined, [release.spanContext().spanId]]);
 });
 
 test("a hold of a key whose release is through waits for what comes after it, as its releaser's caller was told it is released, then holds the key", async () => {

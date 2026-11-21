@@ -11,6 +11,7 @@ import { Deferred, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 import { added, collected } from "./support/metrics.ts";
+import { childrenOf, ended, endedLater, endedSpan } from "./support/spans.ts";
 import { Binder } from "../src/binder/binder.ts";
 import { type BindingLease, markReleasing, readLease, reconcile, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, leaseName, type Pool } from "../src/binder/names.ts";
@@ -25,6 +26,7 @@ import type { Released } from "../src/node-agent/workspaces.ts";
 import { DEFER_FOR_MS } from "../src/gateway/snapshots.ts";
 import { type AttachRequest, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { sessionKey } from "../src/sandbox/names.ts";
+import { currentTraceparent, TracingLayer } from "../src/telemetry/index.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
 // The gateway's session workspaces on a real API server, each pool's pods at the loopback's
@@ -477,6 +479,20 @@ test("a release its caller asks is through once its snapshot is recorded, before
   const rebound = await again;
   assert.deepEqual(recorded.asked.slice(2), [`detach node-a ${env.namespace}/${bound.pod}`, "bound again"]);
   assert.notEqual(rebound.pod, bound.pod);
+});
+
+test("a release's save is traced under the binder's step before the release: its record read, its sandbox's checkpoint, and its release recorded, saying how it came out", async () => {
+  const env = await environment(1, { gvisor: true });
+  const recorded = agents();
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-saved");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  assert.equal(await Effect.runPromise(binder.release(placement.pool, key, placement.release).pipe(Effect.provide(TracingLayer))), "released");
+  const save = endedSpan("alasio.sandbox.release");
+  assert.equal(save.parentSpanContext?.spanId, endedSpan("alasio.binder.release.save").spanContext().spanId);
+  assert.deepEqual(childrenOf(save).map(({ name }) => name), ["record_read", "checkpoint", "record"].map((step) => `alasio.sandbox.release.${step}`));
+  assert.deepEqual([save.attributes["alasio.sandbox.name"], save.attributes["alasio.sandbox.release.outcome"]], ["fs-saved", "snapshotted"]);
 });
 
 test("a release asked again after its save took its snapshot, as one whose detach failed is, is released into that snapshot, never saved anew: the snapshot kept, and recorded, for its next bind to restore, and the binding counted released once, as the release that was through was", async () => {
@@ -1098,6 +1114,47 @@ test("a workspace released into its snapshot is restored from it as it is next b
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=restored": 1 });
   // A free pod of the pool's claimed by none.
   assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
+});
+
+test("a restore's bind is traced step by step: its Lease taken; its pod got, the restore's record and current snapshot read, its nodes found, a standby looked for, its snapshot prepared beside its workspace's attach, and its pod made; its pod readied, waited for to run, its network policies listed, its sandbox resumed in the trace its node's agent continues, its condition set and its record cleared; and its wait to serve; its spend a trace of its own, linked to its readying", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-0000001a";
+  const recorded = restoringAgents(manifestOf(env, "fs-traced", snapshot), { snapshot, release: "r1" });
+  // The trace its node's agent is asked to resume it in.
+  const resumedIn: (string | null)[] = [];
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    resume: (node, request, bytes) => Effect.sync(() => void resumedIn.push(currentTraceparent())).pipe(Effect.andThen(recorded.agents.resume(node, request, bytes))),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-traced");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const since = ended().length;
+  const binding = Effect.runPromise(binder.bind(placement.pool, key, placement).pipe(Effect.provide(TracingLayer)));
+  await runs(env, (await restorePodOf(env)).metadata?.name ?? "");
+  await binding;
+  const spanOf = (name: string) => ended().slice(since).find((span) => span.name === name);
+  const namesUnder = (name: string) => {
+    const parent = spanOf(name);
+    assert.ok(parent, `no span ${name} ended`);
+    return childrenOf(parent).map((span) => span.name);
+  };
+  assert.deepEqual(namesUnder("alasio.binder.bind"), ["alasio.binder.lease", "alasio.binder.pod_for", "alasio.binder.readied", "alasio.binder.serving"]);
+  assert.deepEqual(namesUnder("alasio.binder.pod_for"), ["alasio.sandbox.restore"]);
+  assert.deepEqual(namesUnder("alasio.sandbox.restore"), ["current", "nodes", "standby", "prepare", "attach", "pod"].map((step) => `alasio.sandbox.restore.${step}`));
+  assert.equal(spanOf("alasio.sandbox.restore.standby")?.attributes["alasio.standby.claimed"], false);
+  assert.deepEqual(namesUnder("alasio.binder.readied"), ["alasio.sandbox.ready"]);
+  // Its resume asked as its pod is waited for to run, beside it.
+  const readying = namesUnder("alasio.sandbox.ready");
+  assert.deepEqual([readying[0], readying.slice(1, 3).toSorted(), readying[3], readying.length], ["alasio.sandbox.ready.policies", ["alasio.sandbox.ready.pod_running", "alasio.sandbox.ready.resume"], "alasio.sandbox.ready.condition", 4]);
+  const ready = spanOf("alasio.sandbox.ready");
+  assert.deepEqual([ready?.attributes["alasio.sandbox.name"], ready?.attributes["k8s.namespace.name"]], ["fs-traced", env.namespace]);
+  const resume = spanOf("alasio.sandbox.ready.resume");
+  assert.deepEqual(resumedIn.map((traceparent) => traceparent?.split("-")[2]), [resume?.spanContext().spanId]);
+  const spend = await endedLater("alasio.sandbox.ready.spend", since);
+  assert.deepEqual([spend.parentSpanContext, spend.links.map(({ context }) => context.spanId)], [undefined, [ready?.spanContext().spanId]]);
+  await spent(recorded.asked, "node-a", snapshot);
 });
 
 /** The standbys of `env`'s pool on node-a, not being deleted, once there are `count` of them. */

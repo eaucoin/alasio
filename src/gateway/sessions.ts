@@ -72,7 +72,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { isValidVolumeId, sessionKey, volumeIdOfKey } from "../sandbox/names.ts";
-import { meter } from "../telemetry/index.ts";
+import { type Attributes, meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
 import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
 import { killedForMemory, memoryLimitOf, released } from "./releases.ts";
@@ -83,6 +83,12 @@ export const ATTACH_DURATION = "alasio.gateway.attach.duration";
 export const DETACH_DURATION = "alasio.gateway.detach.duration";
 const attachDuration = meter.createHistogram(ATTACH_DURATION, { description: "How long a node agent took to attach a workspace into its bound pod", unit: "s" });
 const detachDuration = meter.createHistogram(DETACH_DURATION, { description: "How long a node agent took to detach a workspace from its released pod", unit: "s" });
+
+/** What the spans of a key's requests, binds and releases say of it beside it: the workspace it names, where it names a session's. */
+export const sessionKeyAttributes = (key: string): Attributes => {
+  const volumeId = volumeIdOfKey(key);
+  return volumeId === null ? {} : { "alasio.sandbox.name": volumeId };
+};
 
 /** `effect`, its duration, when it succeeds, recorded on `histogram` of `pool`'s namespace. */
 const timed = <A, E, R>(histogram: typeof attachDuration, pool: Pool, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>

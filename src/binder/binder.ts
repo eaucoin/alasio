@@ -14,6 +14,11 @@
  * How long each binding this binder made took, from the bind asked to its pod serving, is
  * BIND_DURATION's, by its pool and how its pod came: `warm`, a free pod claimed at once;
  * `cold`, waited for, as its pool was scaled; `made`, its own, as a restore makes one.
+ *
+ * Each bind and release is traced, step by step, its spans saying its key, its pool, and what
+ * `attributesOf` says of the key beside: a bind's Lease taken, its pod got and readied, and its
+ * wait for the pod to serve; a release's step before, and its end, a trace of its own, linked to
+ * the release's, where it runs on in the background.
  */
 import { randomUUID } from "node:crypto";
 
@@ -21,7 +26,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
-import { meter } from "../telemetry/index.ts";
+import { type Attributes, currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 import { BINDING_TIMEOUT_MS, type BindingLease, boundPod, claim, holdLease, markReleased, markReleasing, readLease, RELEASED_ANNOTATION, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
 import { boundAnnotations, boundLabels, type Pool } from "./names.ts";
 
@@ -35,11 +40,15 @@ export const BIND_POLL_MS = 250;
  */
 export const RENEW_MS = 10_000;
 
-/** What Binder.layer is given: how long a bind waits, and how often a binding under way is renewed, and after how long unrenewed it is stale. */
+/**
+ * What Binder.layer is given: how long a bind waits, and how often a binding under way is renewed, and after how long unrenewed
+ * it is stale; and what the spans of a key's binds and releases say of it beside its key, none unless given.
+ */
 export interface BinderOptions {
   readonly waitMs: number;
   readonly renewMs?: number;
   readonly staleMs?: number;
+  readonly attributesOf?: (key: string) => Attributes;
 }
 
 /** The histogram of how long the bindings a binder made took, as the module says. */
@@ -186,11 +195,15 @@ export class Binder extends Context.Service<Binder, {
   readonly bound: (pool: Pool, key: string) => Effect.Effect<Bound | null, KubeApiError>;
 }>()("alasio/binder/Binder") {
   /** On the KubeClient, each bind waiting up to `waitMs`. */
-  static readonly layer = ({ waitMs, renewMs = RENEW_MS, staleMs = BINDING_TIMEOUT_MS }: BinderOptions): Layer.Layer<Binder, never, KubeClient> =>
+  static readonly layer = ({ waitMs, renewMs = RENEW_MS, staleMs = BINDING_TIMEOUT_MS, attributesOf = () => ({}) }: BinderOptions): Layer.Layer<Binder, never, KubeClient> =>
     Layer.effect(
       Binder,
       Effect.gen(function*() {
         const kube = yield* KubeClient;
+        /** What the spans of `key`'s bind or release in `pool` say of it. */
+        const keyAttributes = (pool: Pool, key: string): Attributes => ({ "alasio.sandbox.key": key, "alasio.binder.pool": pool.name, "k8s.namespace.name": pool.namespace, ...attributesOf(key) });
+        /** `effect` as the step `name` of a bind or release of `key` in `pool`, in a span of its own. */
+        const step = (name: string, pool: Pool, key: string) => withAlasioSpan(name, { attributes: keyAttributes(pool, key) });
         const provide = <A, E>(effect: Effect.Effect<A, E, KubeClient>) => Effect.provideService(effect, KubeClient, kube);
         // This replica, as its Leases under way name it.
         const binder = randomUUID();
@@ -284,11 +297,15 @@ export class Binder extends Context.Service<Binder, {
             let start: PodStart = "warm";
             const readied = (lost: () => boolean) =>
               Effect.gen(function*() {
-                const got = yield* podFor(pool, key, taken.metadata?.uid ?? "", make, deadline, lost);
+                const got = yield* podFor(pool, key, taken.metadata?.uid ?? "", make, deadline, lost).pipe(
+                  Effect.tap(({ start: came }) => Effect.annotateCurrentSpan({ "alasio.binder.start": came })),
+                  step("alasio.binder.pod_for", pool, key),
+                );
                 const pod = got.pod;
                 start = got.start;
                 if (prepare) {
                   yield* prepare(pod, taken.metadata?.uid ?? "").pipe(
+                    step("alasio.binder.readied", pool, key),
                     Effect.tapError(() => kube.remove("v1", "Pod", pool.namespace, pod.metadata?.name ?? "").pipe(Effect.ignore)),
                   );
                 }
@@ -351,29 +368,39 @@ export class Binder extends Context.Service<Binder, {
             const marked = yield* provide(markReleasing(lease, binder));
             if (!marked) return "busy";
             const bound = { pod, binding: marked.metadata?.uid ?? "" };
-            const { lease: held } = yield* renewing(marked, () => before ? before(bound) : Effect.void, (renewed) => provide(unmarkReleasing(renewed)).pipe(Effect.ignore));
+            const { lease: held } = yield* renewing(marked, () => (before ? before(bound).pipe(step("alasio.binder.release.save", pool, key)) : Effect.void), (renewed) =>
+              provide(unmarkReleasing(renewed)).pipe(Effect.ignore));
             if (!after) {
-              yield* ended(pool, pod, held);
+              yield* ended(pool, pod, held).pipe(step("alasio.binder.release.end", pool, key));
               return done;
             }
             const through = held && !already ? yield* provide(markReleased(held)) : held;
+            const releasedIn = yield* Effect.sync(currentTraceparent);
             yield* Effect.forkDetach(ending(pool, pod, through, after(bound)).pipe(
               Effect.catch((error) => Effect.logWarning(`${key}'s release was through, but ending its pod ${pod} failed: ${error.message}`)),
+              withAlasioSpan("alasio.binder.release.end", { attributes: keyAttributes(pool, key), parent: null, links: releasedIn === null ? [] : [releasedIn] }),
             ));
             return done;
-          });
+          }).pipe(
+            Effect.tap((done) => Effect.annotateCurrentSpan({ "alasio.binder.release.outcome": done })),
+            step("alasio.binder.release", pool, key),
+          );
 
         const bind = (pool: Pool, key: string, options: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
             const asked = yield* Clock.currentTimeMillis;
             const deadline = asked + (options.waitMs ?? waitMs);
             for (;;) {
-              const taken = yield* provide(takeLease(pool, key, binder, staleMs));
+              const taken = yield* provide(takeLease(pool, key, binder, staleMs)).pipe(
+                Effect.tap(({ taken: took }) => Effect.annotateCurrentSpan({ "alasio.binder.lease.taken": took })),
+                step("alasio.binder.lease", pool, key),
+              );
               if (taken.taken) {
                 const bound = yield* underWay(pool, key, taken.lease, options, deadline);
                 if (bound === null) continue;
-                const served = yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);
+                const served = yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline).pipe(step("alasio.binder.serving", pool, key));
                 const took = ((yield* Clock.currentTimeMillis) - asked) / 1000;
+                yield* Effect.annotateCurrentSpan({ "alasio.binder.start": bound.start });
                 bindDuration.record(took, { "alasio.binder.pool": pool.name, "k8s.namespace.name": pool.namespace, "alasio.binder.start": bound.start });
                 return served;
               }
@@ -388,7 +415,7 @@ export class Binder extends Context.Service<Binder, {
                 }
               } else if (holder) {
                 const pod = yield* provide(boundPod(pool, key));
-                if (pod?.metadata?.name === holder && !pod.metadata.deletionTimestamp) return yield* servingBy(pool, key, taken.lease.metadata?.uid ?? "", holder, deadline);
+                if (pod?.metadata?.name === holder && !pod.metadata.deletionTimestamp) return yield* servingBy(pool, key, taken.lease.metadata?.uid ?? "", holder, deadline).pipe(step("alasio.binder.serving", pool, key));
                 // Its pod gone, or going: its Lease let go, as it was read, and the key bound anew.
                 yield* provide(releaseLease(taken.lease)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
                 continue;
@@ -396,7 +423,7 @@ export class Binder extends Context.Service<Binder, {
               if ((yield* Clock.currentTimeMillis) >= deadline) return yield* new BindTimeout({ key, pool: pool.name, waited: "binding" });
               yield* Effect.sleep(BIND_POLL_MS);
             }
-          });
+          }).pipe(step("alasio.binder.bind", pool, key));
 
         const hold = <A, E>(pool: Pool, key: string, effect: Effect.Effect<A, E>): Effect.Effect<{ readonly value: A } | null, KubeApiError | E> =>
           Effect.gen(function*() {
