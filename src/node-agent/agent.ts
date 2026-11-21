@@ -104,7 +104,7 @@ import { Clock, type Duration, Effect, FiberMap, Option, RcMap, Schedule, Schema
 import type { KubeApiError } from "../kube/client.ts";
 import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
-import { meter, withAlasioSpan } from "../telemetry/index.ts";
+import { currentTraceparent, meter, withAlasioSpan, withWaitSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
@@ -1059,18 +1059,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /**
    * `effect` once no other operation runs on the workspaces, each held in the order of its
    * name, so that two operations never wait on each other; the workspaces in flight from
-   * its call on, as it waits too.
+   * its call on, as it waits too; its wait for them a step of its own, `waited`, where given.
    */
-  const exclusive = <A, E>(workspaces: readonly WorkspaceRef[], effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
-    inFlightWhile(
-      workspaces,
+  const exclusive = <A, E>(workspaces: readonly WorkspaceRef[], effect: Effect.Effect<A, E>, waited?: string): Effect.Effect<A, E> => {
+    const holding = (held: Effect.Effect<A, E>) =>
       Effect.scoped(
         [...new Set(workspaces.map(prefixOf))].sort().reduceRight<Effect.Effect<A, E, Scope.Scope>>(
-          (held, name) => RcMap.get(locks, name).pipe(Effect.flatMap((lock) => held.pipe(Semaphore.withPermit(lock)))),
-          effect,
+          (inner, name) => RcMap.get(locks, name).pipe(Effect.flatMap((lock) => inner.pipe(Semaphore.withPermit(lock)))),
+          held,
         ),
-      ),
-    );
+      );
+    const [one] = workspaces;
+    return inFlightWhile(workspaces, waited === undefined ? holding(effect) : withWaitSpan(waited, workspaces.length === 1 && one ? spanAttributes(one) : {})(holding, effect));
+  };
 
   /** How long `effect` took, in milliseconds, and what it came to. */
   const timed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<readonly [number, A], E> =>
@@ -1149,11 +1150,15 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }),
     );
 
-  /** The files of the image `digest` the cache holds of the workspace, uploaded, as putFile puts them: each with the ETag its upload was answered with. */
-  const upload = (ref: WorkspaceRef, digest: string, files: readonly ImageFile[], ready?: () => Promise<void>): Effect.Effect<Layer, S3Error> =>
+  /**
+   * The files of the image `digest` the cache holds of the workspace, uploaded, as putFile puts them: each with the ETag its
+   * upload was answered with, and in a span of its own, `put`, of its bytes.
+   */
+  const upload = (ref: WorkspaceRef, digest: string, files: readonly ImageFile[], put: string, ready?: () => Promise<void>): Effect.Effect<Layer, S3Error> =>
     Effect.forEach(files, (file) =>
       bucket.putFile(layerKey(ref, digest, file.path), join(cache.image(ref.environment, ref.workspace, digest), file.path), ready).pipe(
         Effect.map((etag) => ({ ...file, etag })),
+        withAlasioSpan(put, { attributes: { ...spanAttributes(ref), "alasio.snapshot.file": file.path, "alasio.snapshot.bytes": file.bytes } }),
       )).pipe(Effect.map((uploaded) => ({ digest, files: uploaded })));
 
   /**
@@ -1172,24 +1177,25 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /**
    * `layer`, an image of the workspace's that a new snapshot refers to, as the bucket holds
-   * it: as it was put, checked; or put again from the cache (putAgain).
+   * it: as it was put, checked; or put again from the cache (putAgain), each file's upload as
+   * `put` names its span.
    */
-  const layerInBucket = (ref: WorkspaceRef, layer: Layer): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
-    Effect.flatMap(inBucket(ref, layer), (held) => (held ? Effect.succeed(layer) : putAgain(ref, layer)));
+  const layerInBucket = (ref: WorkspaceRef, layer: Layer, put: string): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
+    Effect.flatMap(inBucket(ref, layer), (held) => (held ? Effect.succeed(layer) : putAgain(ref, layer, put)));
 
   /**
    * `layer`, an image of the workspace's that a new snapshot refers to, which the bucket lost,
    * or holds another of its digest: put again from the cache, whose files must be the
-   * manifest's.
+   * manifest's, each file's upload as `put` names its span.
    */
-  const putAgain = (ref: WorkspaceRef, layer: Layer): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
+  const putAgain = (ref: WorkspaceRef, layer: Layer, put: string): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const reason = `its image ${layer.digest} is not in the bucket as it was put`;
       if (!(yield* cache.holds(ref.environment, ref.workspace, layer.digest))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor in this node's cache` });
       const files = yield* onDisk(() => imageFiles(cache.image(ref.environment, ref.workspace, layer.digest)));
       if (!sameFiles(files, layer)) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, and this node's cache holds other files of it` });
       yield* Effect.logWarning(`${reason}: it is put again from this node's cache`);
-      const again = yield* upload(ref, layer.digest, files);
+      const again = yield* upload(ref, layer.digest, files, put);
       if (!(yield* inBucket(ref, again))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor once put again` });
       return again;
     });
@@ -1257,32 +1263,41 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
         live: live !== undefined,
       });
-      const [pauseMs] = yield* timed(askedAt === null ? saved : boundWhileLoading(request, askedAt, saved));
+      const [pauseMs] = yield* timed(askedAt === null ? saved : boundWhileLoading(request, askedAt, saved)).pipe(
+        Effect.tap(([took]) => Effect.annotateCurrentSpan({ "alasio.snapshot.pause_ms": took })),
+        step("alasio.node_agent.checkpoint.runsc", request),
+      );
       // What the save caught, as bayma's hook wrote it as the sandbox was saved.
       const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
-      const image = yield* runsc.inspect(release, staged);
+      const image = yield* runsc.inspect(release, staged).pipe(step("alasio.node_agent.checkpoint.inspect", request));
       if (image.version !== runscVersion(release)) {
         return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image says runsc ${image.version} saved it, not ${runscVersion(release)}` });
       }
       // Each image it holds pages of is one of its parent's, whose files its manifest says.
       const known = new Map((parent?.layers ?? []).map((layer) => [layer.digest, layer]));
-      const referred = yield* Effect.forEach(yield* runsc.layers(release, staged), (digest) => {
-        const layer = known.get(digest);
-        return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
-      });
-      yield* cache.commit(environment, workspace, snapshot, image.digest);
-      const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
-      yield* cache.stamp(environment, workspace, image.digest, files);
+      const referred = yield* Effect.flatMap(runsc.layers(release, staged), (digests) =>
+        Effect.forEach(digests, (digest) => {
+          const layer = known.get(digest);
+          return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
+        })).pipe(step("alasio.node_agent.checkpoint.layers", request));
+      yield* cache.commit(environment, workspace, snapshot, image.digest).pipe(step("alasio.node_agent.checkpoint.cache", request));
+      // Its files' SHA-256, which its manifest records, and the cache's stamp of them as checked so.
+      const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest))).pipe(
+        Effect.tap((hashed) => cache.stamp(environment, workspace, image.digest, hashed)),
+        step("alasio.node_agent.checkpoint.digest", request),
+      );
       const uploadedAt = yield* Clock.currentTimeMillis;
       const [[uploadMs, layers], verified] = yield* Effect.all([
         timed(Effect.gen(function*() {
-          const uploaded = yield* upload(request, image.digest, files);
+          const uploaded = yield* upload(request, image.digest, files, "alasio.node_agent.checkpoint.upload.put").pipe(step("alasio.node_agent.checkpoint.upload", request));
           // Its own image and those it refers to looked at together, as the prepare of a restore looks at its chain's.
-          const missing = yield* notInBucket(request, [uploaded, ...referred]);
-          if (missing.includes(uploaded)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
-          return [uploaded, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer) : Effect.succeed(layer)))];
+          return yield* Effect.gen(function*() {
+            const missing = yield* notInBucket(request, [uploaded, ...referred]);
+            if (missing.includes(uploaded)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
+            return [uploaded, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer, "alasio.node_agent.checkpoint.upload.put") : Effect.succeed(layer)))];
+          }).pipe(step("alasio.node_agent.checkpoint.heads", request));
         })),
-        verifiedStaged({ environment, workspace, snapshot, release }, [image.digest, ...referred.map(({ digest }) => digest)]),
+        verifiedStaged({ environment, workspace, snapshot, release }, [image.digest, ...referred.map(({ digest }) => digest)]).pipe(step("alasio.node_agent.checkpoint.verify", request)),
       ], { concurrency: 2 });
       yield* inTime(request, snapshot, uploadedAt);
       const manifest: Manifest = {
@@ -1299,10 +1314,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         uploadMs,
         ...(caught === undefined ? {} : { live: caught }),
       };
-      yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
-      if (verified) yield* sayVerified(manifest);
-      yield* bucket.putJson(manifestKey(request, snapshot), manifest);
-      yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
+      // Committed: in the cache, then in the bucket, its manifest and then its commit, which make it durable.
+      yield* Effect.gen(function*() {
+        yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
+        if (verified) yield* sayVerified(manifest);
+        yield* bucket.putJson(manifestKey(request, snapshot), manifest);
+        yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
+      }).pipe(step("alasio.node_agent.checkpoint.commit", request));
       return manifest;
     }).pipe(Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)));
 
@@ -1344,14 +1362,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         // after it read it, beside the restores on this node, which they yield to: runsc stopped while one reads its image, the
         // others waiting meanwhile.
         yield* onDisk(() => rm(staged, { recursive: true, force: true }));
-        const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged, pausing: loading.pausing }));
+        const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged, pausing: loading.pausing })).pipe(
+          step("alasio.node_agent.compaction.compact", committed),
+        );
         yield* Effect.sync(() => compactionDuration.record(compactMs / 1000));
-        const image = yield* runsc.inspect(release, staged);
-        if (image.version !== runscVersion(release)) {
-          return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image says runsc ${image.version} wrote it, not ${runscVersion(release)}` });
-        }
-        const referred = yield* runsc.layers(release, staged);
-        if (referred.length > 0) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image refers to the images ${referred.join(", ")}, where it is to refer to none` });
+        const image = yield* Effect.gen(function*() {
+          const inspected = yield* runsc.inspect(release, staged);
+          if (inspected.version !== runscVersion(release)) {
+            return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image says runsc ${inspected.version} wrote it, not ${runscVersion(release)}` });
+          }
+          const referred = yield* runsc.layers(release, staged);
+          if (referred.length > 0) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image refers to the images ${referred.join(", ")}, where it is to refer to none` });
+          return inspected;
+        }).pipe(step("alasio.node_agent.compaction.inspect", committed));
         yield* say(image.digest);
         yield* cache.commit(environment, workspace, snapshot, image.digest);
         unnamed = image.digest;
@@ -1359,7 +1382,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* cache.stamp(environment, workspace, image.digest, files);
         const uploadedAt = yield* Clock.currentTimeMillis;
         const [[uploadMs, uploaded], verified] = yield* Effect.all([
-          timed(upload(committed, image.digest, files, quietly)),
+          timed(upload(committed, image.digest, files, "alasio.node_agent.compaction.upload.put", quietly)).pipe(step("alasio.node_agent.compaction.upload", committed)),
           verifiedStaged({ environment, workspace, snapshot, release }, [image.digest]),
         ], { concurrency: 2 });
         // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
@@ -1371,7 +1394,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             if (read?.manifest.snapshot !== committed.snapshot) return null;
             // Checked only now that it holds the workspace, which a collection on this node holds too: one may have taken
             // what it uploaded, which no manifest named, as it waited for it. The cache holds its image, spared meanwhile.
-            const layer = yield* layerInBucket(committed, uploaded);
+            const layer = yield* layerInBucket(committed, uploaded, "alasio.node_agent.compaction.upload.put");
             yield* inTime(committed, snapshot, uploadedAt);
             const compacted: Manifest = { ...committed, snapshot, layers: [layer], bytes: bytesOf([layer]), uploadMs, compactedFrom: committed.snapshot };
             const cached = join(cache.workspace(environment, workspace), MANIFEST_FILE);
@@ -1422,7 +1445,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             if (now !== null && now.etag !== read.etag && !now.manifest.layers.some(({ digest }) => digest === image.digest)) yield* uncommit;
             return yield* put.failure;
           }),
-        );
+        ).pipe(step("alasio.node_agent.compaction.commit", committed));
         if (manifest === null) {
           yield* ended("superseded");
           yield* Effect.logInfo(`compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}, but the workspace moved on from it meanwhile: the compacted image is left to be collected`);
@@ -1484,10 +1507,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * Compacts `committed` as compactNow does, once no other compaction runs on the node, in the agent's scope: what fails is
    * said, and changes nothing. One of the workspace's before it is stopped, as the workspace has moved on from it. Each is
    * counted once, by how it ended: one stopped after it has counted its outcome, as it removes what it staged once it has
-   * committed or been superseded, is not counted again as stopped.
+   * committed or been superseded, is not counted again as stopped. A trace of its own, linked to the checkpoint's it began in,
+   * which it outlives.
    */
   const compactLater = (committed: Manifest): Effect.Effect<void> =>
     Effect.suspend(() => {
+      const begunIn = currentTraceparent();
       /** How it ended, once counted. */
       let outcome: string | null = null;
       const ended = (counted: string) =>
@@ -1509,7 +1534,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             )
           )
         ),
-        withAlasioSpan("alasio.node_agent.compaction", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot } }),
+        withAlasioSpan("alasio.node_agent.compaction", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot }, parent: null, links: begunIn === null ? [] : [begunIn] }),
         withLogScope("node-agent"),
       );
     }).pipe(
@@ -1638,7 +1663,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
     return deferred.pipe(
       Effect.andThen(asked),
-      Effect.flatMap((at) => exclusive([request], committed(at).pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message))))))),
+      Effect.flatMap((at) => exclusive([request], committed(at).pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message))))), "alasio.node_agent.checkpoint.lock")),
       // A release's: compacted once it no longer holds the workspace, where its chain is due.
       Effect.tap((manifest) => (request.live === undefined ? compactLater(manifest) : Effect.void)),
       Effect.tap((manifest) =>
@@ -1867,9 +1892,22 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * beside the workspace's images, which the cache spares meanwhile, holding the workspace
    * only to look at what the cache holds of it and to commit it, so that a checkpoint of the
    * sandbox, as its pod stops, waits on no download; one fetch of a workspace's runs at a time.
-   * What fails is said, and leaves that checkpoint whole.
+   * What fails is said, and leaves that checkpoint whole. A trace of its own, linked to the
+   * prepare's it began in, which it outlives.
    */
   const fetchLater = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const begunIn = currentTraceparent();
+      return fetchNow(ref, manifest, reader).pipe(
+        withAlasioSpan("alasio.node_agent.fetch", { attributes: { ...spanAttributes(ref), "alasio.snapshot": manifest.snapshot }, parent: null, links: begunIn === null ? [] : [begunIn] }),
+        withLogScope("node-agent"),
+        Effect.forkIn(scope),
+        Effect.asVoid,
+      );
+    });
+
+  /** Fetches into the cache what fetchLater says, as it runs it in the background. */
+  const fetchNow = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
     Effect.forEach(manifest.layers, (layer) =>
       inFlightWhile([ref], Effect.gen(function*() {
         if (yield* exclusive([ref], intact(ref, layer))) return;
@@ -1886,10 +1924,6 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // Within its budget again, the least recently used workspace evicted.
       Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
       Effect.catch((error) => Effect.logWarning(`could not fetch the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, so its next checkpoint is whole: ${error.message}`)),
-      withAlasioSpan("alasio.node_agent.fetch", { attributes: { ...spanAttributes(ref), "alasio.snapshot": manifest.snapshot } }),
-      withLogScope("node-agent"),
-      Effect.forkIn(scope),
-      Effect.asVoid,
     );
 
   /**
@@ -1954,11 +1988,14 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         // it says so (verifiedStaged); one that does not verify has the images read from the
         // bucket instead.
         let imagePath: string | null = null;
-        let held = true;
-        for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) held = false;
+        const held = yield* Effect.forEach(manifest.layers, (layer) => intact(ref, layer)).pipe(
+          Effect.map((intacts) => intacts.every(Boolean)),
+          step("alasio.node_agent.prepare.intact", ref),
+        );
         if (held) {
-          const linked = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest));
-          imagePath = yield* ((yield* verifiedAlready(manifest)) ? Effect.succeed(linked) : verified(linked)).pipe(
+          const linked = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest)).pipe(step("alasio.node_agent.prepare.cache", ref));
+          imagePath = yield* Effect.flatMap(verifiedAlready(manifest), (already) => (already ? Effect.succeed(linked) : verified(linked))).pipe(
+            step("alasio.node_agent.prepare.verify", ref),
             Effect.catchTag("SnapshotCorrupt", (error) =>
               Effect.logWarning(`the node's cached copy of the snapshot ${snapshot} of ${prefixOf(ref)} does not restore (${error.reason}): it is read from the bucket`).pipe(
                 Effect.andThen(cache.clear(environment, workspace)),
@@ -1985,6 +2022,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             return yield* verified(yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest)));
           });
           imagePath = yield* fetched.pipe(
+            step("alasio.node_agent.prepare.download", ref),
             Effect.catchTag("SnapshotCorrupt", (error) => {
               const kept = manifest.layers.filter((layer) => !downloaded.includes(layer));
               if (kept.length === 0) return Effect.fail(error);
@@ -1999,7 +2037,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         if (imagePath === null) {
           // Read as the restore goes, each of its images must be in the bucket as it was put: the files of all of them
           // looked at together, as a chain's are many, and each look a round trip to the store.
-          const [missing] = yield* notInBucket(ref, manifest.layers);
+          const [missing] = yield* notInBucket(ref, manifest.layers).pipe(step("alasio.node_agent.prepare.heads", ref));
           if (missing !== undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${missing.digest} is not in the bucket as it was put` });
         }
         /** The token the restore reads the bucket by, where it does. */
@@ -2008,11 +2046,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           // Through the socket where asked and the proxy serves one; over TCP otherwise.
           if (gofer?.transport === "socket" && storeProxy.socket === null) yield* Effect.logWarning(`the restore of ${prefixOf(ref)} asks to read the snapshots bucket through the node agent's socket, which it does not serve: it reads it over TCP`);
           const transport: Transport = gofer?.transport === "socket" && storeProxy.socket !== null ? "socket" : "tcp";
-          const token = storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`, transport);
+          const token = yield* Effect.sync(() => storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`, transport)).pipe(step("alasio.node_agent.prepare.token", ref));
           if (token === null) return yield* new AgentStopping({ environment, workspace });
           const options = goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false);
-          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, options);
-          yield* expectPages(ref, snapshot, token.accessKeyId, release, options);
+          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, options).pipe(
+            Effect.tap(() => expectPages(ref, snapshot, token.accessKeyId, release, options)),
+            step("alasio.node_agent.prepare.gofer", ref),
+          );
           reader = token.accessKeyId;
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
@@ -2025,6 +2065,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
         return { manifest, imagePath, source };
       }),
+      "alasio.node_agent.prepare.lock",
     ).pipe(
       // Prepared for no restore, it reads nothing.
       Effect.onError(() => loading.end(prefixOf(ref))),
@@ -2237,23 +2278,30 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
-      const running = yield* runningPod(request);
-      const waited = yield* policiesInForce({ ...request, ...running });
+      const running = yield* runningPod(request).pipe(step("alasio.node_agent.resume.pod_running", request));
+      const waited = yield* policiesInForce({ ...request, ...running }).pipe(
+        Effect.tap((took) => Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": took })),
+        step("alasio.node_agent.resume.policies", request),
+      );
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
-      const containers = yield* Effect.forEach(running.containerIds, (id) => ofPod(id, request.namespace, request.pod));
+      const containers = yield* Effect.forEach(running.containerIds, (id) => ofPod(id, request.namespace, request.pod)).pipe(step("alasio.node_agent.resume.containers", request));
       const from = yield* restoredFrom(request);
       if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
-      yield* Effect.forEach(running.podIPs, forgetConnections, { discard: true });
+      yield* Effect.forEach(running.podIPs, forgetConnections, { discard: true }).pipe(step("alasio.node_agent.resume.conntrack", request));
       // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
       storeProxy.resumed(prefixOf(request), backgroundReadMs);
-      yield* Effect.forEach(running.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
+      yield* Effect.forEach(running.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true }).pipe(step("alasio.node_agent.resume.runsc", request));
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
       for (const id of running.containerIds) bases.set(id, from);
-      // It reads its image until runsc says it has read every page.
+      // It reads its image until runsc says it has read every page: a trace of its own, linked to the resume's, which it
+      // outlives, saying how long the agent's background work yielded to restores meanwhile.
+      const resumedIn = yield* Effect.sync(currentTraceparent);
       yield* Effect.forEach(running.containerIds, (id, index) => runsc.restored(containers[index]?.release ?? "", id), { discard: true }).pipe(
         Effect.catch((error) => Effect.logWarning(`runsc did not say when the restore of ${prefixOf(request)} has read its image, so the agent's compactions yield to it no more: ${error.message}`)),
         Effect.andThen(loading.end(prefixOf(request))),
+        Effect.flatMap((yielded) => (yielded === null ? Effect.void : Effect.annotateCurrentSpan({ "alasio.loading.yield_ms": yielded }))),
+        withAlasioSpan("alasio.node_agent.loading", { attributes: spanAttributes(request), parent: null, links: resumedIn === null ? [] : [resumedIn] }),
         withLogScope("node-agent"),
         Effect.forkIn(scope),
       );
@@ -2264,7 +2312,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // Its gofer read its options as its pod's containers started, the restore's token among them.
       Effect.ensuring(goferOptionsGone(request)),
       // Ready as kubelet's probe would find it, before it is answered.
-      Effect.flatMap(([waited, running]) => Effect.as(accepting(request, running), waited)),
+      Effect.flatMap(([waited, running]) => Effect.as(accepting(request, running).pipe(step("alasio.node_agent.resume.accepting", request)), waited)),
       Effect.tap((waited) =>
         Effect.sync(() => resumes.add(1, { "alasio.node_agent.resume.outcome": "resumed" })).pipe(
           Effect.andThen(Effect.logInfo(`resumed the sandbox of ${prefixOf(request)} in ${request.namespace}/${request.pod}, its network policies in force after ${waited} ms`)),
@@ -2459,7 +2507,12 @@ function podOf(annotations: Readonly<Record<string, string>>): string {
   return `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
 }
 
-/** The attributes of a span of an operation on a workspace. */
+/** The attributes of a span of an operation on a workspace: of its sandbox's too, which bears its name. */
 function spanAttributes({ environment, workspace }: WorkspaceRef): Record<string, string> {
-  return { "alasio.environment": environment, "alasio.workspace": workspace };
+  return { "alasio.environment": environment, "alasio.workspace": workspace, "alasio.sandbox.name": workspace };
+}
+
+/** A step, `name`, of an operation on the workspace `ref`, in a span of its own under the operation's. */
+function step(name: string, ref: WorkspaceRef) {
+  return withAlasioSpan(name, { attributes: spanAttributes(ref) });
 }
