@@ -216,6 +216,26 @@ export function currentTraceparent(): string | null {
 }
 
 /**
+ * The trace a request served continues: the active span's, as HTTP instrumentation makes one
+ * for each request it serves, continuing the one the request carries; else the W3C trace
+ * context the request carries itself; null where it is of none.
+ */
+export function requestTrace(headers: Readonly<Record<string, string | readonly string[] | undefined>>): TraceCarrier | null {
+  const active = traceCarrier();
+  if (active) return active;
+  const carrier: TraceCarrier = {};
+  propagation.inject(propagation.extract(ROOT_CONTEXT, headers), carrier);
+  return carrier.traceparent ? carrier : null;
+}
+
+/** Records on the active span of alasio's that `name` happened now, as `attributes` say; nothing outside every span. */
+export const spanEvent = (name: string, attributes: Attributes = {}): Effect.Effect<void> =>
+  Effect.currentSpan.pipe(
+    Effect.flatMap((span) => Effect.clockWith((clock) => Effect.sync(() => span.event(name, clock.currentTimeNanosUnsafe(), attributes)))),
+    Effect.ignore,
+  );
+
+/**
  * What `hold` comes to, which runs `held` once it holds what it waits for, as a lock: its wait
  * in a span of alasio's, `name`, under the active span, from its start until `held` begins, or
  * until it ends without it, as one given up waiting does; `held` runs under the active span.

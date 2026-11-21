@@ -80,6 +80,12 @@
  * its connection as it does, for STOP_CALLS_MS at most, and runs on for STOP_LINGER_MS at
  * least, so it is there to refuse while the routes to it are let go of; what is left then is
  * cut.
+ *
+ * Each caller's request is traced, from as its token is found a caller's, in the trace it came
+ * in where it came in one (alasio.front.request), its spans saying its key and what
+ * `attributesOf` says of it: its routing, the bind it asks among it (alasio.front.route), a
+ * release's wait for its binding's requests under way (alasio.front.quiet), and the moment it is
+ * passed to its key's pod (alasio.front.forwarded, an event of the request's).
  */
 import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -90,6 +96,7 @@ import { Clock, Deferred, Effect, Exit, Option, Schema, type Scope } from "effec
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
+import { type Attributes, requestTrace, SpanKind, spanEvent, type TraceCarrier, withAlasioSpan } from "../telemetry/index.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout, type ReleaseSteps } from "./binder.ts";
 import { boundIn, counts, touchLease } from "./bindings.ts";
 import { EVENTS_PATH, GATEWAY_READINESS, NO_BIND_HEADER, NOT_PASSED_HEADER, PINNED_HEADER, type Pool, STOP_GRACE_SECONDS } from "./names.ts";
@@ -276,6 +283,8 @@ export interface BinderServerOptions {
   readonly relay?: (bound: HeldTo, body: Uint8Array) => Effect.Effect<Answer>;
   /** How it stops, as the module says: STOP_CALLS_MS and STOP_LINGER_MS but for tests. */
   readonly stopping?: { readonly callsMs: number; readonly lingerMs: number };
+  /** What the spans of a key's requests say of it beside its key, as the workspace it names: none unless given. */
+  readonly attributesOf?: (key: string) => Attributes;
 }
 
 /** A listening front: its port, and how many calls (requests but GETs) of each key of each pool it is passing on now. */
@@ -320,7 +329,7 @@ const Flights = Schema.Struct({ flights: Schema.Number });
 const decodeFlights = Schema.decodeUnknownOption(Flights);
 
 /** Serves the front on `port` until the scope closes, as the module says. */
-export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants, relay, stopping: stopTimings = { callsMs: STOP_CALLS_MS, lingerMs: STOP_LINGER_MS } }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
+export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0", callerKey, bindingKey, podPort, poolOf, peers = () => Effect.succeed([]), operate, routeHeld, grants, relay, stopping: stopTimings = { callsMs: STOP_CALLS_MS, lingerMs: STOP_LINGER_MS }, attributesOf = () => ({}) }: BinderServerOptions): Effect.fn.Return<BinderServer, never, Binder | KubeClient | Scope.Scope> {
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -334,6 +343,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const firstTold = new Map<string, number>();
   // When this replica last stamped each key's binding active, by the binding: a new binding's first request is stamped whatever its key's last was.
   const stamped = new Map<string, { readonly binding: string; readonly at: number }>();
+  /** What the spans of `key`'s requests say of it. */
+  const keyAttributes = (key: string): Attributes => ({ "alasio.sandbox.key": key, ...attributesOf(key) });
   /** The key of `key`, as `pool` binds it, in what the front keeps: a namespace has no slash. */
   const slot = (pool: Pool, key: string): string => `${pool.namespace}/${key}`;
 
@@ -381,7 +392,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // Bound now, as a bind of it is through: idle from now at the earliest.
       if (!unbound) yield* active(key, pool, bound.binding, { bound: true });
       return { route, known: false };
-    });
+    }).pipe(withAlasioSpan("alasio.front.route", { attributes: keyAttributes(key) }));
 
   /** The pool's counts, its waiting summed over every replica's. */
   const countsOf = (pool: Pool) =>
@@ -426,7 +437,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
     });
 
-  const handle = (incoming: IncomingMessage, outgoing: ServerResponse): Effect.Effect<void> =>
+  /** Answers `incoming`, which came in `trace`, where it came in one, as the module says. */
+  const handle = (incoming: IncomingMessage, outgoing: ServerResponse, trace: TraceCarrier | null): Effect.Effect<void> =>
     Effect.gen(function*() {
       const url = incoming.url ?? "/";
       if (incoming.method === "GET" && url === "/healthz") return answer(outgoing, 200, { ok: true });
@@ -485,6 +497,20 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       const claims = Option.isSome(bearer) ? verifyToken(callerKey, bearer.value[1], now) : null;
       // A caller's token, which stops within MAX_CALLER_TOKEN_MS, or is held to a binding; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.binding !== undefined || (claims.expires !== undefined && claims.expires > now + MAX_CALLER_TOKEN_MS)) return answer(outgoing, 401, { error: "no caller's token" });
+      return yield* served(incoming, outgoing, claims, trace);
+    }).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("answering a request failed", cause).pipe(Effect.andThen(Effect.sync(() => {
+        if (!outgoing.headersSent) answer(outgoing, 500, { error: "answering the request failed" });
+        else outgoing.destroy();
+      })))),
+      withLogScope("binder"),
+    );
+
+  /** Answers `incoming`, a caller's request of the key its token's `claims` name, as the module says, traced in `trace`, the one it came in, where it came in one. */
+  const served = (incoming: IncomingMessage, outgoing: ServerResponse, claims: TokenClaims, trace: TraceCarrier | null): Effect.Effect<void> => {
+    const url = incoming.url ?? "/";
+    const { key } = claims;
+    return Effect.gen(function*() {
       if (claims.expires === undefined) {
         const { held } = claims;
         if (!held || !routeHeld || !grants?.(claims.key, held)) return answer(outgoing, 401, { error: "no caller's token" });
@@ -502,7 +528,6 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         if (holding === "unknown") return answer(outgoing, 503, { error: `whether ${held.key}'s binding is held is not known yet` }, { "retry-after": String(RETRY_AFTER_S), [NOT_PASSED_HEADER]: "true" });
         if (holding === "gone") return answer(outgoing, 401, { error: `the binding of ${held.key} the token is held to is gone` });
       }
-      const { key } = claims;
       const [path = "", search = ""] = url.split("?", 2);
       if (operate && OPERATED.test(path)) {
         const body = yield* Effect.promise(() => bodyOf(incoming, MAX_OPERATION_BYTES));
@@ -515,7 +540,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         incoming.resume();
         const released = yield* poolOf(key, claims.options ?? {}).pipe(
           // Its requests under way through any replica let end first; then its route forgotten, as its binding is released.
-          Effect.tap(({ pool }) => Effect.andThen(quiet(pool, key), Effect.sync(() => routes.delete(slot(pool, key))))),
+          Effect.tap(({ pool }) => Effect.andThen(quiet(pool, key).pipe(withAlasioSpan("alasio.front.quiet", { attributes: keyAttributes(key) })), Effect.sync(() => routes.delete(slot(pool, key))))),
           Effect.flatMap(({ pool, release, reset }) => Effect.andThen(reset ?? Effect.void, binder.release(pool, key, release))),
           Effect.result,
         );
@@ -572,6 +597,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         Effect.gen(function*() {
           // One that binds nothing only reads what the binding has, as whether it is idle, and so keeps it no longer.
           if (!unbound) yield* active(key, to.pool, to.binding);
+          yield* spanEvent("alasio.front.forwarded", { "alasio.binder.binding": to.binding, "k8s.namespace.name": to.pool.namespace });
           // A call holds its binding against its caller's release while it is under way; a GET does not, as the
           // stream an MCP client listens on for what its server sends of its own, open for as long as the client is,
           // waits on nothing it asked.
@@ -617,12 +643,13 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       const unsent = !proxied.connected && NEVER_CONNECTED.has(proxied.code ?? "");
       answer(outgoing, 503, { error: `the pod of ${key} was not reached` }, unsent ? { "retry-after": String(RETRY_AFTER_S), [NOT_PASSED_HEADER]: "true" } : {});
     }).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("answering a request failed", cause).pipe(Effect.andThen(Effect.sync(() => {
-        if (!outgoing.headersSent) answer(outgoing, 500, { error: "answering the request failed" });
-        else outgoing.destroy();
-      })))),
-      withLogScope("binder"),
+      withAlasioSpan("alasio.front.request", {
+        kind: SpanKind.SERVER,
+        parent: trace,
+        attributes: { ...keyAttributes(key), "http.request.method": incoming.method ?? "GET", "url.path": url.split("?", 1)[0] ?? "" },
+      }),
     );
+  };
 
   /** Whether the front is told to stop, as the module says; what it is answering, and of that the streams it passes on, answered as event streams. */
   let stopping = false;
@@ -637,7 +664,8 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
     }
     answering.add(outgoing);
     outgoing.on("close", () => void (answering.delete(outgoing), streams.delete(outgoing)));
-    void runPromise(handle(incoming, outgoing));
+    // In the trace it came in, as it arrives.
+    void runPromise(handle(incoming, outgoing, requestTrace(incoming.headers)));
   });
   // A request holds its stream for as long as its call runs: no time limit of the server's own.
   server.requestTimeout = 0;

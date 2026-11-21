@@ -17,7 +17,9 @@ import { type BinderServer, type BinderServerOptions, FIRST_TOLD_KEPT, MAX_CALLE
 import { bindingToken, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { heldToHarness } from "../src/gateway/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
+import { TracingLayer } from "../src/telemetry/index.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
+import { childrenOf, ended, endedLater } from "./support/spans.ts";
 
 // The binder's front, on a real API server, its pool's pods each at the loopback's address,
 // where a stand-in for every pod records what it is sent.
@@ -91,12 +93,15 @@ async function front(
     grants = undefined as BinderServerOptions["grants"],
     relay = undefined as BinderServerOptions["relay"],
     elsewhere = {} as Readonly<Record<string, Pool>>,
+    // Traced as alasio's is, what it says of each key as `attributesOf` says, where it is told to.
+    traced = undefined as BinderServerOptions["attributesOf"],
     // Stopped at once as a test ends, but where a test says how it stops.
     stopping = { callsMs: 1_000, lingerMs: 0 } as NonNullable<BinderServerOptions["stopping"]>,
   } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
-  const layer = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
+  const binders = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
+  const layer = traced ? Layer.merge(binders, TracingLayer) : binders;
   // Its routes checked against the bindings' Leases as they are watched, where it is told to.
   const live = watched
     ? await Effect.runPromise(Effect.map(Layer.build(LiveBindings.layer({ namespaces: { current: Effect.succeed([of.namespace]), known: (namespace) => Effect.succeed(namespace === of.namespace) } })), (built) => Context.get(built, LiveBindings)).pipe(
@@ -106,7 +111,7 @@ async function front(
     : null;
   const routeHeld = holds ?? live?.holds;
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), ...(relay ? { relay } : {}), stopping, poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, ...(operate ? { operate } : {}), ...(routeHeld ? { routeHeld } : {}), ...(grants ? { grants } : {}), ...(relay ? { relay } : {}), ...(traced ? { attributesOf: traced } : {}), stopping, poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: elsewhere[options["environment"] ?? ""] ?? of, release, ...told })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -576,6 +581,42 @@ test("a no-bind request reads what a binding has, and keeps it no longer: its Le
   } finally {
     await bound.close();
     await other.close();
+    stand.close();
+  }
+});
+
+test("a caller's request is traced in the trace it came in, from as its token is found a caller's, saying its key and what is said of it: its routing, the bind it asks among it, and the moment it is passed to its key's pod, an event of it; and a release's, its wait for its binding's calls under way among it", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const served = await front(of, stand.port, { traced: (key) => ({ "alasio.sandbox.name": key.slice("sessionfs:".length) }) });
+  try {
+    const key = "sessionfs:fs-traced";
+    const traceId = randomBytes(16).toString("hex");
+    const parent = randomBytes(8).toString("hex");
+    const since = ended().length;
+    const response = await fetch(`http://127.0.0.1:${served.port}/mcp?session=1`, { method: "POST", headers: { authorization: caller(key), traceparent: `00-${traceId}-${parent}-01` }, body: "{}" });
+    assert.equal(response.status, 200);
+    const request = await endedLater("alasio.front.request", since);
+    assert.deepEqual([request.spanContext().traceId, request.parentSpanContext?.spanId], [traceId, parent]);
+    assert.deepEqual(
+      ["alasio.sandbox.key", "alasio.sandbox.name", "http.request.method", "url.path"].map((name) => request.attributes[name]),
+      [key, "fs-traced", "POST", "/mcp"],
+    );
+    const [route, ...others] = childrenOf(request);
+    assert.deepEqual([route?.name, others.length], ["alasio.front.route", 0]);
+    assert.deepEqual(route ? childrenOf(route).map(({ name }) => name) : [], ["alasio.binder.bind"]);
+    // Passed on once routed.
+    const [forwarded] = request.events;
+    assert.equal(forwarded?.name, "alasio.front.forwarded");
+    const nanos = ([seconds, nanoseconds]: readonly [number, number]) => BigInt(seconds) * 1_000_000_000n + BigInt(nanoseconds);
+    assert.ok(route && forwarded && nanos(forwarded.time) >= nanos(route.endTime));
+    const released = await fetch(`http://127.0.0.1:${served.port}/release`, { method: "POST", headers: { authorization: caller(key) } });
+    assert.equal(released.status, 204);
+    const release = ended().slice(since).findLast(({ name, attributes }) => name === "alasio.front.request" && attributes["url.path"] === "/release");
+    assert.deepEqual(release ? childrenOf(release).map(({ name }) => name) : [], ["alasio.front.quiet", "alasio.binder.release"]);
+  } finally {
+    await served.close();
     stand.close();
   }
 });
