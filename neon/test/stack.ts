@@ -2292,6 +2292,27 @@ export function neonStack(): void {
         }, `held each of ${expected} entries exactly once`);
       });
 
+      /** A client of main's read replica, connected, which wakes it where it sleeps. */
+      const replicaClient = async (): Promise<pg.Client> => {
+        const url = new URL(databaseUrl);
+        url.searchParams.set("options", `endpoint=${replicaId(MAIN)}`);
+        const replica = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 60_000 });
+        replica.on("error", () => {});
+        await replica.connect();
+        return replica;
+      };
+
+      /** What the replica says of its replay, and main of what it has flushed, as a failure says them. */
+      const replayState = async (replica: pg.Client): Promise<string> => {
+        const [flushed] = await query<{ lsn: string }>("select pg_current_wal_flush_lsn()::text as lsn");
+        const { rows } = await replica.query(
+          `select pg_last_wal_receive_lsn()::text as received, pg_last_wal_replay_lsn()::text as replayed,
+            (select json_agg(json_build_object('process', backend_type, 'waits on', concat_ws(':', wait_event_type, wait_event)))
+              from pg_stat_activity where backend_type in ('startup', 'walreceiver')) as processes`,
+        ).catch((error: unknown) => ({ rows: [{ unanswered: String(error) }] }));
+        return `main flushed ${flushed?.lsn}; the replica ${JSON.stringify(rows[0])}`;
+      };
+
       test("keeps every entry exactly once through a pageserver killed mid-load", async () => {
         await new NeonSessionStore(pool).append(KEY, Array.from({ length: 20_000 }, (_, n) => entry(30_000 + n)));
         await untilLoading();
@@ -2302,21 +2323,31 @@ export function neonStack(): void {
           const { n, seqs } = await lakeCounts();
           return Number(n) === expected && Number(seqs) === expected;
         }, `held each of ${expected} entries exactly once`);
+        // And main's read replica replays past what main has flushed, within the 150 s its compute waits for an answer
+        // from the pageserver it asked before it connects anew (neon.pageserver_response_disconnect_timeout): a replay
+        // that asked the pageserver killed may wait that long, longer than a replica undisturbed is given below.
+        const replica = await replicaClient();
+        try {
+          const [flushed] = await query<{ lsn: string }>("select pg_current_wal_flush_lsn()::text as lsn");
+          const deadline = Date.now() + 180_000;
+          while (!(await replica.query("select pg_last_wal_replay_lsn() >= $1::pg_lsn as past", [flushed?.lsn]).then(({ rows }) => rows[0]?.past === true, () => false))) {
+            if (Date.now() >= deadline) assert.fail(`the replica did not replay past ${flushed?.lsn} once the pageserver was back: ${await replayState(replica)}`);
+            await sleep(1000);
+          }
+        } finally {
+          await replica.end().catch(() => {});
+        }
       });
 
       test("loads through main's read replica, which replays main's writes and takes none", async () => {
-        const url = new URL(databaseUrl);
-        url.searchParams.set("options", `endpoint=${replicaId(MAIN)}`);
-        const replica = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 60_000 });
-        replica.on("error", () => {});
-        await replica.connect();
+        const replica = await replicaClient();
         try {
           assert.deepEqual((await replica.query("select pg_is_in_recovery() as recovering")).rows, [{ recovering: true }]);
           await query("create table replayed (id int primary key)");
           await query("insert into replayed values (1)");
           const deadline = Date.now() + 60_000;
           while (!(await replica.query("select count(*)::int as n from replayed").then(({ rows }) => rows[0]?.n === 1, () => false))) {
-            assert.ok(Date.now() < deadline, "the replica did not replay main's write");
+            if (Date.now() >= deadline) assert.fail(`the replica did not replay main's write: ${await replayState(replica)}`);
             await sleep(1000);
           }
           await assert.rejects(replica.query("insert into replayed values (2)"), /read-only transaction/u);
