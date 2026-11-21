@@ -7,7 +7,9 @@ import { test } from "node:test";
 import { Effect } from "effect";
 
 import { holdsQuota, lookOnNode, mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
+import { TracingLayer } from "../src/telemetry/index.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
+import { childrenOf, endedSpan } from "./support/spans.ts";
 
 const refusal = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(Effect.flip(effect)).then((error) => (error instanceof WorkspaceRefused ? error.status : error));
 
@@ -215,6 +217,26 @@ test("a workspace is attached only once the node's mount holds its quota, waited
     setTimeout(() => at.unheld.delete("fs-def456"), 150);
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-def456" }, "pool-1", "t", {}));
     assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-1", "ws")]);
+  } finally {
+    at.done();
+  }
+});
+
+test("an attach is traced, its wait for the node's mount to hold the workspace's quota a step of its own", async () => {
+  const at = workspacesNode({ quotaHeldWithinMs: 1_200 });
+  try {
+    at.files("fs-def456");
+    at.pod("pool-1");
+    // Held a moment after the attach began.
+    at.unheld.add("fs-def456");
+    setTimeout(() => at.unheld.delete("fs-def456"), 150);
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-def456" }, "pool-1", "t", {}).pipe(Effect.provide(TracingLayer)));
+    const attach = endedSpan("alasio.node_agent.attach");
+    assert.deepEqual([attach.attributes["alasio.sandbox.name"], attach.attributes["k8s.pod.name"]], ["fs-def456", "pool-1"]);
+    const [quota, ...others] = childrenOf(attach);
+    assert.deepEqual([quota?.name, others.length], ["alasio.node_agent.attach.quota", 0]);
+    const [seconds = 0, nanos = 0] = quota?.duration ?? [];
+    assert.ok(seconds * 1000 + nanos / 1e6 >= 100, `its wait took ${seconds} s ${nanos} ns`);
   } finally {
     at.done();
   }
