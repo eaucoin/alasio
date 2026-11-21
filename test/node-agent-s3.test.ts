@@ -317,6 +317,109 @@ test("the multipart uploads begun under a prefix and left, across pages of their
   }
 });
 
+test("a versioned bucket's versions and delete markers under a prefix are listed across pages, in order, and versions are deleted for good, a thousand a request, saying those the bucket did not delete, one gone already gone; a request that fails fails the deletion", async () => {
+  const s3 = await startFakeS3({ bucket: "neon", region: "us-east-1", ...CREDENTIALS });
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "neon", ...CREDENTIALS });
+    const at = Date.parse("2026-11-20T12:00:00.000Z");
+    const listed = [
+      { key: "pageserver/a&b", versionId: "v3", writtenAt: at, bytes: 0, latest: true, deleteMarker: true },
+      { key: "pageserver/a&b", versionId: "v2", writtenAt: at - 1000, bytes: 7, latest: false, deleteMarker: false },
+      { key: "pageserver/a&b", versionId: "v1", writtenAt: at - 2000, bytes: 5, latest: false, deleteMarker: false },
+      { key: "pageserver/c", versionId: "v1", writtenAt: at - 3000, bytes: 9, latest: true, deleteMarker: false },
+      { key: "safekeeper/d", versionId: "v1", writtenAt: at - 4000, bytes: 16, latest: true, deleteMarker: false },
+    ];
+    s3.versions.push(...listed);
+    // The stand-in lists two a page.
+    assert.deepEqual(await Effect.runPromise(bucket.listVersions("pageserver/")), listed.slice(0, 4));
+    assert.deepEqual(s3.requests.filter((asked) => asked.startsWith("GET ?")).length, 2);
+    assert.deepEqual(await Effect.runPromise(bucket.listVersions("")), listed);
+
+    // In the order given, one gone already among them.
+    assert.deepEqual(await Effect.runPromise(bucket.removeVersions([{ key: "pageserver/a&b", versionId: "v1" }, { key: "pageserver/a&b", versionId: "v2" }, { key: "pageserver/gone", versionId: "v9" }, { key: "pageserver/a&b", versionId: "v3" }])), []);
+    assert.deepEqual(s3.versions.map(({ key }) => key), ["pageserver/c", "safekeeper/d"]);
+    assert.equal(s3.requests.filter((asked) => asked === "POST ?delete=").length, 1);
+
+    // A thousand a request.
+    const many = Array.from({ length: 1001 }, (_, index) => ({ key: `pageserver/m${index}`, versionId: "v1", writtenAt: at, bytes: 0, latest: true, deleteMarker: true }));
+    s3.versions.push(...many);
+    assert.deepEqual(await Effect.runPromise(bucket.removeVersions(many)), []);
+    assert.equal(s3.requests.filter((asked) => asked === "POST ?delete=").length, 3);
+    assert.equal(s3.versions.length, 2);
+
+    // Gone already, as S3 may say it, is deleted; refused otherwise, it is said, and the versions after it in the request
+    // deleted, as S3 goes on past one it does not delete.
+    s3.versions.push({ key: "pageserver/e", versionId: "v1", writtenAt: at, bytes: 1, latest: true, deleteMarker: false });
+    s3.refuseVersion = (key) => (key === "pageserver/c" ? "NoSuchVersion" : key === "safekeeper/d" ? "AccessDenied" : null);
+    assert.deepEqual(await Effect.runPromise(bucket.removeVersions([{ key: "pageserver/c", versionId: "v1" }, { key: "safekeeper/d", versionId: "v1" }, { key: "pageserver/e", versionId: "v1" }])), [
+      { key: "safekeeper/d", versionId: "v1", code: "AccessDenied", message: "refused, as the test asks" },
+    ]);
+    assert.deepEqual(s3.versions.map(({ key }) => key), ["pageserver/c", "safekeeper/d"]);
+    // A request that fails fails the deletion.
+    s3.refuse = (method) => (method === "POST" ? 503 : null);
+    const failed = await Effect.runPromiseExit(bucket.removeVersions([{ key: "pageserver/c", versionId: "v1" }]));
+    assert.ok(Exit.isFailure(failed));
+    assert.match(String(failed.cause), /the bucket's deletion of versions of pageserver\/c failed: 503/u);
+  } finally {
+    await s3.close();
+  }
+});
+
+test("a listing of versions cut short that names no key or version to go on from, or that is no listing, fails, as does a deletion answered with no result of one, or with an error of no version, so that nothing is taken of either", async () => {
+  const s3 = await startFakeS3({ bucket: "neon", region: "us-east-1", ...CREDENTIALS });
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "neon", ...CREDENTIALS });
+    const at = Date.parse("2026-11-20T12:00:00.000Z");
+    s3.versions.push(...["a", "b", "c"].map((key) => ({ key: `pageserver/${key}`, versionId: "v1", writtenAt: at, bytes: 1, latest: true, deleteMarker: false })));
+    const failure = async <A>(effect: Effect.Effect<A, unknown>) => {
+      const exit = await Effect.runPromiseExit(effect);
+      assert.ok(Exit.isFailure(exit));
+      return String(exit.cause);
+    };
+    // Cut short, the two a page, naming no version, or an empty key, to go on from.
+    s3.answers = (asked, body) => (/^GET \?.*\bversions=/u.test(asked) ? body.replace(/<NextVersionIdMarker>[^<]*<\/NextVersionIdMarker>/u, "") : body);
+    assert.match(await failure(bucket.listVersions("")), /its listing went on past a page that names no key and version to go on from \(NextKeyMarker "pageserver\/b", NextVersionIdMarker ""\)/u);
+    s3.answers = (asked, body) => (/^GET \?.*\bversions=/u.test(asked) ? body.replace(/<NextKeyMarker>[^<]*<\/NextKeyMarker>/u, "<NextKeyMarker></NextKeyMarker>") : body);
+    assert.match(await failure(bucket.listVersions("")), /names no key and version to go on from/u);
+    s3.answers = (asked, body) => (/^GET \?.*\bversions=/u.test(asked) ? "<html>a proxy's page</html>" : body);
+    assert.match(await failure(bucket.listVersions("")), /it answered no listing of versions: <html>/u);
+    s3.answers = (_asked, body) => body;
+    assert.equal((await Effect.runPromise(bucket.listVersions(""))).length, 3);
+
+    // A deletion answered with no result of one, or with an error that names no version.
+    s3.answers = (asked, body) => (asked.startsWith("POST ?delete") ? "<html>a proxy's page</html>" : body);
+    assert.match(await failure(bucket.removeVersions([{ key: "pageserver/a", versionId: "v1" }])), /it answered no result of a deletion: <html>/u);
+    s3.answers = (asked, body) => (asked.startsWith("POST ?delete") ? "<DeleteResult><Error><Code>InternalError</Code><Message>it failed</Message></Error></DeleteResult>" : body);
+    assert.match(await failure(bucket.removeVersions([{ key: "pageserver/b", versionId: "v1" }])), /it answered an error of no version: InternalError it failed/u);
+  } finally {
+    await s3.close();
+  }
+});
+
+test("a versioned bucket of more versions than a page of its listing holds, a thousand, is listed whole across pages, a key's versions across a page's end among them", async () => {
+  const s3 = await startFakeS3({ bucket: "neon", region: "us-east-1", ...CREDENTIALS, pageSize: 1000 });
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "neon", ...CREDENTIALS });
+    const at = Date.parse("2026-11-20T12:00:00.000Z");
+    // 2500 versions: keys of one version each, but for one of four versions, the 998th to the 1001st listed, across the first
+    // page's end, and in its order, its latest a delete marker.
+    const one = (index: number) => ({ key: `pageserver/k${String(index).padStart(5, "0")}`, versionId: "v1", writtenAt: at - index, bytes: index, latest: true, deleteMarker: false });
+    const spanning = Array.from({ length: 4 }, (_, index) => ({ key: "pageserver/k00997-span", versionId: `s${4 - index}`, writtenAt: at - index * 1000, bytes: index === 0 ? 0 : 10, latest: index === 0, deleteMarker: index === 0 }));
+    const listed = [...Array.from({ length: 997 }, (_, index) => one(index)), ...spanning, ...Array.from({ length: 1499 }, (_, index) => one(index + 997))];
+    s3.versions.push(...listed);
+    assert.equal(listed.length, 2500);
+    const got = await Effect.runPromise(bucket.listVersions(""));
+    assert.deepEqual(got, listed);
+    assert.deepEqual(got.slice(997, 1001).map(({ versionId }) => versionId), ["s4", "s3", "s2", "s1"]);
+    assert.equal(s3.requests.filter((asked) => asked.startsWith("GET ?")).length, 3);
+    assert.deepEqual(await Effect.runPromise(bucket.removeVersions(got)), []);
+    assert.equal(s3.requests.filter((asked) => asked === "POST ?delete=").length, 3);
+    assert.deepEqual(s3.versions, []);
+  } finally {
+    await s3.close();
+  }
+});
+
 test("the bucket's gets go `parallel` at a time, every one of its files together, each written synced to the disk", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));

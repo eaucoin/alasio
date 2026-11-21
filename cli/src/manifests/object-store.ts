@@ -20,9 +20,10 @@
  *   gives each bucket with lifecycle rules its rules (Neon's, and the snapshots'). It is
  *   ready, and the stack's writers start, only once they are.
  *
- * And the periodic pass that applies the lifecycle rules, and copies again what has fewer
- * copies than it should; and the filer store's backups. The identities the gateways take
- * are the stack's setup's, as are the filer store's users' passwords.
+ * And the periodic pass that applies the lifecycle rules, expires what of Neon's bucket Neon
+ * needs no more, and copies again what has fewer copies than it should; and the filer store's
+ * backups. The identities the gateways take are the stack's setup's, as are the filer store's
+ * users' passwords.
  */
 import type {
   KubernetesObject,
@@ -41,10 +42,9 @@ import type {
   V1WeightedPodAffinityTerm,
 } from "@kubernetes/client-node";
 
-import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { BACKGROUND_CPU, claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { BACKGROUND_CPU, claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, s3Endpoint, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -102,68 +102,16 @@ const PORTS = {
 };
 
 /**
- * The days back to which Neon's time-travel recovery can put the pageserver's objects:
- * the history Neon keeps (HISTORY_DAYS), and a day more to notice a deletion that should
- * not have been.
+ * The lifecycle rule of Neon's bucket and of the snapshots bucket: a multipart upload left
+ * neither completed nor aborted, as an uploader ended mid-upload leaves the parts it had
+ * sent, aborted after a day, the least S3 allows: a node agent puts a file larger than a
+ * part in parts (src/node-agent/s3.ts), and aborts an upload that fails, but not one it
+ * was stopped in. What else of Neon's bucket Neon needs no more, the lifecycle pass
+ * deletes itself (lifecyclePass). An external store is given no rule by alasio: its
+ * operator gives the buckets this one, and Neon's those of the ages neon/control/expiry.ts
+ * keeps its objects for.
  */
-const RESTORABLE_DAYS = HISTORY_DAYS + 1;
-
-/** The size of each of the safekeepers' full WAL segments, Postgres's own. */
-const WAL_SEGMENT_BYTES = 16 * 1024 * 1024;
-
-/**
- * The lifecycle rules of Neon's bucket. Old versions of the pageserver's objects expire
- * RESTORABLE_DAYS after they are replaced, so its time-travel recovery can put the bucket
- * back as it was at any moment of those days. The safekeepers' old versions expire after
- * a day, the least S3 allows, since each re-uploads the segment it writes, whole, as it
- * grows.
- *
- * Neon deletes none of a timeline's full WAL segments while it lives, so they expire a
- * day past RESTORABLE_DAYS. The safekeepers serve from them what they no longer hold on
- * their volumes: to a pageserver put back as it was up to RESTORABLE_DAYS ago, which
- * ingests again from what it had uploaded by then, and to a safekeeper that was away,
- * from where it stopped (one away for longer is rebuilt from its peers once its volume
- * is deleted). Otherwise the pageserver resumes from what it uploaded minutes ago, which
- * the safekeepers keep on their volumes until it has. The segment each safekeeper writes
- * is smaller than a full one, so it is not expired, however long it goes unchanged: a
- * safekeeper rebuilt from its peers copies it.
- *
- * An operator's store (objectStore.external) is given none of this: its operator gives
- * Neon's bucket these rules.
- */
-const NEON_LIFECYCLE = {
-  Rules: [
-    {
-      ID: "expire-noncurrent",
-      Status: "Enabled",
-      Filter: { Prefix: "pageserver/" },
-      NoncurrentVersionExpiration: { NoncurrentDays: RESTORABLE_DAYS },
-      AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
-    },
-    {
-      ID: "expire-noncurrent-wal",
-      Status: "Enabled",
-      Filter: { Prefix: "safekeeper/" },
-      NoncurrentVersionExpiration: { NoncurrentDays: 1 },
-      AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
-    },
-    {
-      ID: "expire-wal",
-      Status: "Enabled",
-      Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: WAL_SEGMENT_BYTES - 1 } },
-      Expiration: { Days: RESTORABLE_DAYS + 1 },
-    },
-  ],
-};
-
-/**
- * The lifecycle rule of the snapshots bucket. A node agent puts a file larger than a
- * part in parts (src/node-agent/s3.ts), and aborts an upload that fails; one it could not
- * abort, ended mid-upload, leaves the parts it had sent, which this aborts after a day,
- * the least S3 allows. An external store is given no rule by alasio: its operator gives
- * the bucket this one.
- */
-const SNAPSHOTS_LIFECYCLE = {
+const ABORT_INCOMPLETE_UPLOADS = {
   Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
 };
 
@@ -481,8 +429,8 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   // Each bucket's rules given as its admin: Neon's as the admin's, the snapshots' as their own
   // identity's, as nothing else may write that bucket (neon/control/secrets.ts s3Identities).
   const lifecycles = [
-    { bucket: buckets.neon, rules: NEON_LIFECYCLE, as: "ADMIN" },
-    { bucket: buckets.snapshots, rules: SNAPSHOTS_LIFECYCLE, as: "SNAPSHOTS" },
+    { bucket: buckets.neon, rules: ABORT_INCOMPLETE_UPLOADS, as: "ADMIN" },
+    { bucket: buckets.snapshots, rules: ABORT_INCOMPLETE_UPLOADS, as: "SNAPSHOTS" },
   ];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
@@ -655,6 +603,12 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
  * each volume with fewer than that, as a volume server lost, or come back empty, or a
  * replication raised leaves it; holding the shell's lock while it does, which one shell
  * holds at a time.
+ *
+ * Beside it, the pass expires what of Neon's bucket Neon needs no more
+ * (neon/control/expiry.ts), with alasio's image, as the bucket's admin, asking the storage
+ * controller each timeline's remote consistent LSN, which it records in the bucket, and
+ * below the one recorded RESTORABLE_DAYS before alone deletes the timeline's WAL, with a
+ * token of the scrubber's scope (neon/control/kube-setup.ts).
  */
 function lifecyclePass(config: InstallConfig): V1CronJob {
   const component = LIFECYCLE_COMPONENT;
@@ -699,6 +653,26 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                 securityContext: restrictedContainer(),
                 resources: { requests: { cpu: BACKGROUND_CPU, memory: "32Mi" }, limits: { memory: "256Mi" } },
                 volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+              }, {
+                name: "neon-expiry",
+                image: imageReference(config.images.alasio),
+                imagePullPolicy: config.images.pullPolicy,
+                // Under the image's entrypoint, as each of its programs is: its shell, then the expiry in its place.
+                args: [
+                  "/bin/sh",
+                  "-c",
+                  `${oncePolicyApplies(`curl -fsS -o /dev/null --max-time 5 ${s3Endpoint(config)}/healthz`)} && exec node /opt/alasio/neon/control/expiry.ts`,
+                ],
+                env: [
+                  { name: "S3_ENDPOINT", value: s3Endpoint(config) },
+                  { name: "S3_REGION", value: config.objectStore.external.region },
+                  { name: "S3_BUCKET_NEON", value: config.objectStore.buckets.neon },
+                  { name: "STORAGE_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
+                  // Its admin's keys, and its token of the scrubber's scope (neon/control/kube-setup.ts).
+                  ...["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "STORAGE_CONTROLLER_TOKEN"].map((key) => ({ name: key, valueFrom: { secretKeyRef: { name: neonName("expiry"), key } } })),
+                ],
+                securityContext: restrictedContainer(),
+                resources: { requests: { cpu: BACKGROUND_CPU, memory: "128Mi" }, limits: { memory: "512Mi" } },
               }],
               volumes: [{ name: "tmp", emptyDir: {} }],
             },

@@ -1,8 +1,9 @@
 /**
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
  * SeaweedFS does: PutObject (as of an ETag, or of none, too), CopyObject, GetObject (of a range too), HeadObject, DeleteObject (as of an ETag too),
- * ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
- * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), every
+ * ListObjectsV2, multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
+ * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), and, of the versions a
+ * test gives it, ListObjectVersions and DeleteObjects, every
  * request's Signature Version 4 checked against the credentials it is given, with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
  * asked is recorded in order, a request can be made to fail, and its gets and heads to wait,
@@ -12,7 +13,7 @@ import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { type S3Credentials, sigV4Authorization, UNSIGNED_PAYLOAD } from "../../src/node-agent/s3.ts";
+import { type ListedVersion, type S3Credentials, sigV4Authorization, UNSIGNED_PAYLOAD } from "../../src/node-agent/s3.ts";
 
 /** A running stand-in. */
 export interface FakeS3 {
@@ -33,6 +34,15 @@ export interface FakeS3 {
   readonly requests: string[];
   /** The multipart uploads begun and neither completed nor aborted, by their ids. */
   readonly uploads: Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>;
+  /**
+   * The versions and delete markers it lists as a versioned bucket does (ListObjectVersions), as a test sets them: by key,
+   * each key's newest first. DeleteObjects takes those it deletes out.
+   */
+  readonly versions: ListedVersion[];
+  /** The code DeleteObjects answers a version of the key `key` it does not delete with, as S3 would, where it gives one; null deletes it. */
+  refuseVersion: (key: string, versionId: string) => string | null;
+  /** The body it answers a ListObjectVersions or a DeleteObjects with (`asked` as `requests` records it), given the one it would: a test's to rewrite, as of a store that answers amiss. */
+  answers: (asked: string, body: string) => string;
   /** Answers a request (`asked` as `requests` records it) with the status it gives, as S3 would with an error, at once, rather than doing it; null does it. */
   refuse: (method: string, key: string, asked: string) => number | null;
   /** How long it waits before it answers a get of an object, so gets overlap as they would on a network. */
@@ -107,6 +117,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
   /** The puts taken and not yet written, by key, each written once its object's next get is answered (dropsPut). */
   const writtenLater = new Map<string, () => void>();
   const uploads = new Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>();
+  const versions: ListedVersion[] = [];
   let getting = 0;
   let mostGetting = 0;
   let heading = 0;
@@ -228,6 +239,45 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       ].join(""));
       return;
     }
+    if (!key && method === "GET" && url.searchParams.has("versions")) {
+      const prefix = url.searchParams.get("prefix") ?? "";
+      const listed = versions.filter(({ key: named }) => named.startsWith(prefix));
+      const keyMarker = url.searchParams.get("key-marker");
+      const marker = listed.findIndex(({ key: named, versionId }) => named === keyMarker && versionId === url.searchParams.get("version-id-marker"));
+      const after = keyMarker === null ? listed : listed.slice(marker + 1);
+      const page = after.slice(0, pageSize);
+      const last = page.at(-1);
+      const truncated = after.length > pageSize && last !== undefined;
+      response.writeHead(200, { "content-type": "application/xml" }).end(fake.answers(asked, [
+        `<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult><Name>${bucket}</Name><Prefix>${escapeXml(prefix)}</Prefix>`,
+        ...page.map(({ key: named, versionId, writtenAt: at, bytes, latest, deleteMarker }) => {
+          const common = `<Key>${escapeXml(named)}</Key><VersionId>${escapeXml(versionId)}</VersionId><IsLatest>${latest}</IsLatest><LastModified>${new Date(at).toISOString()}</LastModified>`;
+          return deleteMarker
+            ? `<DeleteMarker>${common}<Owner><ID>0</ID></Owner></DeleteMarker>`
+            : `<Version>${common}<ETag>"0"</ETag><Size>${bytes}</Size><Owner><ID>0</ID></Owner></Version>`;
+        }),
+        `<IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextKeyMarker>${escapeXml(last.key)}</NextKeyMarker><NextVersionIdMarker>${escapeXml(last.versionId)}</NextVersionIdMarker>` : ""}</ListVersionsResult>`,
+      ].join("")));
+      return;
+    }
+    if (!key && method === "POST" && url.searchParams.has("delete")) {
+      if (request.headers["content-md5"] !== createHash("md5").update(body).digest("base64")) return error(response, 400, "InvalidDigest", "The Content-MD5 you specified was invalid.");
+      const named = [...body.toString("utf8").matchAll(/<Object><Key>([^<]*)<\/Key><VersionId>([^<]*)<\/VersionId><\/Object>/gu)];
+      if (named.length > 1000) return error(response, 400, "MalformedXML", "more than 1000 objects");
+      const text = (xml: string) => xml.replace(/&#(\d+);/gu, (_, code: string) => String.fromCharCode(Number(code)));
+      const errors: string[] = [];
+      for (const [, deleted = "", versionId = ""] of named) {
+        const refusedWith = fake.refuseVersion(text(deleted), text(versionId));
+        if (refusedWith !== null) {
+          errors.push(`<Error><Key>${deleted}</Key><VersionId>${versionId}</VersionId><Code>${refusedWith}</Code><Message>refused, as the test asks</Message></Error>`);
+          continue;
+        }
+        const index = versions.findIndex((version) => version.key === text(deleted) && version.versionId === text(versionId));
+        if (index >= 0) versions.splice(index, 1);
+      }
+      response.writeHead(200, { "content-type": "application/xml" }).end(fake.answers(asked, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult>${errors.join("")}</DeleteResult>`));
+      return;
+    }
     if (!key && method === "GET" && url.searchParams.get("list-type") === "2") {
       const prefix = url.searchParams.get("prefix") ?? "";
       const keys = [...objects.keys()].filter((name) => name.startsWith(prefix)).sort();
@@ -317,6 +367,9 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     writtenAt,
     requests,
     uploads,
+    versions,
+    refuseVersion: () => null,
+    answers: (_asked, body) => body,
     refuse: () => null,
     getDelayMs: 0,
     getsTagged: true,

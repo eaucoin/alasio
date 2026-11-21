@@ -66,6 +66,15 @@ export interface SecretNames {
   filerStoreCollector: string;
   filerStoreBackup: string;
   s3Admin: string;
+  /**
+   * Neon's bucket's expiry's (./expiry.ts): the bucket's admin's keys, and a token of the scrubber's scope. The storage
+   * controller takes that scope (storage_controller/src/http.rs at release-9129) for three requests alone: GET
+   * /control/v1/tenant/<tenant> and GET /control/v1/tenant/<tenant>/timeline/<timeline>, which describe a tenant's shards
+   * and a timeline's on them, the latter the one the expiry asks; and POST /control/v1/metadata_health/update, which
+   * records how healthy a scrub found shards' remote metadata, which the expiry never asks. The pageservers and the
+   * safekeepers refuse it (pageserver/src/auth.rs, safekeeper/src/auth.rs).
+   */
+  neonExpiry: string;
   s3Backups: string;
   compute: string;
   proxy: string;
@@ -186,6 +195,7 @@ export function secretNames(prefix: string): SecretNames {
     filerStoreCollector: `${prefix}-seaweedfs-filer-store-collector`,
     filerStoreBackup: `${prefix}-seaweedfs-filer-store-backup`,
     s3Admin: `${prefix}-neon-s3-admin`,
+    neonExpiry: `${prefix}-neon-expiry`,
     s3Backups: `${prefix}-neon-s3-backups`,
     compute: `${prefix}-neon-compute`,
     proxy: `${prefix}-neon-proxy`,
@@ -229,6 +239,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
   /** Neon's services', the lake's, Grafana's, branch environments' and the object store's admin's. */
   const neonSecrets = (neon: NeonHosts): RenderedSecrets => ({
     [names.s3Admin]: aws("admin"),
+    [names.neonExpiry]: { ...aws("admin"), STORAGE_CONTROLLER_TOKEN: token("scrubber") },
     [names.safekeeper]: {
       ...aws("neon"),
       REMOTE_STORAGE: storage("safekeeper"),

@@ -5,7 +5,9 @@
  * gets them into files, puts and reads small JSON objects, where asked only while each is
  * the one its ETag names, or while there is none, copies objects within the bucket, says an
  * object's size and ETag, deletes objects, where asked only while each is the one its ETag
- * names, and lists those under a prefix, and nothing else.
+ * names, and lists those under a prefix; and, of a versioned bucket, as Neon's bucket's
+ * expiry asks (neon/control/expiry.ts), lists every version and delete marker under a prefix,
+ * and deletes versions for good; and nothing else.
  *
  * What it asks only while an object is so, the commits of the snapshots, holds only on a
  * store that honours the conditions (If-Match, If-None-Match) of a PUT and a DELETE, checking
@@ -113,6 +115,30 @@ export interface ListedObject {
   readonly writtenAt: number;
 }
 
+/** A version of an object of a versioned bucket, as such a bucket lists them: its key and id. */
+export interface ObjectVersion {
+  readonly key: string;
+  readonly versionId: string;
+}
+
+/**
+ * A version as a versioned bucket lists it: when it was written, in milliseconds since the
+ * epoch, its size, whether it is its key's latest, and whether it is a delete marker, which
+ * holds nothing (0 bytes).
+ */
+export interface ListedVersion extends ObjectVersion {
+  readonly writtenAt: number;
+  readonly bytes: number;
+  readonly latest: boolean;
+  readonly deleteMarker: boolean;
+}
+
+/** A version the bucket did not delete, as it answered: its code and message. */
+export interface RefusedVersion extends ObjectVersion {
+  readonly code: string;
+  readonly message: string;
+}
+
 /** The store does not honour the conditions of a request: which. */
 export class StoreUnconditional extends Schema.TaggedError<StoreUnconditional>()("StoreUnconditional", { condition: Schema.String }) {
   override get message(): string {
@@ -169,6 +195,19 @@ export interface S3Bucket {
   /** Aborts every multipart upload begun under `prefix` and neither completed nor aborted, as an uploader that stopped left it: how many. */
   readonly abortUploads: (prefix: string) => Effect.Effect<number, S3Error>;
   /**
+   * Every version and delete marker under `prefix`, of a versioned bucket, as it lists them: by key, each key's newest first.
+   * Fails where a page is no listing, or one cut short names no key and version to go on from.
+   */
+  readonly listVersions: (prefix: string) => Effect.Effect<readonly ListedVersion[], S3Error>;
+  /**
+   * Deletes each of `versions` for good, of a versioned bucket, in the order given, in requests of a thousand at most, as S3
+   * takes them: those the bucket did not delete, and why, as it answers each of a request's versions on its own and goes on
+   * past one it does not delete; one gone already is gone. A delete marker deleted so, its key's latest, lets the version
+   * before it be its key's latest again, if there is one. Fails where a request does, or is answered with no result of
+   * a deletion, or an error of no version.
+   */
+  readonly removeVersions: (versions: readonly ObjectVersion[]) => Effect.Effect<readonly RefusedVersion[], S3Error>;
+  /**
    * Proves the store honours the conditions putJsonIf and removeIf ask on, with an object of its own under PROBES, which it
    * removes: a PUT as of an ETag it does not hold, and one of an object it holds, refused, and one as of the ETag it holds
    * done; a DELETE as of an ETag it does not hold refused, and as of the one it holds done. Fails with StoreUnconditional
@@ -194,6 +233,10 @@ const IDLE_TIMEOUT_MS = 60_000;
 const ERROR_BODY_BYTES = 64 * 1024;
 /** The most a JSON object of the bucket's may hold: a manifest, which names a snapshot's few files, is a few KiB. */
 const JSON_BYTES = 1024 * 1024;
+/** The most versions S3 deletes in one request. */
+const DELETE_BATCH = 1000;
+/** What S3 says of a version it could not delete as it is not there: gone already. */
+const GONE: readonly string[] = ["NoSuchKey", "NoSuchVersion"];
 /** What a request made only as the object it names is so answers, where it is not: none (404), another (412), or one being written (409). */
 const REFUSED_CONDITIONS: readonly number[] = [404, 409, 412];
 
@@ -657,6 +700,59 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         } while (after !== undefined);
         for (const { key, uploadId } of begun) await bodyText(await succeeded(await call("DELETE", key, { query: { uploadId } }, signal), [404]), 0);
         return begun.length;
+      }),
+
+    listVersions: (prefix) =>
+      attempt("listing of versions", `${prefix}*`, async (signal) => {
+        const listed: ListedVersion[] = [];
+        let after: ObjectVersion | undefined;
+        do {
+          const query = { versions: "", prefix, ...(after === undefined ? {} : { "key-marker": after.key, "version-id-marker": after.versionId }) };
+          const page = await bodyText(await succeeded(await call("GET", null, { query }, signal)), Number.POSITIVE_INFINITY);
+          if (!page.includes("<ListVersionsResult")) throw new Error(`it answered no listing of versions: ${page.slice(0, 200)}`);
+          // Versions and delete markers as they come, which is in order.
+          for (const [, kind, entry = ""] of page.matchAll(/<(Version|DeleteMarker)>(.*?)<\/\1>/gsu)) {
+            const [key] = elements(entry, "Key");
+            const [versionId] = elements(entry, "VersionId");
+            const writtenAt = Date.parse(elements(entry, "LastModified")[0] ?? "");
+            const bytes = kind === "DeleteMarker" ? 0 : Number(elements(entry, "Size")[0]);
+            if (key === undefined || versionId === undefined || Number.isNaN(writtenAt) || !Number.isInteger(bytes)) {
+              throw new Error(`it listed a version with no key, id, time it was written or size: ${entry}`);
+            }
+            listed.push({ key, versionId, writtenAt, bytes, latest: elements(entry, "IsLatest")[0] === "true", deleteMarker: kind === "DeleteMarker" });
+          }
+          if (elements(page, "IsTruncated")[0] !== "true") break;
+          // A listing cut short that does not say where it goes on is not listed whole: nothing of it is taken.
+          const [key] = elements(page, "NextKeyMarker");
+          const [versionId] = elements(page, "NextVersionIdMarker");
+          if (!key || !versionId) throw new Error(`its listing went on past a page that names no key and version to go on from (NextKeyMarker "${key ?? ""}", NextVersionIdMarker "${versionId ?? ""}")`);
+          after = { key, versionId };
+        } while (after !== undefined);
+        return listed;
+      }),
+
+    removeVersions: (versions) =>
+      attempt("deletion of versions", versions.length === 1 ? `${versions[0]?.key}` : `${versions.length} versions`, async (signal) => {
+        const refused: RefusedVersion[] = [];
+        for (let start = 0; start < versions.length; start += DELETE_BATCH) {
+          const objects = versions.slice(start, start + DELETE_BATCH).map(({ key, versionId }) => `<Object><Key>${escapeXml(key)}</Key><VersionId>${escapeXml(versionId)}</VersionId></Object>`);
+          const bytes = Buffer.from(`<?xml version="1.0" encoding="UTF-8"?><Delete><Quiet>true</Quiet>${objects.join("")}</Delete>`);
+          // S3 takes a DeleteObjects only with its body's MD5.
+          const headers = { "content-type": "application/xml", "content-md5": createHash("md5").update(bytes).digest("base64") };
+          const answered = await bodyText(await succeeded(await call("POST", null, { query: { delete: "" }, headers, body: { bytes } }, signal)), Number.POSITIVE_INFINITY);
+          // Quiet, it answers the versions it did not delete alone: of those, one gone already is gone. An answer that is no
+          // DeleteResult, or an error of no version, is the request's failure, as what it deleted cannot be told.
+          if (!answered.includes("<DeleteResult")) throw new Error(`it answered no result of a deletion: ${answered.slice(0, 200)}`);
+          for (const error of elementsXml(answered, "Error")) {
+            const [key] = elements(error, "Key");
+            const code = elements(error, "Code")[0] ?? "";
+            const message = elements(error, "Message")[0] ?? "";
+            if (!key) throw new Error(`it answered an error of no version: ${code} ${message}`);
+            if (GONE.includes(code)) continue;
+            refused.push({ key, versionId: elements(error, "VersionId")[0] ?? "", code, message });
+          }
+        }
+        return refused;
       }),
   };
   return { ...bucket, checkConditions: conditionsOf(bucket) };

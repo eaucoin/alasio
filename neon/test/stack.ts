@@ -31,6 +31,7 @@ import { AGENTS, alasioOk, type Forward, inContainer, kube, lakeQuery, paths, re
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SERVING_LABEL, SUSPEND_AFTER } from "../control/endpoints.ts";
+import { EXPIRY_TEST_AGES_VARIABLE, HORIZONS_KEY, lsnOf, segmentOf } from "../control/expiry.ts";
 import { computeCtlToken, signToken } from "../control/jwt.ts";
 import { COMPUTE_LOCKS } from "../control/record.ts";
 import { scramVerifier } from "../control/scram.ts";
@@ -1077,25 +1078,6 @@ export function neonStack(): void {
         }
       });
 
-      test("the object store holds Neon's bucket to its lifecycle rules, the safekeepers' full WAL segments expiring after three days", async () => {
-        const answered: { Rules: { ID: string }[] } = JSON.parse(await kube.execOk(
-          NAMESPACE,
-          await kube.runningPod(NAMESPACE, componentName("seaweedfs")),
-          // As the stack's admin, Neon's bucket's, which gave it them.
-          ["/bin/sh", "-c", 'AWS_ACCESS_KEY_ID="$ADMIN_KEY_ID" AWS_SECRET_ACCESS_KEY="$ADMIN_SECRET" aws s3api --endpoint-url http://127.0.0.1:8333 get-bucket-lifecycle-configuration --bucket neon'],
-          { container: "lifecycle" },
-        ));
-        const rule = (id: string) => answered.Rules.find(({ ID }) => ID === id);
-        assert.deepEqual(rule("expire-wal"), {
-          ID: "expire-wal",
-          Status: "Enabled",
-          Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: 16 * 1024 * 1024 - 1 } },
-          Expiration: { Days: 3 },
-        });
-        assert.ok(rule("expire-noncurrent-wal"));
-        assert.ok(rule("expire-noncurrent"));
-      });
-
       /** Runs `script` in the gateway `pod`'s lifecycle container, as the tests' own S3 identity, its `s3api` at `endpoint` (its own, unless another's). */
       const onGateway = (pod: string, script: string) =>
         kube.execOk(NAMESPACE, pod, ["/bin/sh", "-c", `set -e; ${AS_E2E}; s3api() { endpoint=$1; shift; aws s3api --endpoint-url "http://$endpoint" "$@"; }; ${script}`], { container: "lifecycle" });
@@ -1109,6 +1091,148 @@ export function neonStack(): void {
         kube.execOk(NAMESPACE, master ?? (await masters())[0] ?? assert.fail("no master runs"), ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "master" });
       /** The pod of a part's address, as SeaweedFS names a server: its name in its headless Service, and a port. */
       const podOfAddress = (address: string) => address.split(".")[0] ?? "";
+
+      test("the object store's lifecycle pass expires what of Neon's bucket Neon needs no more: its replaced objects, its delete markers left alone, and its full WAL segments wholly a segment below their timeline's remote consistent LSN, none of those where the storage controller cannot tell it; and Neon reads, writes and restarts on what is left", { timeout: 1_800_000 }, async () => {
+        const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+        // SeaweedFS's own rule of the bucket: its uploads left incomplete aborted after a day, alone.
+        const rules: { Rules: { ID: string }[] } = JSON.parse(await kube.execOk(
+          NAMESPACE,
+          gateway,
+          ["/bin/sh", "-c", 'AWS_ACCESS_KEY_ID="$ADMIN_KEY_ID" AWS_SECRET_ACCESS_KEY="$ADMIN_SECRET" aws s3api --endpoint-url http://127.0.0.1:8333 get-bucket-lifecycle-configuration --bucket neon'],
+          { container: "lifecycle" },
+        ));
+        assert.deepEqual(rules.Rules.map(({ ID }) => ID), ["abort-incomplete-uploads"]);
+
+        const { timelineId } = await record();
+        const timeline = `${tenantId}/${timelineId}`;
+        /** Every version of the bucket, as it lists them. */
+        const versions = async () => {
+          const listed: { Versions?: { Key: string; VersionId: string; IsLatest: boolean }[]; DeleteMarkers?: { Key: string; VersionId: string; IsLatest: boolean }[] } = JSON.parse(
+            (await onGateway(gateway, "s3api 127.0.0.1:8333 list-object-versions --bucket neon --output json")) || "{}",
+          );
+          return { versions: listed.Versions ?? [], markers: listed.DeleteMarkers ?? [] };
+        };
+        /** The timeline's remote consistent LSN, the least of its shards', of the uploaded index and of the one validated. */
+        const horizon = async () => {
+          const described = await controller<{ shards: { remote_consistent_lsn: string; remote_consistent_lsn_visible?: string }[] }>("GET", `/control/v1/tenant/${tenantId}/timeline/${timelineId}`);
+          const lsns = described.shards.flatMap(({ remote_consistent_lsn, remote_consistent_lsn_visible }) => [remote_consistent_lsn, ...(remote_consistent_lsn_visible ? [remote_consistent_lsn_visible] : [])]).map(lsnOf);
+          assert.ok(lsns.length > 0 && lsns.every((lsn) => lsn !== null), JSON.stringify(described));
+          return lsns.reduce<bigint>((least, lsn) => (lsn !== null && lsn < least ? lsn : least), lsns[0] ?? 0n);
+        };
+        /** The timeline's full WAL segments the bucket holds now, by their end, of their current versions. */
+        const segments = async () => (await versions()).versions.filter(({ IsLatest }) => IsLatest).flatMap(({ Key }) => {
+          const segment = segmentOf(Key);
+          return segment?.timeline === timeline ? [{ key: Key, end: segment.end }] : [];
+        });
+        const SEGMENT = 16n * 1024n * 1024n;
+
+        // WAL of six segments or more, uploaded by the safekeepers whole, and the pageserver's layers of it uploaded too, so its
+        // remote consistent LSN is past it: the open layer written out within seconds, for this test alone, as the churn's.
+        await query("create table expiry (id int primary key, payload text)");
+        await query("insert into expiry select g, repeat(md5(g::text), 30) from generate_series(1, 100000) g");
+        const [{ written } = { written: "" }] = await query<{ written: string }>("select pg_current_wal_flush_lsn()::text as written");
+        const target = lsnOf(written) ?? assert.fail(`not an LSN: ${written}`);
+        const configured = async (checkpoint_timeout: string | null) =>
+          assert.equal((await answeredInside(await podOf("neon-storage-controller"), "PATCH", "http://127.0.0.1:1234/v1/tenant/config", token("admin"), { tenant_id: tenantId, checkpoint_timeout })).status, 200);
+        await configured("5s");
+        try {
+          for (const deadline = Date.now() + 300_000; (await horizon()) < target; await sleep(5000)) {
+            assert.ok(Date.now() < deadline, `the timeline's remote consistent LSN did not reach ${written}`);
+          }
+        } finally {
+          await configured(null);
+        }
+        const below = async () => {
+          const lsn = await horizon();
+          return { lsn, segments: (await segments()).filter(({ end }) => end + SEGMENT <= lsn) };
+        };
+        for (const deadline = Date.now() + 300_000; (await below()).segments.length < 5; await sleep(5000)) {
+          assert.ok(Date.now() < deadline, `the safekeepers uploaded ${(await segments()).length} full segments`);
+        }
+
+        /** A pass of the CronJob's, its expiry given `env` beside its own: what the expiry logged. */
+        const pass = async (env: Readonly<Record<string, string>>) => {
+          const name = `lifecycle-expiry-${Date.now()}`;
+          const template = (await kube.get<V1CronJob>(ref("CronJob", componentName("seaweedfs-lifecycle"), NAMESPACE)))?.spec?.jobTemplate;
+          assert.ok(template?.spec?.template.spec);
+          const containers = template.spec.template.spec.containers.map((container) =>
+            container.name === "neon-expiry" ? { ...container, env: [...(container.env ?? []).filter(({ name }) => !(name in env)), ...Object.entries(env).map(([name, value]) => ({ name, value }))] } : container
+          );
+          const job: V1Job = {
+            apiVersion: "batch/v1",
+            kind: "Job",
+            metadata: { name, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} },
+            spec: { ...template.spec, template: { ...template.spec.template, spec: { ...template.spec.template.spec, containers } } },
+          };
+          await kube.apply(job);
+          try {
+            await kube.awaitReady([ref("Job", name, NAMESPACE)], "10 minutes");
+            const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "job-name": name }) });
+            return (await Promise.all(pods.map((pod) => kube.logs(NAMESPACE, pod.metadata?.name ?? "", "neon-expiry")))).join("");
+          } finally {
+            await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});
+          }
+        };
+        // Everything old enough to go at once, for this test alone, but where said.
+        const atOnce = { [EXPIRY_TEST_AGES_VARIABLE]: JSON.stringify({ pageserverNoncurrentMs: 0, safekeeperNoncurrentMs: 0, walSegmentMs: 0, walHorizonMs: 0 }) };
+        // Those wholly a segment below the LSN before any pass: the passes below record an LSN no lower, once what the
+        // installation's hourly passes recorded before the WAL above was written is forgotten.
+        await onGateway(gateway, `s3api 127.0.0.1:8333 delete-object --bucket neon --key ${HORIZONS_KEY} >/dev/null`);
+        const { lsn, segments: before } = await below();
+        const keptAll = async () => {
+          const kept = new Set((await segments()).map(({ key }) => key));
+          assert.deepEqual(before.filter(({ key }) => !kept.has(key)), []);
+        };
+
+        // The LSN its timeline had a window ago not recorded yet, as on a first pass: no full segment goes, and it says why.
+        const unrecorded = await pass({ [EXPIRY_TEST_AGES_VARIABLE]: JSON.stringify({ pageserverNoncurrentMs: 0, safekeeperNoncurrentMs: 0, walSegmentMs: 0 }) });
+        assert.match(unrecorded, / 0 versions of full WAL segments \(0 bytes\), /u);
+        assert.ok(unrecorded.includes(`full WAL segments of the timeline ${timeline} old enough to expire`) && unrecorded.includes("as no remote consistent LSN of its has been recorded 48 h ago or longer"), unrecorded);
+        await keptAll();
+
+        // Its storage controller not reached: no full segment goes, and it says which timeline's, and why.
+        const unreached = await pass({ ...atOnce, STORAGE_CONTROLLER_URL: "http://127.0.0.1:9" });
+        assert.match(unreached, / 0 versions of full WAL segments \(0 bytes\), /u);
+        assert.ok(unreached.includes(`full WAL segments of the timeline ${timeline} old enough to expire`) && unreached.includes(`as the storage controller could not tell the remote consistent LSN of the timeline ${timeline}: `), unreached);
+        await keptAll();
+
+        // An object of the pageserver's part written over, and one deleted, as Neon's are.
+        await onGateway(gateway, "echo one > /tmp/one; echo two > /tmp/two; for body in one two; do s3api 127.0.0.1:8333 put-object --bucket neon --key pageserver/e2e-expiry/replaced --body /tmp/$body >/dev/null; done");
+        await onGateway(gateway, "s3api 127.0.0.1:8333 put-object --bucket neon --key pageserver/e2e-expiry/deleted --body /tmp/one >/dev/null; s3api 127.0.0.1:8333 delete-object --bucket neon --key pageserver/e2e-expiry/deleted >/dev/null");
+        const ours = async () => {
+          const { versions: held, markers } = await versions();
+          return [...held, ...markers].filter(({ Key }) => Key.startsWith("pageserver/e2e-expiry/")).map(({ Key, IsLatest }) => `${Key.slice("pageserver/e2e-expiry/".length)} ${IsLatest ? "latest" : "noncurrent"}`).sort();
+        };
+        assert.deepEqual(await ours(), ["deleted latest", "deleted noncurrent", "replaced latest", "replaced noncurrent"]);
+
+        // Reached: the full segments wholly a segment below the least LSN recorded within the window go, every version of
+        // each, those below the one read before the passes among them, as do the replaced objects and the delete marker each
+        // leaves alone; the current versions stay.
+        const expired = await pass(atOnce);
+        const deleted = /deleted (\d+) noncurrent versions of the pageserver's \(\d+ bytes\), (\d+) noncurrent versions of the safekeepers' \(\d+ bytes\), (\d+) versions of full WAL segments \(\d+ bytes\), (\d+) noncurrent versions of its own record and (\d+) delete markers left their key's only version/u.exec(expired);
+        assert.ok(deleted, expired);
+        const [, pageserver = "0", , wal = "0", own = "0", markers = "0"] = deleted;
+        // Its own record, written at each pass before, replaced: those versions gone.
+        assert.ok(Number(own) >= 1, expired);
+        assert.ok(Number(pageserver) >= 2 && Number(wal) >= before.length && Number(markers) >= 1, expired);
+        assert.deepEqual(await ours(), ["replaced latest"]);
+        const left = await segments();
+        assert.deepEqual(left.filter(({ end }) => end + SEGMENT <= lsn), []);
+        assert.ok(left.every(({ end }) => end + SEGMENT > lsn), `segments ${left.map(({ key }) => key.split("/").at(-1)).join(", ")} past ${lsn}`);
+
+        // Neon reads, writes, and comes back from its pageservers' and safekeepers' restarts on what is left.
+        assert.deepEqual(await query("select count(*)::int as n from expiry"), [{ n: 100000 }]);
+        await query("insert into expiry values (100001, 'after')");
+        const restarted = (await runningPods()).filter(({ metadata }) => ["neon-pageserver", "neon-safekeeper"].includes(metadata?.labels?.["app.kubernetes.io/component"] ?? ""));
+        assert.ok(restarted.length >= 4, restarted.map(({ metadata }) => metadata?.name).join(", "));
+        await Promise.all(restarted.map((pod) => kube.remove(ref("Pod", pod.metadata?.name ?? "", NAMESPACE))));
+        await awaitReplaced(restarted);
+        await up();
+        assert.deepEqual(await query("select count(*)::int as n, max(id) as last from expiry"), [{ n: 100001, last: 100001 }]);
+        await query("insert into expiry values (100002, 'restarted')");
+        assert.deepEqual(await query("select payload from expiry where id = 100002"), [{ payload: "restarted" }]);
+        await onGateway(gateway, "s3api 127.0.0.1:8333 delete-object --bucket neon --key pageserver/e2e-expiry/replaced >/dev/null");
+      });
 
       test("the object store, its objects kept twice, serves every one while a volume server holding them is away, and takes new ones", { skip: AGENTS < 2 && "three volume servers, on three nodes" }, async () => {
         const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");

@@ -35,6 +35,7 @@ import type {
 } from "@kubernetes/client-node";
 import { Result } from "effect";
 
+import { EXPIRY_TEST_AGES_VARIABLE } from "../../neon/control/expiry.ts";
 import { LOG_PRINCIPALS } from "../../neon/control/secrets.ts";
 import { DRAIN_WITHIN_MS } from "../../neon/lake/src/drain.ts";
 import { memoryBytes } from "../src/capacity.ts";
@@ -745,26 +746,34 @@ describe("neon", () => {
     assert.equal(pass?.jobTemplate.spec?.activeDeadlineSeconds, 2700);
   });
 
-  /** The lifecycle rules each gateway gives Neon's bucket. */
-  const lifecycleRules = () => {
-    const lifecycle = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
-    const rules = /--lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1];
-    assert.ok(rules);
-    return (JSON.parse(rules) as { Rules: { Filter: { Prefix?: string }; NoncurrentVersionExpiration?: { NoncurrentDays: number }; Expiration?: unknown }[] }).Rules;
-  };
-
-  test("expires Neon's replaced objects a day past the history it keeps, and the safekeepers' re-uploads after a day", () => {
-    const expiries = lifecycleRules().flatMap(({ Filter, NoncurrentVersionExpiration }) => (NoncurrentVersionExpiration ? [[Filter.Prefix, NoncurrentVersionExpiration.NoncurrentDays]] : []));
-    assert.deepEqual(expiries, [["pageserver/", 2], ["safekeeper/", 1]]);
-  });
-
-  test("expires the safekeepers' full WAL segments a day after the pageserver's objects can no longer be put back, not the segments they write", () => {
-    assert.deepEqual(lifecycleRules().filter(({ Expiration }) => Expiration), [{
-      ID: "expire-wal",
-      Status: "Enabled",
-      Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: 16 * 1024 * 1024 - 1 } },
-      Expiration: { Days: 3 },
-    }]);
+  test("gives Neon's bucket SeaweedFS's rule for uploads left incomplete alone, and expires what else of it Neon needs no more in its lifecycle pass, with alasio's image, as the bucket's admin, its WAL below the remote consistent LSN the storage controller says", () => {
+    const objects = install();
+    const lifecycle = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
+    assert.deepEqual(JSON.parse(/--bucket neon --lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1] ?? ""), {
+      Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
+    });
+    const pass = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.spec;
+    assert.deepEqual(pass?.containers.map(({ name }) => name), ["lifecycle", "neon-expiry"]);
+    const expiry = pass?.containers[1];
+    assert.match(expiry?.image ?? "", /^ghcr\.io\/eaucoin\/alasio:/u);
+    // Once its pod's policy lets it reach the store's gateways.
+    assert.equal(expiry?.command, undefined);
+    assert.deepEqual(expiry?.args, [
+      "/bin/sh",
+      "-c",
+      "until curl -fsS -o /dev/null --max-time 5 http://alasio-seaweedfs.alasio.svc:8333/healthz; do sleep 2; done && exec node /opt/alasio/neon/control/expiry.ts",
+    ]);
+    assert.deepEqual(expiry?.env?.map(({ name, value, valueFrom }) => [name, value ?? `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]), [
+      ["S3_ENDPOINT", "http://alasio-seaweedfs.alasio.svc:8333"],
+      ["S3_REGION", "us-east-1"],
+      ["S3_BUCKET_NEON", "neon"],
+      ["STORAGE_CONTROLLER_URL", "http://alasio-neon-storage-controller:1234"],
+      ["AWS_ACCESS_KEY_ID", "alasio-neon-expiry/AWS_ACCESS_KEY_ID"],
+      ["AWS_SECRET_ACCESS_KEY", "alasio-neon-expiry/AWS_SECRET_ACCESS_KEY"],
+      ["STORAGE_CONTROLLER_TOKEN", "alasio-neon-expiry/STORAGE_CONTROLLER_TOKEN"],
+    ]);
+    // No installation's ages but its own.
+    assert.ok(!JSON.stringify(objects).includes(EXPIRY_TEST_AGES_VARIABLE));
   });
 
   test("makes the snapshots bucket, its uploads left incomplete aborted after a day, and has the setup make its Secret, where sessions run under gVisor", () => {
@@ -4290,6 +4299,7 @@ test("runs every container of alasio's image under the image's entrypoint, tini,
     "alasio-node-agent/node-agent",
     "alasio-receiver/receiver",
     "alasio-sandbox-gateway/sandbox-gateway",
+    "alasio-seaweedfs-lifecycle/neon-expiry",
     "alasio-workspace-mount/workspace-mount",
     "alasio/alasio",
     "harness-claude/harness",

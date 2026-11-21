@@ -124,6 +124,11 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.lake, "LAKE_S3_KEY"), root.s3.lake.accessKey);
   assert.deepEqual(verifyToken(publicKey, value(kube, names.lake, "LAKE_BRANCHES_TOKEN")), { scope: "branches" });
   assert.deepEqual(verifyToken(publicKey, value(kube, names.branches, "control-token")), { scope: "admin" });
+  // Neon's bucket's expiry's: its admin's keys, and a token of the scrubber's scope, which the storage controller takes to
+  // describe a tenant or a timeline and to record a scrub's findings alone (./kube-setup.ts), not the admin's.
+  assert.equal(value(kube, names.neonExpiry, "AWS_ACCESS_KEY_ID"), root.s3.admin.accessKey);
+  assert.equal(value(kube, names.neonExpiry, "AWS_SECRET_ACCESS_KEY"), root.s3.admin.secretKey);
+  assert.deepEqual(verifyToken(publicKey, value(kube, names.neonExpiry, "STORAGE_CONTROLLER_TOKEN")), { scope: "scrubber" });
   assert.equal(value(kube, names.branches, "fork-key"), root.branchForkKey);
   // neon-control's own, which it draws its role's passwords on the computes from, rendered nowhere but the root.
   assert.match(root.monitorKey ?? "", /^[\w-]{32}$/u);
@@ -230,7 +235,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   for (const { name, actions } of seaweed.identities) {
     if (name !== "snapshots") assert.ok(actions.every((action) => action.includes(":") && !action.endsWith(":snapshots")), `${name}: ${actions.join(", ")}`);
   }
-  // The admin, of Neon's bucket alone, gives it its lifecycle rules; the backups' writes the backups and reads the workspaces' metadata.
+  // The admin, of Neon's bucket alone, gives it its lifecycle rules and expires what of it Neon needs no more; the backups' writes the backups and reads the workspaces' metadata.
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "admin")?.actions, ["Admin:neon"]);
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "backups")?.actions, [
     "Read:backups",
