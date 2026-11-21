@@ -1267,7 +1267,7 @@ export async function dumpClusterState(): Promise<void> {
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
       }
     }
-    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake-loader", "lake-query", "lake-intake", "alasio", "log"]);
+    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "neon-compute-ro", "neon-pageserver", "lake-loader", "lake-query", "lake-intake", "alasio", "log"]);
     const restarts = (pod: V1Pod) => (pod.status?.containerStatuses ?? []).some(({ restartCount }) => restartCount > 0);
     const told = (pod: V1Pod) => waking.has(pod.metadata?.labels?.["app.kubernetes.io/component"] ?? "") || restarts(pod);
     for (const pod of pods.filter((each) => each.status?.phase === "Running" && told(each) && podProblems(each).length === 0)) {
