@@ -1,0 +1,220 @@
+name: bench
+run-name: ${{ inputs.label || 'bench' }}
+
+# The memory-snapshot benchmark of alasio (bench/): on demand only. One job per store profile and
+# variant, on the runner itself (the host target), each installing alasio from the images job's
+# images and running every run of every case asked, a line of results.jsonl per run and phase
+# (bench/common/schema/result.schema.json); then the results aggregated, the restores' critical
+# paths among them, and the run's images deleted, unless kept for later runs.
+on:
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: "Store profiles, of local s3-standard s3-express"
+        type: string
+        default: "local s3-standard s3-express"
+      variants:
+        description: "Variants, a job each (bench/alasio/bench.test.ts VARIANTS)"
+        type: string
+        default: "as-shipped"
+      cases:
+        description: "Fixture cases, as fixture/MiB (bench/common/cases.json's, all of them if empty)"
+        type: string
+        default: ""
+      runs:
+        description: "Runs of each case"
+        type: string
+        default: "20"
+      images:
+        description: "alasio's images of an earlier run, kept, as ghcr.io/eaucoin/alasio-ci/run-<id>-<attempt> (built anew if empty)"
+        type: string
+        default: ""
+      cpu:
+        description: "The runner CPU model every bench job must have, others failing at once to be re-run (any if empty)"
+        type: string
+        default: "AMD EPYC 7763 64-Core Processor"
+      kernel:
+        description: "The prefix of the runner kernel's release every bench job must have, others failing at once to be re-run (any if empty)"
+        type: string
+        default: "7.0."
+      keep-images:
+        description: "Keep the images this run builds, for later runs, to be deleted by hand"
+        type: boolean
+        default: false
+      label:
+        description: "The run's name, as the runs list says it (bench if empty)"
+        type: string
+        default: ""
+      settings:
+        description: "Settings of the bench jobs, as BENCH_NAME=value words, each set in their environment"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Every profile asked with every variant asked, each a job; a word that names neither fails the run before any starts.
+      - id: matrix
+        name: Say the jobs
+        shell: bash
+        env:
+          PROFILES: ${{ inputs.profiles }}
+          VARIANTS: ${{ inputs.variants }}
+        run: |
+          words() { jq --raw-input --compact-output '[splits("[\\s,]+") | select(. != "")]' <<<"$1"; }
+          matrix=$(jq --null-input --compact-output \
+            --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" \
+            --argjson known "$(jq --compact-output 'keys' bench/common/store/profiles.json)" '
+            [$variants[] | select(test("^(as-shipped|kept-cache|whole|restored|trace|turn-replay|mixed-(release|saves|fill|all)|chain-[1-9][0-9]*)$") | not)] as $unknown
+            | if ($profiles - $known) != [] then "::error::no profile \($profiles - $known | join(", "))\n" | halt_error(1)
+              elif $unknown != [] then "::error::no variant \($unknown | join(", "))\n" | halt_error(1)
+              elif $profiles == [] or $variants == [] then "::error::no profile or no variant asked\n" | halt_error(1)
+              else {include: [$profiles[] as $profile | $variants[] as $variant | {profile: $profile, variant: $variant}]} end')
+          echo "matrix=$matrix" | tee --append "$GITHUB_OUTPUT"
+
+  images:
+    needs: matrix
+    if: inputs.images == ''
+    uses: ./.github/workflows/images.yml
+    permissions:
+      contents: read
+      packages: write
+
+  bench:
+    needs: [matrix, images]
+    if: ${{ !cancelled() && needs.matrix.result == 'success' && needs.images.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    name: bench (${{ matrix.profile }}, ${{ matrix.variant }})
+    env:
+      # Beside the checkout, on the runner's disk.
+      BENCH_DIR: /home/runner/bench-work
+      BENCH_PROFILE: ${{ matrix.profile }}
+      BENCH_VARIANT: ${{ matrix.variant }}
+      BENCH_CASES: ${{ inputs.cases }}
+      BENCH_RUNS: ${{ inputs.runs }}
+    steps:
+      # Every measure is of one CPU model, and of the disk that comes with it: a job elsewhere ends
+      # at once, to be re-run (gh run rerun <id> --failed) until it lands on one.
+      - name: The runner's CPU and kernel, as pinned
+        env:
+          PINNED: ${{ inputs.cpu }}
+          KERNEL: ${{ inputs.kernel }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p' | head -n 1)
+          release=$(uname -r)
+          echo "$model, $release"
+          [ -z "$PINNED" ] || [ "$model" = "$PINNED" ] || { echo "::error::this runner's CPU is $model, not $PINNED: re-run this job"; exit 3; }
+          [[ $release == "$KERNEL"* ]] || { echo "::error::this runner's kernel is $release, not $KERNEL*: re-run this job"; exit 3; }
+      # What the runner comes with that the benchmark does not use goes, as ci.yml's end-to-end
+      # jobs do it: the images, the caches and k3s's images need the disk.
+      - name: Free disk space
+        shell: bash
+        run: |
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az; do
+            sudo rm -rf "$dir" &
+          done
+          docker system prune --all --force >/dev/null &
+          wait
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: The benchmark's own pieces, built and tested
+        run: |
+          npm ci
+          (cd bench/common && bun install --frozen-lockfile && npm run typecheck && node driver/build.ts && npm test)
+          node --test --test-concurrency=1 bench/alasio/test/*.test.ts
+      - name: The runner
+        run: |
+          mkdir -p "$BENCH_DIR"
+          bench/common/host.sh "$BENCH_DIR/staging" | tee "$BENCH_DIR/host.json"
+      - name: The run's settings
+        env:
+          SETTINGS: ${{ inputs.settings }}
+        run: |
+          for setting in $SETTINGS; do
+            [[ $setting =~ ^BENCH_[A-Z0-9_]+=[A-Za-z0-9_./:,-]*$ ]] || { echo "::error::$setting is no BENCH_NAME=value"; exit 1; }
+            echo "$setting" | tee --append "$GITHUB_ENV"
+          done
+      - name: Run the benchmark
+        run: bench/alasio/run.sh
+        env:
+          ALASIO_E2E_REGISTRY: ${{ inputs.images || needs.images.outputs.registry }}
+      # A job whose runs failed fails, its results kept: a run's failure is written as a line, not
+      # thrown, so the run before passes whatever came of the runs. The store's measures alone
+      # (BENCH_MODE=store) write no line.
+      - name: Every phase of every run passed
+        if: env.BENCH_MODE != 'store'
+        run: |
+          [ -s "$BENCH_DIR/results.jsonl" ] || { echo "::error::no run wrote a result"; exit 1; }
+          failed=$(jq --slurp '[.[] | select(.ok | not)] | length' "$BENCH_DIR/results.jsonl")
+          total=$(jq --slurp 'length' "$BENCH_DIR/results.jsonl")
+          echo "$failed of $total lines failed"
+          [ "$failed" -eq 0 ] || { jq --compact-output 'select(.ok | not) | {fixture, size_mib, run, phase, failure}' "$BENCH_DIR/results.jsonl" | head -n 40; echo "::error::$failed of $total lines failed"; exit 1; }
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ matrix.profile }}-${{ matrix.variant }}
+          path: |
+            ${{ env.BENCH_DIR }}/results.jsonl
+            ${{ env.BENCH_DIR }}/spans.jsonl
+            ${{ env.BENCH_DIR }}/host.json
+            ${{ env.BENCH_DIR }}/logs/
+          if-no-files-found: warn
+
+  aggregate:
+    needs: bench
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: results
+      # The percentiles of every cell, and each restore's critical path through its spans.
+      - name: Aggregate
+        run: |
+          (cd bench/common && bun install --frozen-lockfile)
+          mapfile -t files < <(find results -name results.jsonl -size +0)
+          # A run of the store's measures alone (BENCH_MODE=store) writes no result line, only its logs.
+          [ "${#files[@]}" -gt 0 ] || { echo "no job wrote results: nothing to aggregate"; exit 0; }
+          node bench/common/aggregate/aggregate.ts --out summary "${files[@]}"
+          mapfile -t spans < <(find results -name spans.jsonl -size +0)
+          [ "${#spans[@]}" -eq 0 ] || node bench/common/aggregate/critical-path.ts --out summary "${spans[@]}"
+          cat summary/*.md >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: summary
+          path: summary/
+
+  # Whatever came of the rest, the run's images are deleted, unless kept.
+  delete-images:
+    needs: [images, bench]
+    if: always() && needs.images.result != 'skipped' && !inputs.keep-images
+    uses: ./.github/workflows/delete-images.yml
+    permissions:
+      packages: write

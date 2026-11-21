@@ -1,0 +1,25 @@
+{
+  "local": {
+    "emulated": false,
+    "first_byte_ms": null,
+    "bytes_per_second": null,
+    "about": "The store as the box runs it: no proxy."
+  },
+  "s3-standard": {
+    "emulated": true,
+    "first_byte_ms": 150,
+    "bytes_per_second": 85000000,
+    "about": "S3 Standard: 'consistent small object latencies (and first-byte-out latencies for larger objects) of roughly 100-200 milliseconds', and 'one concurrent request for each 85-90 MB/s of desired network throughput'. 150 ms is the middle of the range, 85 MB/s its low end.",
+    "sources": ["https://d1.awsstatic.com/whitepapers/AmazonS3BestPractices.pdf"]
+  },
+  "s3-express": {
+    "emulated": true,
+    "first_byte_ms": 5,
+    "bytes_per_second": 85000000,
+    "about": "S3 Express One Zone: 'consistent single-digit millisecond first-byte read and write request latencies—up to 10x faster than S3 Standard'; 5 ms is the middle of single digits. Its connections have 'a fixed upper bound on the number of bytes that can be uploaded or downloaded per second', of which AWS publishes no figure: S3 Standard's is used.",
+    "sources": [
+      "https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-performance.html",
+      "https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-optimizing-performance-design-patterns.html"
+    ]
+  }
+}
