@@ -1,0 +1,40 @@
+name: delete-images
+
+# The calling run's images (images.yml), those of each of its attempts, pushed whole or not,
+# deleted: so a failed run is re-run whole, its images built anew, as a re-run of its failed jobs
+# alone would find them gone. Called by ci.yml and bench.yml, whatever came of their other jobs.
+on:
+  workflow_call:
+
+permissions:
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/eaucoin/alasio-ci
+
+jobs:
+  delete-images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete the run's images
+        shell: bash
+        run: |
+          failed=0
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-webhook alasio-node alasio-harness-stand-ins alasio-harness-stand-ins-previous; do
+              image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
+              package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
+              if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then
+                echo "deleted $image"
+              elif [[ $said == *"HTTP 404"* ]]; then
+                echo "no $image to delete"
+              else
+                echo "::error::$image was not deleted: $said"
+                failed=1
+              fi
+            done
+          done
+          exit "$failed"
