@@ -792,13 +792,30 @@ describe("neon", () => {
       Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
     });
     assert.equal(made.setup, "snapshots");
-    // Its rules given as its own identity, the one that may write it, Neon's as the admin.
+  });
+
+  test("aborts the uploads left incomplete after a day in each bucket written in parts, Neon's, the lake's, the backups' and the snapshots', each rule given as an identity that may write its bucket, and in workspace storage's, which JuiceFS writes whole, none", () => {
     const lifecycle = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
-    assert.match(lifecycle?.command?.[2] ?? "", /AWS_ACCESS_KEY_ID="\$SNAPSHOTS_KEY_ID" AWS_SECRET_ACCESS_KEY="\$SNAPSHOTS_SECRET" aws s3api --endpoint-url http:\/\/127\.0\.0\.1:8333 put-bucket-lifecycle-configuration --bucket snapshots /u);
-    assert.match(lifecycle?.command?.[2] ?? "", /AWS_ACCESS_KEY_ID="\$ADMIN_KEY_ID" AWS_SECRET_ACCESS_KEY="\$ADMIN_SECRET" aws s3api --endpoint-url http:\/\/127\.0\.0\.1:8333 put-bucket-lifecycle-configuration --bucket neon /u);
-    assert.deepEqual(lifecycle?.env?.filter(({ name }) => name.endsWith("_KEY_ID")).map(({ name, valueFrom }) => [name, valueFrom?.secretKeyRef?.name]), [
-      ["ADMIN_KEY_ID", "alasio-neon-s3-admin"],
-      ["SNAPSHOTS_KEY_ID", "alasio-snapshots"],
+    const script = lifecycle?.command?.[2] ?? "";
+    const given = [...script.matchAll(/AWS_ACCESS_KEY_ID="\$(\w+)_KEY_ID" AWS_SECRET_ACCESS_KEY="\$\1_SECRET" aws s3api --endpoint-url http:\/\/127\.0\.0\.1:8333 put-bucket-lifecycle-configuration --bucket (\w+) --lifecycle-configuration '([^']+)'/gu)];
+    assert.deepEqual(given.map(([, as, bucket]) => [bucket, as]), [["neon", "ADMIN"], ["lake", "LAKE"], ["backups", "BACKUPS"], ["snapshots", "SNAPSHOTS"]]);
+    for (const [, , , rules] of given) {
+      assert.deepEqual(JSON.parse(rules ?? ""), {
+        Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
+      });
+    }
+    // Each waited for as made before its rule is given.
+    for (const bucket of ["neon", "lake", "backups", "snapshots"]) assert.ok(script.indexOf(`head-bucket --bucket ${bucket} `) < script.indexOf(`--bucket ${bucket} --lifecycle-configuration`), bucket);
+    // Each identity's keys from the Secret the setup gives its writers.
+    assert.deepEqual(lifecycle?.env?.filter(({ valueFrom }) => valueFrom).map(({ name, valueFrom }) => [name, `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]), [
+      ["ADMIN_KEY_ID", "alasio-neon-s3-admin/AWS_ACCESS_KEY_ID"],
+      ["ADMIN_SECRET", "alasio-neon-s3-admin/AWS_SECRET_ACCESS_KEY"],
+      ["LAKE_KEY_ID", "alasio-lake/LAKE_S3_KEY"],
+      ["LAKE_SECRET", "alasio-lake/LAKE_S3_SECRET"],
+      ["BACKUPS_KEY_ID", "alasio-neon-s3-backups/AWS_ACCESS_KEY_ID"],
+      ["BACKUPS_SECRET", "alasio-neon-s3-backups/AWS_SECRET_ACCESS_KEY"],
+      ["SNAPSHOTS_KEY_ID", "alasio-snapshots/AWS_ACCESS_KEY_ID"],
+      ["SNAPSHOTS_SECRET", "alasio-snapshots/AWS_SECRET_ACCESS_KEY"],
     ]);
     assert.equal(lifecycle?.envFrom, undefined);
   });

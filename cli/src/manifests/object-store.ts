@@ -17,7 +17,7 @@
  *   by (alasio-seaweedfs:8333), scaled on their CPU where their scale is a range. Each makes
  *   the buckets, idempotently, as it starts: Neon's, the lake's, backups', workspace
  *   storage's, and session sandboxes' snapshots'; and
- *   gives each bucket with lifecycle rules its rules (Neon's, and the snapshots'). It is
+ *   gives each bucket written in parts its lifecycle rule (ABORT_INCOMPLETE_UPLOADS). It is
  *   ready, and the stack's writers start, only once they are.
  *
  * And the periodic pass that applies the lifecycle rules, expires what of Neon's bucket Neon
@@ -102,11 +102,13 @@ const PORTS = {
 };
 
 /**
- * The lifecycle rule of Neon's bucket and of the snapshots bucket: a multipart upload left
- * neither completed nor aborted, as an uploader ended mid-upload leaves the parts it had
- * sent, aborted after a day, the least S3 allows: a node agent puts a file larger than a
- * part in parts (src/node-agent/s3.ts), and aborts an upload that fails, but not one it
- * was stopped in. What else of Neon's bucket Neon needs no more, the lifecycle pass
+ * The lifecycle rule of each bucket a writer puts files larger than a part into, in parts: a
+ * multipart upload left neither completed nor aborted, as an uploader ended mid-upload
+ * leaves the parts it had sent, aborted after a day, the least S3 allows. Neon's, the
+ * lake's (DuckDB's files), the backups' (`aws s3 cp`'s dumps) and the snapshots' (a node
+ * agent puts a file larger than a part in parts, src/node-agent/s3.ts, and aborts an upload
+ * that fails, but not one it was stopped in). Workspace storage's needs none: JuiceFS puts
+ * each block whole. What else of Neon's bucket Neon needs no more, the lifecycle pass
  * deletes itself (lifecyclePass). An external store is given no rule by alasio: its
  * operator gives the buckets this one, and Neon's those of the ages neon/control/expiry.ts
  * keeps its objects for.
@@ -426,11 +428,15 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
   const { scaling } = bundled.gateways;
   const made = [buckets.neon, buckets.lake, buckets.backups, buckets.workspaces, buckets.snapshots];
-  // Each bucket's rules given as its admin: Neon's as the admin's, the snapshots' as their own
-  // identity's, as nothing else may write that bucket (neon/control/secrets.ts s3Identities).
+  // Each bucket's rule given as an identity that may write the bucket, which SeaweedFS asks of
+  // its rules: Neon's as its admin, the others' as their own writers', each by the keys of
+  // the Secret it is given (neon/control/secrets.ts s3Identities, neon/control/kube-setup.ts).
+  const aws = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] as const;
   const lifecycles = [
-    { bucket: buckets.neon, rules: ABORT_INCOMPLETE_UPLOADS, as: "ADMIN" },
-    { bucket: buckets.snapshots, rules: ABORT_INCOMPLETE_UPLOADS, as: "SNAPSHOTS" },
+    { bucket: buckets.neon, as: "ADMIN", secret: neonName("s3-admin"), keys: aws },
+    { bucket: buckets.lake, as: "LAKE", secret: componentName("lake"), keys: ["LAKE_S3_KEY", "LAKE_S3_SECRET"] as const },
+    { bucket: buckets.backups, as: "BACKUPS", secret: neonName("s3-backups"), keys: aws },
+    { bucket: buckets.snapshots, as: "SNAPSHOTS", secret: componentName("snapshots"), keys: aws },
   ];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
@@ -531,7 +537,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
               volumeMounts: [{ name: "shell-tmp", mountPath: "/tmp" }],
             },
-            // Gives each bucket with lifecycle rules its rules once it exists.
+            // Gives each bucket written in parts its lifecycle rule once it exists.
             {
               name: "lifecycle",
               image: imageReference(config.neon.image),
@@ -541,11 +547,11 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 "-c",
                 script(
                   "set -e",
-                  ...lifecycles.flatMap(({ bucket, rules, as }) => {
-                    const aws = `AWS_ACCESS_KEY_ID="$${as}_KEY_ID" AWS_SECRET_ACCESS_KEY="$${as}_SECRET" aws s3api --endpoint-url http://127.0.0.1:8333`;
+                  ...lifecycles.flatMap(({ bucket, as }) => {
+                    const s3api = `AWS_ACCESS_KEY_ID="$${as}_KEY_ID" AWS_SECRET_ACCESS_KEY="$${as}_SECRET" aws s3api --endpoint-url http://127.0.0.1:8333`;
                     return [
-                      `until ${aws} head-bucket --bucket ${bucket} 2>/dev/null; do sleep 2; done`,
-                      `${aws} put-bucket-lifecycle-configuration --bucket ${bucket} --lifecycle-configuration '${JSON.stringify(rules)}'`,
+                      `until ${s3api} head-bucket --bucket ${bucket} 2>/dev/null; do sleep 2; done`,
+                      `${s3api} put-bucket-lifecycle-configuration --bucket ${bucket} --lifecycle-configuration '${JSON.stringify(ABORT_INCOMPLETE_UPLOADS)}'`,
                     ];
                   }),
                   "touch /tmp/ready",
@@ -555,13 +561,10 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               env: [
                 { name: "AWS_DEFAULT_REGION", value: "us-east-1" },
                 { name: "HOME", value: "/tmp" },
-                ...lifecycles.flatMap(({ as }) => {
-                  const secret = as === "ADMIN" ? neonName("s3-admin") : componentName("snapshots");
-                  return [
-                    { name: `${as}_KEY_ID`, valueFrom: { secretKeyRef: { name: secret, key: "AWS_ACCESS_KEY_ID" } } },
-                    { name: `${as}_SECRET`, valueFrom: { secretKeyRef: { name: secret, key: "AWS_SECRET_ACCESS_KEY" } } },
-                  ];
-                }),
+                ...lifecycles.flatMap(({ as, secret, keys: [id, key] }) => [
+                  { name: `${as}_KEY_ID`, valueFrom: { secretKeyRef: { name: secret, key: id } } },
+                  { name: `${as}_SECRET`, valueFrom: { secretKeyRef: { name: secret, key } } },
+                ]),
               ],
               readinessProbe: ready,
               securityContext: restrictedContainer(),
