@@ -119,7 +119,14 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     load = await mixedLoad(runId);
 
     phase = "exec-running";
-    const running = await driver<Probed>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
+    // Spike (A/B): BENCH_EXEC_RUNNING=probe (the probe, its verify reading every page), first (its first exec alone), off (none).
+    const asked = process.env["BENCH_EXEC_RUNNING"] ?? "probe";
+    if (asked !== "probe") {
+      if (asked === "first") await driver(workspace, "first", "--session", sessionId, "--fixture", fixture);
+      held.push({ result: { fixture, sizeMib, run, phase: "exec-running", ok: true, failure: null, metrics: {}, details: { k3s, exec_running: asked } }, fromMs: Date.now(), toMs: Date.now() });
+    }
+    const running = asked !== "probe" ? null : await driver<Probed>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
+    if (running !== null) 
     hold({
       fixture, sizeMib, run, phase: "exec-running", ok: running.ok, failure: running.failure,
       metrics: { exec_running_ms: running.first_exec_ms, verify_ms: running.verify_ms, probe_exec_ms: probeExecMs(running), workload_rss_bytes: running.workload_rss_bytes },
