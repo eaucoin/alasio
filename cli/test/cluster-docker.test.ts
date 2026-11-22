@@ -142,7 +142,8 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
       // Its sandbox image by the name the CRI pins it by.
       "--pause-image=docker.io/rancher/mirrored-pause:3.10.2",
     ],
-    Env: [`ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"],
+    // kine's compaction given 2 minutes, which k3s v1.37's ends k3s past (cli/src/cluster/k3s.ts's K3S_SERVER_ENV).
+    Env: ["KINE_COMPACT_TIMEOUT=2m", `ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"],
     ExposedPorts: { "6443/tcp": {} },
     HostConfig: {
       Privileged: true,

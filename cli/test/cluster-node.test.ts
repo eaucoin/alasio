@@ -40,7 +40,7 @@ function rig(t: TestContext) {
   return { directory, machine, perform };
 }
 
-test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds and its config file, a runaway process killed alone, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's", async () => {
+test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds and its config file, a runaway process killed alone, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's; k3s's datastore's compaction given 2 minutes", async () => {
   const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] });
   assert.deepEqual([...files.keys()], [
     "/etc/rancher/k3s/config.yaml",
@@ -50,6 +50,7 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
     "/etc/containerd-stargz-grpc/config.toml",
     "/etc/systemd/system/stargz-snapshotter.service",
     "/etc/systemd/system/k3s.service.d/alasio-stargz.conf",
+    "/etc/systemd/system/k3s.service.d/alasio-env.conf",
   ]);
   const [comment, k3s] = (files.get("/etc/rancher/k3s/config.yaml") ?? "").split("\n");
   assert.match(comment ?? "", /^# /u);
@@ -154,6 +155,8 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
   assert.match(unit, /^Environment=GOMEMLIMIT=128MiB$/mu, "Go's soft limit on the daemon's heap and its FUSE manager's");
   assert.match(unit, new RegExp(`^ExecStart=/usr/local/bin/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=/etc/containerd-stargz-grpc/config\\.toml --root=${STARGZ_ROOT}$`, "mu"));
   assert.match(files.get("/etc/systemd/system/k3s.service.d/alasio-stargz.conf") ?? "", /^\[Unit\]\nWants=stargz-snapshotter\.service\nAfter=stargz-snapshotter\.service\n$/mu);
+  // kine's compaction given 2 minutes, which k3s v1.37's ends k3s past (./k3s.ts's K3S_SERVER_ENV).
+  assert.match(files.get("/etc/systemd/system/k3s.service.d/alasio-env.conf") ?? "", /^\[Service\]\nEnvironment=KINE_COMPACT_TIMEOUT=2m\n$/mu);
   const registries = { mirrors: { "docker.io": { endpoint: ["https://mirror.lan"] } }, configs: {} };
   assert.equal(nodeFiles({ role: "server", storagePath: "/srv", registries, gvisor: [] }).get("/etc/rancher/k3s/registries.yaml"), `{"mirrors":{"docker.io":{"endpoint":["https://mirror.lan"]}},"configs":{}}\n`);
 });

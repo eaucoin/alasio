@@ -28,7 +28,7 @@ import { Duration, Effect, FileSystem, Option, type PlatformError, Schedule, Sch
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
 import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler, NODE_DIRECTORY } from "../../../src/node-agent/names.ts";
 import { Registries } from "../config.ts";
-import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, KUBELET_CONFIG, KUBELET_CONFIG_PATH, NotYet, registriesYaml, SANDBOX_IMAGE } from "./k3s.ts";
+import { clusterKubeconfig, containerdFiles, K3S_SERVER_ENV, KUBELET_ARGS, KUBELET_CONFIG, KUBELET_CONFIG_PATH, NotYet, registriesYaml, SANDBOX_IMAGE } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
 import { FUSE_MANAGER_SOCKET, FUSE_MANAGER_STORE, STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_MEMORY_LIMIT, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
 import { tarEntries } from "./tar.ts";
@@ -131,6 +131,8 @@ export const STARGZ_SERVICE = "stargz-snapshotter";
 const STARGZ_UNIT = `/etc/systemd/system/${STARGZ_SERVICE}.service`;
 /** What k3s's service is given beside its install script's: the daemon, started before it. */
 const K3S_DROP_IN = `/etc/systemd/system/${SERVICE}.service.d/alasio-stargz.conf`;
+/** And its environment as a server's (./k3s.ts's K3S_SERVER_ENV). */
+const K3S_ENV_DROP_IN = `/etc/systemd/system/${SERVICE}.service.d/alasio-env.conf`;
 /** The containers that ran on a FUSE manager gone, which the daemon's service lists as it starts and stops once the daemon serves, one id a line. */
 const ON_GONE_MANAGER = `${dirname(STARGZ_SOCKET)}/on-gone-manager`;
 /** The mounts of a FUSE manager gone, as the daemon's service finds them before it unmounts them. */
@@ -154,9 +156,9 @@ export type NodeConfig = typeof NodeConfig.Type;
  * config.yaml, written as JSON, which YAML reads as it is, its snapshotter none, as
  * containerd's files say the daemon's, and its sandbox image pinned (./k3s.ts); its kubelet's
  * config file; the registries; the files that make containerd pull through stargz-snapshotter's daemon and
- * run each gVisor release, where systemd runs the machine; and the daemon's configuration
- * and service, which k3s's service wants, and with which it stops and restarts. Pure, for
- * tests.
+ * run each gVisor release, where systemd runs the machine; the daemon's configuration and
+ * service, which k3s's service wants, and with which it stops and restarts; and k3s's
+ * environment as a server's (./k3s.ts's K3S_SERVER_ENV). Pure, for tests.
  */
 export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
   const k3s = {
@@ -227,6 +229,12 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
       "[Unit]",
       `Wants=${STARGZ_SERVICE}.service`,
       `After=${STARGZ_SERVICE}.service`,
+      "",
+    ].join("\n")],
+    [K3S_ENV_DROP_IN, [
+      "# k3s's service, its environment a server's (its datastore's compaction given 2 minutes): alasio up writes this file.",
+      "[Service]",
+      ...K3S_SERVER_ENV.map((variable) => `Environment=${variable}`),
       "",
     ].join("\n")],
   ]);

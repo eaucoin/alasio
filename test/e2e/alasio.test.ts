@@ -389,6 +389,10 @@ if (inShard("upgrade")) {
           assert.ok(node, "the cluster has no node");
           const began = Date.parse((await inCutOverRecord("cat point-of-no-return")).trim());
           const started = Number(await onNode(node, `date -d "$(systemctl show --property=ExecMainStartTimestamp --value k3s)" +%s`)) * 1000;
+          // k3s runs with its environment as a server's, which the upgrade gave its service where the release before gave none
+          // (cli/src/cluster/k3s.ts's K3S_SERVER_ENV): kine's compaction given 2 minutes.
+          const environment = await onNode(node, `tr '\\0' '\\n' < /proc/$(systemctl show --property=MainPID --value k3s)/environ`);
+          assert.match(environment, /^KINE_COMPACT_TIMEOUT=2m$/mu, "k3s runs without kine's compaction given 2 minutes");
           // k3s started anew past the cut-over's point of no return where the upgrade planned it, as one that changes the
           // node's files does, and not otherwise.
           const restarting = K3S_RESTARTED.test(await inCutOverRecord("cat upgrade.log"));

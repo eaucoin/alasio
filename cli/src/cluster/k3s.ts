@@ -56,6 +56,18 @@ export interface Registries {
  */
 export const NODE_STATUS_REPORT_SECONDS = 10;
 
+/**
+ * What a k3s server is given in its environment: its embedded datastore, kine, gives a
+ * compaction's transaction 2 minutes (KINE_COMPACT_TIMEOUT), not 5 seconds. The kine of k3s
+ * v1.37 (v0.17.1) runs the transaction's statements without that deadline: a DELETE slower
+ * than it, as one is on a disk a sandbox's save is writing to, runs to completion regardless,
+ * and its commit then fails on the transaction the deadline rolled back, which ends k3s whole
+ * (kine#790). A longer deadline only stops that fatal commit. A k3s whose kine is v0.17.3 or
+ * later gives the statements the deadline, which ends such a DELETE instead, and needs none
+ * of this.
+ */
+export const K3S_SERVER_ENV: readonly string[] = ["KINE_COMPACT_TIMEOUT=2m"];
+
 /** Where a node's kubelet config file is, which k3s copies among its own kubelet's (KUBELET_ARGS). */
 export const KUBELET_CONFIG_PATH = "/etc/rancher/k3s/kubelet.yaml";
 

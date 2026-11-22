@@ -40,6 +40,7 @@ import {
   containerdFiles,
   gvisorRuntimeClasses,
   type HostAlias,
+  K3S_SERVER_ENV,
   KUBELET_ARGS,
   KUBELET_CONFIG,
   KUBELET_CONFIG_PATH,
@@ -472,7 +473,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
         "--tls-san=127.0.0.1",
         `--default-local-storage-path=${storagePath}`,
         ...nodeArgs,
-      ], []),
+      ], K3S_SERVER_ENV),
       restarting,
     );
     yield* awaitReady("its API server", kubectl(["get", "--raw=/readyz"]));
