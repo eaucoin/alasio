@@ -255,11 +255,17 @@ const StopRequest = Schema.Struct({ namespace: Schema.NonEmptyString, pod: Schem
 
 /** The least a test's look interval may be (LOADING_SAVE_TEST_TIMINGS_VARIABLE pollMs): one look of the proxy's restores every 100 ms at the most. */
 const LOADING_POLL_LEAST_MS = 100;
-/** What LOADING_SAVE_TEST_TIMINGS_VARIABLE gives, for a test alone: a release's save's floor, stall window and look's interval, whole ms each, the look's LOADING_POLL_LEAST_MS at least. */
+/**
+ * What LOADING_SAVE_TEST_TIMINGS_VARIABLE gives, for a test alone: a release's save's floor, stall
+ * window, look's interval and latest, whole ms each, the look's LOADING_POLL_LEAST_MS at least; and
+ * the load wait runsc is given, in whole seconds (SAVE_LOAD_WAIT_SECONDS otherwise).
+ */
 const LoadingSaveTestTimings = Schema.fromJsonString(Schema.Struct({
   floorMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be 1 ms or more" }))),
   stallMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be 1 ms or more" }))),
   pollMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(LOADING_POLL_LEAST_MS, { message: `must be ${LOADING_POLL_LEAST_MS} ms or more` }))),
+  latestMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be 1 ms or more" }))),
+  loadWaitSeconds: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be 1 s or more" }))),
 }));
 
 /** The status each failure of the agent's is answered with; any other is 500. */
@@ -597,6 +603,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const loadingStallSeconds = yield* Config.Int(LOADING_STALL_SECONDS_VARIABLE);
   const testTimings = yield* Config.schema(LoadingSaveTestTimings, LOADING_SAVE_TEST_TIMINGS_VARIABLE).pipe(Config.option);
+  const { loadWaitSeconds, ...loadingTimings } = Option.getOrElse(testTimings, (): typeof LoadingSaveTestTimings.Type => ({}));
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
   const cache = makeSnapshotCache({ root: SNAPSHOT_CACHE_DIR, budget, graceMs: EVICTION_GRACE_MS });
   yield* cache.clean;
@@ -621,7 +628,8 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     restoresFromBucketSince,
     savesWithLoadWaitSince,
     backgroundReadMs: backgroundReadSeconds * 1000,
-    loadingSave: { stallMs: loadingStallSeconds * 1000, ...Option.getOrElse(testTimings, () => ({})) },
+    loadingSave: { stallMs: loadingStallSeconds * 1000, ...loadingTimings },
+    ...(loadWaitSeconds === undefined ? {} : { loadWait: { waitSeconds: loadWaitSeconds } }),
     pods: podChanges(kube),
   });
   // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.

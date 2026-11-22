@@ -46,7 +46,22 @@ import { STANDBY_ANNOTATION, STANDBY_LABEL, STANDBY_SOCKETS, standbySocket } fro
 import { STANDBY_AFTER_MS } from "../../src/gateway/standbys.ts";
 import { GVISOR_RELEASE_ANNOTATION, GVISOR_RUNTIME_CLASS_LABELS, SANDBOX_IMAGE } from "../../cli/src/cluster/k3s.ts";
 import { describeNodeStep, gvisorReleases, NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { ATTACH_ROOT, goferOf, gvisorDirectory, gvisorRuntimeClass, LOADING_SAVE_TEST_TIMINGS_VARIABLE, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
+import {
+  ATTACH_ROOT,
+  goferOf,
+  gvisorDirectory,
+  gvisorRuntimeClass,
+  LOAD_WAIT_WATCHDOG_MARGIN_SECONDS,
+  LOADING_SAVE_TEST_TIMINGS_VARIABLE,
+  NODE_AGENT_PORT,
+  NODE_AGENT_TOKEN_VARIABLE,
+  restoresIntoStandby,
+  SAVE_HOOK_SECONDS,
+  SNAPSHOT_CACHE_DIR,
+  STORE_PROXY_PORT,
+  UNSYNCED_DOWNLOAD_BYTES,
+  WORKSPACES_ROOT,
+} from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -2013,13 +2028,24 @@ async function snapshotOf(volumeId: string): Promise<Manifest | null> {
 }
 
 /**
- * The timings a node agent bounds a release's save of a sandbox still loading by in the test of
+ * The timings a node agent bounds a release's save of a sandbox still loading by in the tests of
  * a store that goes away (LOADING_SAVE_TEST_TIMINGS_VARIABLE): a floor of 2 s and a stall window
  * of 3 s, looked at every half second, so that a save whose hook waits on pages that no longer
  * load is revoked a few seconds into it, before the hook's own 30 s, and before what else may
- * end it as it waits (one run saw the hook killed 6 s after the release was asked).
+ * end it as it waits (one run saw the hook killed 6 s after the release was asked). And at the
+ * latest a minute from its ask, which leaves its save no time to wait for its pages before it
+ * (SAVE_HOOK_SECONDS and LOAD_WAIT_WATCHDOG_MARGIN_SECONDS more than that): runsc is given no load
+ * wait, and the save is bounded so, as one whose saves have been deferred for an hour is.
  */
-const LOADING_TEST_TIMINGS = { floorMs: 2_000, stallMs: 3_000, pollMs: 500 };
+const LOADING_TEST_TIMINGS = { floorMs: 2_000, stallMs: 3_000, pollMs: 500, latestMs: 60_000 };
+
+/**
+ * The timings of the test of a save whose load wait expires (LOADING_SAVE_TEST_TIMINGS_VARIABLE):
+ * as LOADING_TEST_TIMINGS, but its latest as an installation's, and runsc's load wait 15 s, not
+ * SAVE_LOAD_WAIT_SECONDS, so that runsc defers the save a few seconds past that, long before the
+ * agent's watchdog would revoke it (loadWaitWatchdogMs).
+ */
+const DEFERRING_TEST_TIMINGS = { floorMs: 2_000, stallMs: 3_000, pollMs: 500, loadWaitSeconds: 15 };
 
 /**
  * The node agents given the variable `name` of `value` beside what alasio up gives them, or that
@@ -2647,19 +2673,13 @@ if (inShard("snapshots")) {
       assert.ok(await snapshotOf(big), `the session ${big} was released with no snapshot`);
     });
 
-    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket, whose store goes away from its node's agent as its sandbox loads, is released within the agent's bound on a save of it still loading: its restore's reads refused, its save failing, its pod gone; it comes back from bayma's checkpoints`, async (t) => {
-      // Its node's agent bounding a release's save of a sandbox still loading by timings shorter than an installation may
-      // set, for this test alone, rolled out on every node, so that its revocation comes before bayma's hook bounds itself.
-      await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, JSON.stringify(LOADING_TEST_TIMINGS));
-      try {
-        await revokedAsTheStoreGoesAway(t);
-      } finally {
-        await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, null);
-      }
-    });
-
-    /** The test above's body, its node agents given LOADING_TEST_TIMINGS. */
-    async function revokedAsTheStoreGoesAway(t: TestContext): Promise<void> {
+    /**
+     * A session holding BIG_REPL_MEBIBYTES MiB, released into the bucket, then restored from it on a node whose agent reads its
+     * store slowly from then on, as one far away; its restore reading it still when its node's agent is cut off its store, as a
+     * store goes away, once its snapshot is spent: the session, its REPL's value it checkpointed, its node, and its node agents'
+     * throttles, which the caller undoes.
+     */
+    async function loadingAsItsStoreGoesAway(t: TestContext) {
       const big = await newSession("none");
       const { sessionId: kept } = await repl.set(big, `checkpointed by ${big}`);
       await repl.fill(big, BIG_REPL_MEBIBYTES);
@@ -2683,6 +2703,34 @@ if (inShard("snapshots")) {
         await until(`the snapshot of ${big} spent`, async () => ((await snapshotOf(big)) === null ? true : undefined), 300_000);
         await cut.store.cut();
         t.diagnostic(`restored on ${node}, its agent cut off its store ${Date.now() - restoredAt} ms after`);
+        return { big, kept, node, agent: cut.pod, throttled };
+      } catch (error) {
+        await undoThrottles(throttled);
+        throw error;
+      }
+    }
+
+    /** Undoes what storeThrottled did to each node agent's store. */
+    async function undoThrottles(throttled: readonly { readonly pod: string; readonly store: { readonly undone: () => Promise<void> } }[]): Promise<void> {
+      for (const { pod, store } of throttled) await store.undone().catch((error: unknown) => console.error(`# could not undo the throttle and cut of ${pod}'s store: ${error instanceof Error ? error.message : String(error)}`));
+    }
+
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket, whose store goes away from its node's agent as its sandbox loads, is released within the agent's bound on a save of it still loading given no time to wait for its pages: its restore's reads refused, its save failing, its pod gone; it comes back from bayma's checkpoints`, async (t) => {
+      // Its node's agent bounding a release's save of a sandbox still loading by timings shorter than an installation may
+      // set, for this test alone, rolled out on every node, so that its revocation comes before bayma's hook bounds itself,
+      // and its latest so soon that runsc is given no load wait.
+      await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, JSON.stringify(LOADING_TEST_TIMINGS));
+      try {
+        await revokedAsTheStoreGoesAway(t);
+      } finally {
+        await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, null);
+      }
+    });
+
+    /** The test above's body, its node agents given LOADING_TEST_TIMINGS. */
+    async function revokedAsTheStoreGoesAway(t: TestContext): Promise<void> {
+      const { big, kept, node, agent, throttled } = await loadingAsItsStoreGoesAway(t);
+      try {
         // Released as its caller asks, as alasio does (a sweep's look at whether it idles asks its bayma, which may touch pages
         // that no longer load), its save waiting on pages its restore cannot read, as bayma's hook, which readies the sandbox
         // for it, has the REPL that holds the bytes collect its garbage: no byte served for the stall window once the save has
@@ -2693,7 +2741,9 @@ if (inShard("snapshots")) {
         const released = Date.now() - askedAt;
         t.diagnostic(`its release answered ${asked.status} ${asked.said.trim()} ${released} ms after it was asked`);
         await until(`no pod bound to ${big}`, async () => ((await boundPodOf(big)) === null ? true : undefined), 120_000);
-        const agentLog = (await kube.logs(NAMESPACE, cut.pod, "node-agent")).split("\n");
+        const agentLog = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n");
+        // Given no load wait, as its latest left it none.
+        assert.ok(agentLog.some((line) => line.includes(`the release save of ${SESSIONS}/${big}, asked `) && line.includes(" has no time left to wait for its pages still loading")), `${node}'s agent gave ${big}'s save a load wait`);
         const revoked = agentLog.find((line) => line.includes(`revoked the token of the restore of ${SESSIONS}/${big} from the bucket, as no byte of its pages has been served for `));
         assert.ok(revoked, `${node}'s agent revoked no token of ${big}'s restore for a stall`);
         t.diagnostic(revoked.slice(revoked.indexOf("revoked")));
@@ -2707,13 +2757,55 @@ if (inShard("snapshots")) {
         t.diagnostic(failed.slice(failed.indexOf(failed.includes("can be saved no more") ? "the sandbox" : "checkpointing")));
         assert.ok(released < LOADING_TEST_TIMINGS.stallMs + 120_000, `its release answered ${released} ms after it was asked`);
       } finally {
-        for (const { pod, store } of throttled) await store.undone().catch((error: unknown) => console.error(`# could not undo the throttle and cut of ${pod}'s store: ${error instanceof Error ? error.message : String(error)}`));
+        await undoThrottles(throttled);
       }
       // Back from bayma's checkpoints, no snapshot of it left.
       assert.equal(await snapshotOf(big), null);
       const seen = await repl.read(big, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${big}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+    }
+
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB restored from the bucket, whose store goes away from its node's agent as its sandbox loads, has a release's save of it still loading deferred once runsc's wait for its pages expires: its pod bound still, its sandbox running on, its restore's token held; its store back, it is released whole`, async (t) => {
+      // Its node's agent giving runsc a load wait shorter than an installation's, for this test alone, rolled out on every node.
+      await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, JSON.stringify(DEFERRING_TEST_TIMINGS));
+      try {
+        await deferredAsTheStoreGoesAway(t);
+      } finally {
+        await nodeAgentsWith(LOADING_SAVE_TEST_TIMINGS_VARIABLE, null);
+      }
+    });
+
+    /** The test above's body, its node agents given DEFERRING_TEST_TIMINGS. */
+    async function deferredAsTheStoreGoesAway(t: TestContext): Promise<void> {
+      const { big, kept, node, agent, throttled } = await loadingAsItsStoreGoesAway(t);
+      try {
+        // Released as its caller asks, its save waiting on pages its restore cannot read: runsc gives up on them past its load
+        // wait, ending bayma's hook where that waits on them, and the sandbox runs on, so the release is refused for now, its
+        // binding kept, well before the agent's watchdog would revoke its restore.
+        const askedAt = Date.now();
+        const asked = await gatewayCall(await mainToken(big), "POST", "/release");
+        const answered = Date.now() - askedAt;
+        t.diagnostic(`its release answered ${asked.status} ${asked.said.trim()} ${answered} ms after it was asked`);
+        assert.equal(asked.status, 503, asked.said);
+        assert.ok(answered < (DEFERRING_TEST_TIMINGS.loadWaitSeconds + SAVE_HOOK_SECONDS + LOAD_WAIT_WATCHDOG_MARGIN_SECONDS) * 1000, `its release answered ${answered} ms after it was asked`);
+        assert.ok(await boundPodOf(big), `${big} is bound to no pod once its save was deferred`);
+        const agentLog = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n");
+        const deferred = agentLog.find((line) => line.includes(`the save of ${SESSIONS}/${big} is deferred, `));
+        assert.ok(deferred, `${node}'s agent deferred no save of ${big}`);
+        t.diagnostic(deferred.slice(deferred.indexOf("the save of")));
+        assert.ok(!agentLog.some((line) => line.includes(`revoked the token of the restore of ${SESSIONS}/${big} `)), `${node}'s agent revoked ${big}'s restore`);
+      } finally {
+        await undoThrottles(throttled);
+      }
+      // Its store back, its restore loads the rest, and a release asked again, deferred again for as long as it still loads, is
+      // saved: the session released into a snapshot, its REPL's value live in it.
+      await until(`${big} released once its store is back`, async () => ((await gatewayCall(await mainToken(big), "POST", "/release")).status === 204 ? true : undefined), 900_000);
+      await until(`no pod bound to ${big}`, async () => ((await boundPodOf(big)) === null ? true : undefined), 120_000);
+      assert.ok(await snapshotOf(big), `${big} was released into no snapshot`);
+      const seen = await repl.read(big, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`checkpointed by ${big}`, `checkpointed by ${big}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     }
 
     test("a session released before alasio up changes the pools' template is restored onto the one it was taken on, which the gateway's configuration carries beside the new one", async (t) => {

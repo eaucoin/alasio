@@ -4601,8 +4601,8 @@ test("the agent runs as its own process from its environment, and stops when tol
     const refused = start(unnamed);
     assert.equal(await refused.exited, 1);
     assert.match(refused.output(), /NODE_NAME/u);
-    // A test's timings, where given, whole and positive, looked at no more often than every 100 ms.
-    for (const timings of ['{"pollMs":10}', '{"floorMs":0}', '{"stallMs":1.5}', "fast"]) {
+    // A test's timings, where given, whole and positive, looked at no more often than every 100 ms, its load wait in whole seconds.
+    for (const timings of ['{"pollMs":10}', '{"floorMs":0}', '{"stallMs":1.5}', '{"latestMs":0}', '{"loadWaitSeconds":0.5}', "fast"]) {
       const untimed = start({ ...env, ALASIO_LOADING_SAVE_TEST_TIMINGS: timings });
       assert.equal(await untimed.exited, 1, timings);
       assert.match(untimed.output(), /ALASIO_LOADING_SAVE_TEST_TIMINGS/u, timings);
