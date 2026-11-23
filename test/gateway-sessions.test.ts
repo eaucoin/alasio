@@ -202,6 +202,17 @@ const releasedFor = async (namespace: string, reason: string): Promise<number> =
     .reduce((sum, { value }) => sum + value, 0);
 
 /**
+ * Waits until the gateway has counted one more of `namespace`'s bindings released for `reason` than `before`, within ten
+ * seconds: a release is counted once it is through, which lets its binding go first.
+ */
+const countedReleased = async (namespace: string, reason: string, before: number): Promise<void> => {
+  for (const deadline = Date.now() + 10_000; (await releasedFor(namespace, reason)) === before; await new Promise((resolve) => setTimeout(resolve, 50))) {
+    assert.ok(Date.now() < deadline, `no release for ${reason} was counted`);
+  }
+  assert.equal(await releasedFor(namespace, reason), before + 1);
+};
+
+/**
  * `key`'s binding's Lease in `pool` once `done` holds of it, as what comes after a release runs
  * on once the release is through: within ten seconds, `what` said where it does not.
  */
@@ -1791,10 +1802,7 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
   assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.equal(recorded.saved[0]?.ending, true);
-  // Counted, once its release is through, which lets its binding go first.
-  for (const deadline = Date.now() + 10_000; (await releasedFor(env.namespace, "deleted")) === deletedBefore; await new Promise((resolve) => setTimeout(resolve, 50))) {
-    assert.ok(Date.now() < deadline, "its release was not counted");
-  }
+  await countedReleased(env.namespace, "deleted", deletedBefore);
 });
 
 test("a bound pod ending whose binding another releases, as a broken one's is, is begun released once, however long its pod takes to go", async () => {
@@ -1953,7 +1961,7 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   await ending;
   for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
   assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-broken released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
-  assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore + 1);
+  await countedReleased(env.namespace, "broken", brokenBefore);
   // One whose pod went: released into it as its Lease is let go.
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": sessionKey("fs-gone") } }, spec: { holderIdentity: "none-9" } };
   await Effect.runPromise(sessions.recordLost(env.none, lease));
@@ -1976,7 +1984,8 @@ test("a bound pod whose sandbox was killed for its memory is released as oom, in
   await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
   for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
   assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-killed released into s-live, out of 1Gi`, `detach node-a ${env.namespace}/${bound.pod}`]);
-  assert.deepEqual([await releasedFor(env.namespace, "oom"), await releasedFor(env.namespace, "broken")], [oomBefore + 1, brokenBefore]);
+  await countedReleased(env.namespace, "oom", oomBefore);
+  assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore);
 });
 
 test("a bound pod whose workspace its node can reach no more, as its node's mount of workspace storage ended under it, is released as broken, into the snapshot taken of it live; one whose workspace is reachable is kept", async () => {
@@ -2019,7 +2028,7 @@ test("a bound pod whose workspace its node can reach no more, as its node's moun
   assert.deepEqual(recorded.asked, ["attachments node-a", `record ${env.namespace}/fs-unreachable released into s-live`, `detach node-a ${env.namespace}/${bound.pod}`]);
   assert.notEqual(await run(readLease(env.none, kept)), null);
   // That one alone.
-  assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore + 1);
+  await countedReleased(env.namespace, "broken", brokenBefore);
   assert.notEqual(other.pod, bound.pod);
 });
 
