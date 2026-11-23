@@ -80,17 +80,56 @@ jobs:
               else {include: [$profiles[] as $profile | $variants[] as $variant | {profile: $profile, variant: $variant}]} end')
           echo "matrix=$matrix" | tee --append "$GITHUB_OUTPUT"
 
+  # Spike: a build of the gVisor fork, the bazel job's release artifact of the fork-ci run that
+  # the settings name (BENCH_FORK_RUN, BENCH_FORK_SHA), packed as a release's archive, which the
+  # bench jobs install as 20261102.0-eaucoin.10: its sha512 for them to pin, the version its runsc
+  # says for the node agent to expect, and the archive.
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      sha512: ${{ steps.pack.outputs.sha512 }}
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - id: pack
+        name: Pack the candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SETTINGS: ${{ inputs.settings }}
+        run: |
+          for setting in $SETTINGS; do
+            case "$setting" in
+              BENCH_FORK_RUN=*) run=${setting#*=} ;;
+              BENCH_FORK_SHA=*) sha=${setting#*=} ;;
+            esac
+          done
+          [ -n "${run:-}" ] && [ -n "${sha:-}" ] || { echo "::error::the settings name no BENCH_FORK_RUN and BENCH_FORK_SHA"; exit 1; }
+          gh run download "$run" --repo eaucoin/gvisor --name "release-$sha" --dir release
+          chmod +x release/runsc release/containerd-shim-runsc-v1 release/gvisor-bin/*
+          version=$(release/runsc --version | sed -n 's/^runsc version //p')
+          echo "version=$version" | tee --append "$GITHUB_OUTPUT"
+          mkdir candidate
+          tar -C release --zstd -cf candidate/gvisor-x86_64.tar.zstd runsc containerd-shim-runsc-v1 gvisor-bin
+          echo "sha512=$(sha512sum candidate/gvisor-x86_64.tar.zstd | cut -d ' ' -f 1)" | tee --append "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gvisor-candidate
+          path: candidate/
+          retention-days: 3
+
   images:
-    needs: matrix
+    needs: [matrix, candidate]
     if: inputs.images == ''
     uses: ./.github/workflows/images.yml
+    with:
+      candidate-version: ${{ needs.candidate.outputs.version }}
     permissions:
       contents: read
       packages: write
 
   bench:
-    needs: [matrix, images]
-    if: ${{ !cancelled() && needs.matrix.result == 'success' && needs.images.result != 'failure' }}
+    needs: [matrix, images, candidate]
+    if: ${{ !cancelled() && needs.matrix.result == 'success' && needs.candidate.result == 'success' && needs.images.result != 'failure' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
@@ -130,6 +169,23 @@ jobs:
           wait
           df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Spike: the fork's candidate build pinned as 20261102.0-eaucoin.10, and served where the
+      # host target downloads it from (cli/src/cluster/node.ts).
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gvisor-candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Pin the candidate
+        env:
+          SHA512: ${{ needs.candidate.outputs.sha512 }}
+          VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          jq --arg sha512 "$SHA512" '(.gvisor.releases[] | select(.release == "20261102.0-eaucoin.10") | .sha512) = $sha512' cluster/node/pins.json >"$RUNNER_TEMP/pins.json"
+          mv "$RUNNER_TEMP/pins.json" cluster/node/pins.json
+          grep -A 1 '"20261102.0-eaucoin.10"' cluster/node/pins.json | grep -F "$SHA512"
+          sed -i "s/^const CANDIDATE_VERSION: string = \"\";/const CANDIDATE_VERSION: string = \"$VERSION\";/" src/node-agent/names.ts
+          grep -n '^const CANDIDATE_VERSION' src/node-agent/names.ts | grep -F "$VERSION"
+          (cd "$RUNNER_TEMP/candidate" && nohup python3 -m http.server 8787 --bind 127.0.0.1 >/dev/null 2>&1 &)
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.14.0
@@ -167,6 +223,10 @@ jobs:
           total=$(jq --slurp 'length' "$BENCH_DIR/results.jsonl")
           echo "$failed of $total lines failed"
           [ "$failed" -eq 0 ] || { jq --compact-output 'select(.ok | not) | {fixture, size_mib, run, phase, failure}' "$BENCH_DIR/results.jsonl" | head -n 40; echo "::error::$failed of $total lines failed"; exit 1; }
+      # Spike: every sandbox's boot log, as runsc wrote it (bench/alasio/node.ts bootLogs).
+      - name: Keep the boot logs
+        if: always()
+        run: sudo tar -C /var/log -cf - runsc 2>/dev/null | zstd -q >"$BENCH_DIR/logs/runsc-boot-logs.tar.zst" || true
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

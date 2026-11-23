@@ -19,6 +19,11 @@ on:
         description: "Release the upgrade shard upgrades from, as 10.0.23 (npm's latest if empty)"
         type: string
         default: ""
+      # Spike: the version the fork's candidate build says, which the node agent expects of it.
+      candidate-version:
+        description: "The version runsc of the fork's candidate build says"
+        type: string
+        default: ""
     outputs:
       registry:
         description: "Where the images are, as ghcr.io/eaucoin/alasio-ci/run-<id>-<attempt>"
@@ -43,6 +48,13 @@ jobs:
       previous: ${{ steps.previous.outputs.previous }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Say the candidate's version
+        if: inputs.candidate-version != ''
+        env:
+          VERSION: ${{ inputs.candidate-version }}
+        run: |
+          sed -i "s/^const CANDIDATE_VERSION: string = \"\";/const CANDIDATE_VERSION: string = \"$VERSION\";/" src/node-agent/names.ts
+          grep -n '^const CANDIDATE_VERSION' src/node-agent/names.ts | grep -F "$VERSION"
       # For tooling/node-image.ts, which says the node image's pins, and npm, which says the
       # release the upgrade shard upgrades from.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
