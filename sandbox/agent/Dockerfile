@@ -29,3 +29,6 @@ RUN mkdir -p /tmp/bayma-build \
 # Measurement only: bayma's hook without Node, as its next image carries it.
 COPY sandbox-hook.c /tmp/sandbox-hook.c
 RUN gcc -O2 -Wall -Wextra -Werror -o /usr/local/bin/bayma-sandbox-hook /tmp/sandbox-hook.c && rm /tmp/sandbox-hook.c
+# Measurement only: bayma's bundle as its next release builds it.
+RUN rm -f /opt/bayma/*.js
+COPY bayma-bundle /opt/bayma
