@@ -147,8 +147,12 @@ export const gvisorHandler = (release: string): string => `runsc-${gvisorLabel(r
 /** The RuntimeClass of gVisor's `release` alone, which a sandbox snapshotted under it is restored with. */
 export const gvisorRuntimeClass = (release: string): string => `gvisor-${gvisorLabel(release)}`;
 
+// Spike: the fork's candidate build, installed as 20261102.0-eaucoin.10 (the bench job serves it, ../../cli/src/cluster/node.ts), says
+// the version its build gave it, which the jobs put here.
+const CANDIDATE_VERSION: string = "";
+
 /** The version runsc of gVisor's `release` reports, and saves its images with: its release's tag. */
-export const runscVersion = (release: string): string => `release-${release}`;
+export const runscVersion = (release: string): string => (release === "20261102.0-eaucoin.10" && CANDIDATE_VERSION !== "" ? CANDIDATE_VERSION : `release-${release}`);
 
 /**
  * The directory alasio's pods keep on a node, which nothing of k3s's removes: the workspaces'
