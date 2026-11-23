@@ -121,7 +121,22 @@ test("a restore's token reads its objects through the proxy, whole or in ranges,
     })
   ));
 
-test("the proxy takes a GET alone, signed by a restore's token as the official signer signs it, for the bucket's region and S3, of now, signing its host, date, payload, range and Amazon's headers", () =>
+test("a restore's read of the version of an object it asks for (If-Match) asks the bucket for that version, and is refused as the bucket refuses it where the bucket holds another", () =>
+  withProxy(({ proxy, s3 }) =>
+    Effect.gen(function*() {
+      const token = minted(proxy);
+      const object = s3.objects.get(KEY);
+      assert.ok(object);
+      const etag = `"${createHash("md5").update(object).digest("hex")}"`;
+      const read = (ifMatch: string) => ask(proxy.endpoint, `/snapshots/${KEY}`, { token, range: "bytes=0-9", extra: { "if-match": ifMatch } });
+      const held = yield* Effect.promise(() => read(etag));
+      assert.deepEqual([held.status, held.body], [206, object.subarray(0, 10)]);
+      // Written over since, as a restore must not read it.
+      assert.equal(refusal(yield* Effect.promise(() => read(`"${"0".repeat(32)}"`))), "412 PreconditionFailed");
+    })
+  ));
+
+test("the proxy takes a GET alone, signed by a restore's token as the official signer signs it, for the bucket's region and S3, of now, signing its host, date, payload, range, version asked for and Amazon's headers", () =>
   withProxy(({ proxy, s3 }) =>
     Effect.gen(function*() {
       const token = minted(proxy);
@@ -136,8 +151,8 @@ test("the proxy takes a GET alone, signed by a restore's token as the official s
       assert.equal(yield* said({ token, service: "s3-object-lambda" }), "the request is signed for us-east-1&#39;s s3-object-lambda, not us-east-1&#39;s s3");
       assert.equal(yield* refused({ token, at: new Date(Date.now() - SKEW_MS - 60_000) }), "403 AccessDenied");
       assert.equal(yield* refused({ token, at: new Date(Date.now() + SKEW_MS + 60_000) }), "403 AccessDenied");
-      for (const unsigned of ["host", "x-amz-date", "x-amz-content-sha256", "range", "x-amz-meta-anything"]) {
-        assert.equal(yield* refused({ token, range: "bytes=0-9", extra: { "x-amz-meta-anything": "1" }, signs: (name) => name !== unsigned }), "403 AccessDenied", unsigned);
+      for (const unsigned of ["host", "x-amz-date", "x-amz-content-sha256", "range", "if-match", "x-amz-meta-anything"]) {
+        assert.equal(yield* refused({ token, range: "bytes=0-9", extra: { "x-amz-meta-anything": "1", "if-match": "\"any\"" }, signs: (name) => name !== unsigned }), "403 AccessDenied", unsigned);
       }
       // Signed in its query, as a presigned URL is.
       assert.equal(yield* said({ token, query: { "X-Amz-Signature": "0".repeat(64) } }), "a request signed in its query is not taken");
