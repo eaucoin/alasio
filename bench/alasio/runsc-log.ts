@@ -53,7 +53,8 @@ export function saveLogged(lines: readonly string[]): {
   // When the save paused the sandbox, and each arming of its dirty tracking, its time and size, before and after.
   const pausing = started === -1 ? undefined : lines[started];
   const armed = lines.filter((line) => line.includes("Dirty tracking: armed")).slice(-10);
-  const timers = last.filter((line) => /(Kernel|Memory files|Overall|Split filesystem|CPUID) save took|Pausing root network namespace took|Kernel save stats/u.test(line));
+  // Spike: and the fork's measurement build's lines of the pause's parts.
+  const timers = last.filter((line) => /(Kernel|Memory files|Overall|Split filesystem|CPUID) save took|Pausing root network namespace took|Kernel save stats|Tasks paused in|Kernel quiesced|Unsavable mappings invalidated|Filesystems prepared|VFS PrepareSave of|(proc|sys) PrepareSave:|gofer save stats/u.test(line));
   const rounds = /Pre-copy done after (\d+) rounds \([^)]*\): (\d+) bytes/u.exec(done ?? "");
   const gc = /in (\S+), the world stopped for (\S+) of it/u.exec(collected ?? "");
   const split = {
@@ -98,7 +99,8 @@ export function restoreLogged(lines: readonly string[], standby = false): {
   const loaded = lines.find((line) => line.includes("Overall load took"));
   // Each layer's loader's lines: its working set, its end, its rate and its budget.
   const loading = lines.filter((line) => /Async page loading (completed|read|: )|async loading \d+ bytes from|working set holds/u.test(line));
-  const timers = lines.filter((line) => /(Kernel|Memory files|Overall|CPUID) load took|Starting to restore|Restored container|Dirty tracking: armed/u.test(line));
+  // Spike: and the fork's measurement build's lines of the load's parts.
+  const timers = lines.filter((line) => /(Kernel|Memory files|Overall|CPUID) load took|Starting to restore|Restored container|Dirty tracking: armed|Kernel load stats|VFS CompleteRestore of|gofer restore stats|Network stack restore:|netstack: /u.test(line));
   const completed = loading.flatMap((line) => /Async page loading completed in \S+ \((\d+) bytes/u.exec(line)?.[1] ?? []);
   const from = first ? logTimeMs(first) : null;
   const between = (line: string | undefined) => {
