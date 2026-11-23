@@ -49,6 +49,7 @@ import { saveLogged } from "./runsc-log.ts";
 import { awaitSpans, hasSpan, liveDurableMs, releaseDurableMs } from "./spans.ts";
 import { BENCH_DIR, CASES, COMMON, LIVE_SAVES, PAGE_CACHE, PROFILE, RELEASE_UNDER_TEST, RUNS, VARIANT } from "./settings.ts";
 import { storeMeasures } from "./store.ts";
+import { oomTrials } from "./oom.ts";
 import { replayTurns } from "./turns.ts";
 
 /** The job's ticker check failed: none of its measures is written. */
@@ -288,7 +289,7 @@ async function written(held: readonly Held[], workspace: string, others: readonl
 
 /** What the job runs: `runs`, every case's runs, as the module says; or `store`, the store's own measures alone (./store.ts). */
 const MODE = process.env["BENCH_MODE"] || "runs";
-if (MODE !== "runs" && MODE !== "store") throw new Error(`BENCH_MODE is ${MODE}, not runs or store`);
+if (MODE !== "runs" && MODE !== "store" && MODE !== "oom") throw new Error(`BENCH_MODE is ${MODE}, not runs, store or oom`);
 
 before(async () => {
   try {
@@ -313,6 +314,7 @@ after(async () => {
 
 test(`alasio's sessions saved and restored, ${RUNS} runs of ${CASES.length} cases, through ${PROFILE}, ${VARIANT}`, { timeout: 330 * 60_000 }, async () => {
   if (MODE === "store") return await storeMeasures();
+  if (MODE === "oom") return await oomTrials();
   for (let run = 1; run <= RUNS; run++) {
     for (const { fixture, size_mib } of CASES) {
       const started = Date.now();

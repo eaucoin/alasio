@@ -759,7 +759,7 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       storage: { size: "1Gi" },
       // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.
       // The benchmark's, as every system's instance is: 2 CPUs and 5 GiB, its largest fixture's 3 GiB with room for bayma and gVisor.
-      resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: SHARD === "bench" ? { cpu: "2", memory: "5Gi" } : { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
+      resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: SHARD === "bench" ? { cpu: "2", memory: process.env["BENCH_MODE"] === "oom" ? "32Gi" : "5Gi" } : { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
       // Never released within the run but in the snapshots, upgrade and wake shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
       // their pods under them.
