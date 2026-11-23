@@ -33,6 +33,9 @@ export const RUNS = Number(process.env["BENCH_RUNS"] || 20);
  *   released before is, so the images of its saves carry the working set its restore recorded;
  * - `chain-N`: as shipped, N - 1 live saves taken, each a delta of the one before, so the
  *   release's delta makes a chain of N images;
+ * - `idle-saves`: as shipped, but the session left idle after its first live save and saved live
+ *   again 5 s, 30 s, 120 s and 5 min into its idleness, and released 5 min after the last, each
+ *   save's idleness in its details (IDLE_BEFORE_SAVES_S, IDLE_BEFORE_RELEASE_S);
  * - `trace`: as shipped, each restore's pod watched every 50 ms and kubelet's journal of it kept,
  *   for the steps between the pod's creation and runsc's start that no span covers;
  * - `mixed-release`, `mixed-saves`, `mixed-fill`, `mixed-all`: as shipped, each restore beside a
@@ -44,11 +47,21 @@ export const RUNS = Number(process.env["BENCH_RUNS"] || 20);
 export const VARIANT = variable("BENCH_VARIANT");
 const CHAIN = /^chain-([1-9][0-9]*)$/u.exec(VARIANT);
 const MIXED = /^mixed-(release|saves|fill|all)$/u.exec(VARIANT);
-if (!["as-shipped", "kept-cache", "whole", "restored", "trace", "turn-replay"].includes(VARIANT) && !CHAIN && !MIXED) {
+if (!["as-shipped", "kept-cache", "whole", "restored", "trace", "turn-replay", "idle-saves"].includes(VARIANT) && !CHAIN && !MIXED) {
   throw new Error(`BENCH_VARIANT is ${VARIANT}: no variant of the benchmark's (./settings.ts VARIANT)`);
 }
+/**
+ * How long the session is left idle before each live save of the `idle-saves` variant, in seconds:
+ * the first right after the session's work, the others into its idleness, as one waiting on its
+ * user is saved.
+ */
+const IDLE_SAVES_S = [0, 5, 30, 120, 300] as const;
+/** How long the session is left idle before each live save a run takes, in seconds. */
+export const IDLE_BEFORE_SAVES_S: readonly number[] = VARIANT === "idle-saves" ? IDLE_SAVES_S : [];
+/** How long the session is left idle after its last live save before its release, in seconds. */
+export const IDLE_BEFORE_RELEASE_S = VARIANT === "idle-saves" ? 300 : 0;
 /** The live saves a run takes before its release. */
-export const LIVE_SAVES = VARIANT === "whole" ? 0 : CHAIN ? Number(CHAIN[1]) - 1 : 1;
+export const LIVE_SAVES = VARIANT === "whole" ? 0 : CHAIN ? Number(CHAIN[1]) - 1 : VARIANT === "idle-saves" ? IDLE_SAVES_S.length : 1;
 /** The load a mixed variant's restores run beside, or null. */
 export const MIXED_LOAD = (MIXED?.[1] ?? null) as "release" | "saves" | "fill" | "all" | null;
 /** Whether the node's page cache is dropped before the warm restore: kept by `kept-cache` alone. */

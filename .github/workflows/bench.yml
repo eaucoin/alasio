@@ -73,7 +73,7 @@ jobs:
           matrix=$(jq --null-input --compact-output \
             --argjson profiles "$(words "$PROFILES")" --argjson variants "$(words "$VARIANTS")" \
             --argjson known "$(jq --compact-output 'keys' bench/common/store/profiles.json)" '
-            [$variants[] | select(test("^(as-shipped|kept-cache|whole|restored|trace|turn-replay|mixed-(release|saves|fill|all)|chain-[1-9][0-9]*)$") | not)] as $unknown
+            [$variants[] | select(test("^(as-shipped|kept-cache|whole|restored|trace|turn-replay|idle-saves|mixed-(release|saves|fill|all)|chain-[1-9][0-9]*)$") | not)] as $unknown
             | if ($profiles - $known) != [] then "::error::no profile \($profiles - $known | join(", "))\n" | halt_error(1)
               elif $unknown != [] then "::error::no variant \($unknown | join(", "))\n" | halt_error(1)
               elif $profiles == [] or $variants == [] then "::error::no profile or no variant asked\n" | halt_error(1)
