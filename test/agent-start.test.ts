@@ -3,7 +3,7 @@
  * directories of the test's own: bayma's server once in a pod, its hook as often as it is asked.
  */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -81,6 +81,39 @@ test("bayma's hook is killed past its bound as it readies the sandbox for a save
     assert.deepEqual(["save", "resume", "restore"].map((mode) => hook(mode).status), [124, 124, 0]);
     // Its bound for a save, but for tests, the agent's.
     assert.equal(/ALASIO_SAVE_HOOK_SECONDS:-(\d+)/u.exec(readFileSync(START, "utf8"))?.[1], String(SAVE_HOOK_SECONDS));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bayma's server, as a pool's pod starts, opens the binaries a restore reads before it waits for its binding, and a hook opens none", async () => {
+  // bayma's hook, which takes a second.
+  const { root, env: podEnv } = pod("sleep 1");
+  try {
+    const attach = join(root, "attach");
+    // A binary that says when it is opened: a FIFO, whose writer's open waits for its reader's.
+    const binary = join(root, "bun");
+    assert.equal(spawnSync("mkfifo", [binary]).status, 0);
+    /** Whether `binary` is opened for reading within `ms`, by a writer's open of it ending. */
+    const opened = (ms: number) =>
+      new Promise<boolean>((resolve) => {
+        const writer = spawn("sh", ["-c", `printf x > '${binary}'`]);
+        const timer = setTimeout(() => (writer.kill(), resolve(false)), ms);
+        writer.once("exit", (code) => (clearTimeout(timer), resolve(code === 0)));
+      });
+    const env = { ...podEnv, ALASIO_WARM_FILES: binary };
+    // Its binding not yet given: it opens the binary as it waits for it.
+    rmSync(join(attach, "token"));
+    const server = spawn("sh", [START, "true", "mcp-http"], { env });
+    const ended = new Promise<number | null>((resolve) => server.once("exit", resolve));
+    assert.equal(await opened(5_000), true);
+    writeFileSync(join(attach, "token"), "binding");
+    assert.equal(await ended, 0);
+    // A hook opens none.
+    const hook = spawn("sh", [START, "node", "/opt/bayma/bayma.js", "sandbox-hook"], { env });
+    const hookEnded = new Promise<number | null>((resolve) => hook.once("exit", resolve));
+    assert.equal(await opened(500), false);
+    assert.equal(await hookEnded, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -197,6 +197,15 @@ test("stargz-snapshotter's daemon fetches one layer at a time in the background,
   ].join("\n"));
 });
 
+test("stargz-snapshotter's daemon serves the session image's files through FUSE passthrough, its merge bounded, only where the node is told to, as it is not by default", () => {
+  assert.doesNotMatch(stargzConfig(), /passthrough/u);
+  assert.match(stargzConfig(undefined, true), /\n\[fuse\]\npassthrough = true\nmerge_buffer_size = 33554432\n/u);
+  // A node told to writes it so, and one not told writes the file as before.
+  const told = nodeFiles({ role: "server", storagePath: "/var/lib/alasio", gvisor: ["20990101.0"], imagePassthrough: true });
+  assert.equal(told.get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig(undefined, true));
+  assert.equal(nodeFiles({ role: "server", storagePath: "/var/lib/alasio", gvisor: ["20990101.0"] }).get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig());
+});
+
 /** The archive of gVisor's `release`, downloaded into `directory`, as the operator's command leaves it for root. */
 function downloaded(directory: string, release = "20990101.0", releases: FakeReleases = fakeReleases({ gvisor: [release] })): Artifact {
   const download = downloads(releases.pins).gvisor.get(release);

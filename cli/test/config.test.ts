@@ -35,7 +35,7 @@ function directory(t: TestContext): string {
 test("a docker target is defaulted, and keeps the port and storage it was given", () => {
   const decoded = decodeOperatorConfig(PATH, { target: { docker: { apiPort: 41873 } } });
   assert.ok(Result.isSuccess(decoded));
-  assert.deepEqual(decoded.success.target, { docker: { name: "alasio", apiPort: 41873, hostAliases: [], mounts: [], agents: 0 } });
+  assert.deepEqual(decoded.success.target, { docker: { name: "alasio", apiPort: 41873, hostAliases: [], mounts: [], agents: 0, imagePassthrough: false } });
   assert.deepEqual(decoded.success.install, {});
 });
 
@@ -142,6 +142,23 @@ test("the cluster in Docker runs the node image the config names, such as one bu
   const target = await run(resolveTarget(decoded.success));
   assert.ok(target._tag === "Docker");
   assert.equal(target.cluster.image, "alasio-node:dev");
+});
+
+test("the cluster's nodes serve the session image's files through FUSE passthrough only where the config says so, on either target", async () => {
+  /** What `target` resolves to of passthrough. */
+  const passthroughOf = async (target: Record<string, unknown>) => {
+    const decoded = decodeOperatorConfig(PATH, { target });
+    assert.ok(Result.isSuccess(decoded));
+    const resolved = await run(resolveTarget(decoded.success), { XDG_DATA_HOME: "/data" });
+    assert.ok(resolved._tag === "Host" || resolved._tag === "Docker");
+    return resolved.cluster.imagePassthrough;
+  };
+  assert.deepEqual(
+    [await passthroughOf({ host: {} }), await passthroughOf({ host: { imagePassthrough: false } }), await passthroughOf({ host: { imagePassthrough: true } })],
+    [false, false, true],
+  );
+  assert.deepEqual([await passthroughOf({ docker: { apiPort: 41873 } }), await passthroughOf({ docker: { apiPort: 41873, imagePassthrough: true } })], [false, true]);
+  assert.equal(refusal({ target: { host: { imagePassthrough: "yes" } } }), `${PATH}: target.host.imagePassthrough Expected boolean`);
 });
 
 test("the cluster in Docker's registries are k3s's registries.yaml, without a login, which is a secret", async () => {

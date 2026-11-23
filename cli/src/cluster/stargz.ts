@@ -66,6 +66,13 @@ const tomlString = (value: string): string => JSON.stringify(value);
 const CHUNK_BYTES = 1024 * 1024;
 
 /**
+ * How much of a file the daemon holds in memory at once as it merges the file's chunks into one
+ * backing file for FUSE passthrough: 32 MiB, within its memory limit (STARGZ_MEMORY_LIMIT), as
+ * measured.
+ */
+const MERGE_BUFFER_BYTES = 32 * 1024 * 1024;
+
+/**
  * The daemon's configuration on a node pulling through `registries`: its background fetch,
  * which fetches every layer whole so a pod reads nothing from the registry once it is done,
  * one layer at a time, so it takes less of the network a pod's start reads its layers
@@ -81,8 +88,14 @@ const CHUNK_BYTES = 1024 * 1024;
  * already and others not, asks for those others at once, in ranges apart: refused so, the read
  * failed with EIO in the pod, as a 9.0.0 workspace-mount's of its juicefs did in CI. Asked for
  * as one range covering them, it reads again what was fetched between them, no more.
+ *
+ * With `passthrough`, a file opened through a mount is merged once into a backing file of the
+ * daemon's, which the kernel then reads itself (FUSE passthrough, Linux 6.9 on): no round trip
+ * through the daemon for each read, and one copy of the file in the page cache, not two; its first
+ * open pays the merge, which a pool's pod pays for the binaries a restore reads as it starts
+ * (sandbox/agent/start.sh). The setting is the daemon's as it mounts a layer.
  */
-export function stargzConfig(registries?: Registries): string {
+export function stargzConfig(registries?: Registries, passthrough = false): string {
   const mirrors = Object.entries(registries?.mirrors ?? {})
     // `*` stands for every registry, which the daemon has no way to say.
     .filter(([host, { rewrite }]) => host !== "*" && rewrite === undefined)
@@ -102,6 +115,7 @@ export function stargzConfig(registries?: Registries): string {
     "enable = true",
     `address = ${tomlString(FUSE_MANAGER_SOCKET)}`,
     `path = ${tomlString("/usr/local/bin/stargz-fuse-manager")}`,
+    ...(passthrough ? ["", "[fuse]", "passthrough = true", `merge_buffer_size = ${MERGE_BUFFER_BYTES}`] : []),
     ...mirrors.flatMap(([host, reached]) =>
       reached.flatMap((url) => [
         "",
