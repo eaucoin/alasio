@@ -159,6 +159,17 @@ test("the cluster's nodes serve the session image's files through FUSE passthrou
   );
   assert.deepEqual([await passthroughOf({ docker: { apiPort: 41873 } }), await passthroughOf({ docker: { apiPort: 41873, imagePassthrough: true } })], [false, true]);
   assert.equal(refusal({ target: { host: { imagePassthrough: "yes" } } }), `${PATH}: target.host.imagePassthrough Expected boolean`);
+  // The installation's sessions know it from the target alone.
+  const sessionsOf = (imagePassthrough?: boolean) => {
+    const install = installConfigOf({}, { claude: false, target: "host", ...(imagePassthrough === undefined ? {} : { imagePassthrough }) });
+    assert.ok(Result.isSuccess(install));
+    return install.success.sessions.imagePassthrough;
+  };
+  assert.deepEqual([sessionsOf(), sessionsOf(false), sessionsOf(true)], [false, false, true]);
+  assert.equal(
+    refusal({ target: { host: {} }, install: { sessions: { imagePassthrough: true } } }),
+    `${PATH}: install.sessions.imagePassthrough is alasio's own to say: the target's imagePassthrough makes it`,
+  );
 });
 
 test("the cluster in Docker's registries are k3s's registries.yaml, without a login, which is a secret", async () => {

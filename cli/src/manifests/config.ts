@@ -454,6 +454,13 @@ const Sessions = Schema.Struct({
    * the binds that wait for one.
    */
   pools: Scaling({ min: 1, max: 10 }, { floor: false, scaled: true }),
+  /**
+   * Whether the nodes serve the session image's files through FUSE passthrough, as the target's
+   * `imagePassthrough` says (alasio's own to say): a pool's pod then opens the binaries a restore
+   * reads as it starts (sandbox/agent/start.sh), paying each one's first open there rather than
+   * under a bind, and opens none elsewhere.
+   */
+  imagePassthrough: defaulted(Schema.Boolean, false),
   /** The sandbox gateway, which binds a session's workspace to a pool's pod. */
   gateway: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }) }), {}),
   /** The session telemetry receiver, which bound pods' bayma exports to. */

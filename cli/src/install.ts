@@ -12,7 +12,7 @@ import { Effect, Result, Schema } from "effect";
 
 import { type ApiServer, readApiServer } from "./api-server.ts";
 import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts";
-import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
+import { imagePassthroughOf, installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
 import { clusterReleases } from "./kept-releases.ts";
 import { describeRef, hasStatus, kind, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
@@ -75,7 +75,7 @@ export class BotNotSet extends Schema.TaggedError<BotNotSet>()("BotNotSet", {}) 
 /** The install configuration of `config`, which names Claude Code's Secret when the cluster has it. */
 export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
-  const install = installConfigOf(config.install, { claude, target: targetKind(config.target) });
+  const install = installConfigOf(config.install, { claude, target: targetKind(config.target), imagePassthrough: imagePassthroughOf(config.target) });
   if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
   return install.success;
 });

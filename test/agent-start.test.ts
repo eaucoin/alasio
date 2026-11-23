@@ -86,7 +86,7 @@ test("bayma's hook is killed past its bound as it readies the sandbox for a save
   }
 });
 
-test("bayma's server, as a pool's pod starts, opens the binaries a restore reads before it waits for its binding, and a hook opens none", async () => {
+test("bayma's server, as a pool's pod starts where the image is served through passthrough, opens the binaries a restore reads before it waits for its binding; elsewhere, and a hook, none", async () => {
   // bayma's hook, which takes a second.
   const { root, env: podEnv } = pod("sleep 1");
   try {
@@ -102,15 +102,23 @@ test("bayma's server, as a pool's pod starts, opens the binaries a restore reads
         writer.once("exit", (code) => (clearTimeout(timer), resolve(code === 0)));
       });
     const env = { ...podEnv, ALASIO_WARM_FILES: binary };
-    // Its binding not yet given: it opens the binary as it waits for it.
-    rmSync(join(attach, "token"));
-    const server = spawn("sh", [START, "true", "mcp-http"], { env });
-    const ended = new Promise<number | null>((resolve) => server.once("exit", resolve));
-    assert.equal(await opened(5_000), true);
-    writeFileSync(join(attach, "token"), "binding");
-    assert.equal(await ended, 0);
+    /** bayma's server under `variables`, its binding not yet given: whether it opens the binary within `ms` as it waits for it. */
+    const serve = async (variables: Record<string, string>, ms: number) => {
+      rmSync(join(attach, "token"), { force: true });
+      rmSync(join(attach, "served"), { force: true });
+      const server = spawn("sh", [START, "true", "mcp-http"], { env: variables });
+      const ended = new Promise<number | null>((resolve) => server.once("exit", resolve));
+      const did = await opened(ms);
+      writeFileSync(join(attach, "token"), "binding");
+      assert.equal(await ended, 0);
+      return did;
+    };
+    // Where the image is not served through passthrough, it opens none.
+    assert.equal(await serve(env, 500), false);
+    // Where it is, it opens the binary.
+    assert.equal(await serve({ ...env, ALASIO_WARM: "1" }, 5_000), true);
     // A hook opens none.
-    const hook = spawn("sh", [START, "node", "/opt/bayma/bayma.js", "sandbox-hook"], { env });
+    const hook = spawn("sh", [START, "node", "/opt/bayma/bayma.js", "sandbox-hook"], { env: { ...env, ALASIO_WARM: "1" } });
     const hookEnded = new Promise<number | null>((resolve) => hook.once("exit", resolve));
     assert.equal(await opened(500), false);
     assert.equal(await hookEnded, 0);

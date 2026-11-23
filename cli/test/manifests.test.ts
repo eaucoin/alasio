@@ -3510,6 +3510,13 @@ describe("admission", () => {
 });
 
 describe("the sandbox service", () => {
+  test("has a pool's pods open the binaries a restore reads as they start where the nodes serve the image through passthrough, and none elsewhere", () => {
+    const warm = (objects: readonly KubernetesObject[]) =>
+      ["sandboxes-none", "sandboxes-full"].map((name) => container(one<V1Deployment>(objects, "Deployment", name)).env?.find(({ name }) => name === "ALASIO_WARM"));
+    assert.deepEqual(warm(install()), [undefined, undefined]);
+    assert.deepEqual(warm(install({ sessions: { imagePassthrough: true } })), Array(2).fill({ name: "ALASIO_WARM", value: "1" }));
+  });
+
   test("makes folder conversations' instances of the host profile, which the gateway alone makes and reaches, each on its conversation's state directory, released after an hour idle", () => {
     const objects = install({ host: { enabled: true, stateRoot: "/home/operator/.alasio/bayma" } });
     const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}");
