@@ -6,7 +6,7 @@ import {
   require_src,
   require_src2,
   readTokenFile
-} from "./main-gg66zwkk.js";
+} from "./main-c0bag0nq.js";
 
 // node_modules/.bun/@opentelemetry+context-async-hooks@2.11.0+e40b0dfdd726a224/node_modules/@opentelemetry/context-async-hooks/build/src/AbstractAsyncHooksContextManager.js
 var require_AbstractAsyncHooksContextManager = __commonJS(function(exports) {
@@ -6581,19 +6581,19 @@ var require_getMachineId = __commonJS(function(exports) {
     if (!getMachineIdImpl) {
       switch (process2.platform) {
         case "darwin":
-          getMachineIdImpl = (await import("./getMachineId-darwin-tcwpqrn8.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-darwin-852b300y.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         case "linux":
-          getMachineIdImpl = (await import("./getMachineId-linux-y6raxm8w.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-linux-w1k82zc8.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         case "freebsd":
-          getMachineIdImpl = (await import("./getMachineId-bsd-ferctak0.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-bsd-dke3w5m7.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         case "win32":
-          getMachineIdImpl = (await import("./getMachineId-win-20v69417.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-win-04vxjzsh.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         default:
-          getMachineIdImpl = (await import("./getMachineId-unsupported-bxfczc1c.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-unsupported-nv164dsy.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
       }
     }

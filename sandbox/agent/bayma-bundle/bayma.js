@@ -161,8 +161,15 @@ async function runSandboxHookCommand(args) {
 // packages/server/src/main.ts
 async function main() {
   const [command, ...args] = process.argv.slice(2);
-  if (command === "sandbox-hook")
-    return runSandboxHookCommand(args);
+  if (command === "sandbox-hook") {
+    try {
+      return await runSandboxHookCommand(args);
+    } catch (error) {
+      process.stderr.write(failureMessage(error) + `
+`);
+      process.exit(1);
+    }
+  }
   const [
     { runCli },
     { bunAdapter },
@@ -173,14 +180,14 @@ async function main() {
     { pythonAdapter },
     { rustAdapter }
   ] = await Promise.all([
-    import("./index-q16z3td5.js"),
-    import("./index-g0z91h66.js"),
-    import("./index-e7z9t789.js"),
-    import("./index-gydm6cq8.js"),
-    import("./index-0hwg6fzc.js"),
-    import("./index-02vkgxps.js"),
-    import("./index-10dm5y20.js"),
-    import("./index-rbd5vnvy.js")
+    import("./index-brgjtvt7.js"),
+    import("./index-8azy3pkb.js"),
+    import("./index-14c0rhgz.js"),
+    import("./index-gfms0pp5.js"),
+    import("./index-24ym88ah.js"),
+    import("./index-4dqfcgca.js"),
+    import("./index-w2qxrm8t.js"),
+    import("./index-1w6kdzpw.js")
   ]);
   return runCli([
     bunAdapter,

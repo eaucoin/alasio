@@ -12,7 +12,7 @@ import {
   buildMarkers2,
   createPromptAwareEnvelopeCollector2,
   ensureRuntimeAsset2
-} from "./main-gg66zwkk.js";
+} from "./main-c0bag0nq.js";
 export {
   JSON_CHECKPOINT_CODEC2 as JSON_CHECKPOINT_CODEC,
   ProcessTransport2 as ProcessTransport,

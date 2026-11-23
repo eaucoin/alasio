@@ -10,7 +10,7 @@ import {
   buildMarkers2,
   createPromptAwareEnvelopeCollector2,
   ensureRuntimeAsset2
-} from "./main-gg66zwkk.js";
+} from "./main-c0bag0nq.js";
 
 // packages/runtime-python/src/profile.ts
 var pythonModelProfile = {
@@ -76,10 +76,10 @@ SESSION_GLOBALS = {
     "_error": None,
 }
 CHECKPOINT = None
-# The SHA-256 of the payload CHECKPOINT was last read from or written as,
-# while it holds what the payload does, as the server names a committed one;
-# None where it is not known to.
-CHECKPOINT_SHA256 = None
+# With checkpoint reuse, the committed payload CHECKPOINT is read from when
+# the exec running first reads it, if it has not read or written it yet; None
+# once it has, or where none waits to be read.
+CHECKPOINT_UNREAD = None
 # The running exec's event prefix and directory, while one runs.
 RUNNING_EXEC = None
 
@@ -174,13 +174,28 @@ class HashingWriter:
         return self.file.write(data)
 
 
+def checkpoint_compatibility():
+    """What a checkpoint this runtime makes says of it, as its manifest keeps it."""
+    return {
+        "runtimeVersion": sys.version.split()[0],
+        "languageVersion": sys.version.split()[0],
+        "platform": sys.platform,
+    }
+
+
 def bayma_read_checkpoint():
+    global CHECKPOINT, CHECKPOINT_UNREAD
+    if CHECKPOINT_UNREAD is not None:
+        with open(CHECKPOINT_UNREAD, "rb") as payload:
+            CHECKPOINT = pickle.load(payload)
+        CHECKPOINT_UNREAD = None
     return CHECKPOINT
 
 
 def bayma_write_checkpoint(value):
-    global CHECKPOINT
+    global CHECKPOINT, CHECKPOINT_UNREAD
     CHECKPOINT = value
+    CHECKPOINT_UNREAD = None
     return value
 
 
@@ -248,30 +263,31 @@ def format_result(value):
 
 
 def run_submission(spec_path: str) -> None:
-    global CHECKPOINT, CHECKPOINT_SHA256, RUNNING_EXEC
+    global CHECKPOINT, CHECKPOINT_UNREAD, RUNNING_EXEC
     with open(spec_path, "r", encoding="utf8") as handle:
         spec = json.load(handle)
     prefix = spec["event_prefix"]
-    # Whether the committed checkpoint is taken as the one CHECKPOINT holds
-    # where it is what CHECKPOINT was last read from or written as, and an
-    # exec that leaves it as committed commits none.
+    # With checkpoint reuse, the committed checkpoint is read only as the exec
+    # reads it, as it would be at its start without: so what the exec reads,
+    # and what it commits, are what they would be, but that an exec that
+    # neither reads nor writes it reads nothing of it, and commits nothing.
     reuse = spec.get("checkpoint_reuse") is True
     checkpoint = spec.get("checkpoint")
-    committed_sha256 = None if checkpoint is None else checkpoint.get("sha256")
+    CHECKPOINT_UNREAD = None
     if spec.get("durability_mode") == "checkpointed":
         if checkpoint is None:
             CHECKPOINT = None
         elif checkpoint.get("payload_kind") == "binary-sidecar":
-            if not (reuse and committed_sha256 is not None and committed_sha256 == CHECKPOINT_SHA256):
+            if reuse:
+                CHECKPOINT = None
+                CHECKPOINT_UNREAD = checkpoint["payload_path"]
+            else:
                 with open(checkpoint["payload_path"], "rb") as payload:
                     CHECKPOINT = pickle.load(payload)
         elif checkpoint.get("payload_kind") == "json-inline":
             CHECKPOINT = checkpoint.get("inline_json")
         else:
             raise RuntimeError("unsupported Python checkpoint payload kind: " + str(checkpoint.get("payload_kind")))
-    # The exec may change what CHECKPOINT holds: it is known again once it is
-    # written.
-    CHECKPOINT_SHA256 = None
     stdout = ChannelWriter(prefix, "stdout")
     stderr = ChannelWriter(prefix, "stderr")
     RUNNING_EXEC = (prefix, os.path.dirname(spec_path))
@@ -296,33 +312,46 @@ def run_submission(spec_path: str) -> None:
         if spec.get("durability_mode") == "checkpointed":
             try:
                 checkpoint_output_path = spec["checkpoint_output_path"]
-                with open(checkpoint_output_path, "wb") as payload:
-                    written = HashingWriter(payload)
-                    pickle.dump(CHECKPOINT, written, protocol=5)
-                CHECKPOINT_SHA256 = written.hash.hexdigest()
-                if reuse and committed_sha256 == CHECKPOINT_SHA256:
-                    # Left as committed: nothing to commit.
-                    os.remove(checkpoint_output_path)
+                # The committed checkpoint is the one this exec would commit only
+                # where it was made as this runtime makes one now.
+                committed = checkpoint if reuse and checkpoint is not None and checkpoint.get("payload_kind") == "binary-sidecar" else None
+                made_alike = (
+                    committed is not None
+                    and committed.get("codec_version") == ${PYTHON_CHECKPOINT_CODEC.codecVersion}
+                    and committed.get("compatibility") == checkpoint_compatibility()
+                )
+                if made_alike and CHECKPOINT_UNREAD is not None:
+                    # Neither read nor written: nothing to commit.
                     event = {"kind": "checkpoint-unchanged"}
                 else:
-                    event = {
-                        "kind": "checkpoint",
-                        "checkpoint": {
-                            "runtimeId": "python",
-                            "codecId": ${JSON.stringify(PYTHON_CHECKPOINT_CODEC.codecId)},
-                            "codecVersion": ${PYTHON_CHECKPOINT_CODEC.codecVersion},
-                            "payloadKind": ${JSON.stringify(PYTHON_CHECKPOINT_CODEC.payloadKind)},
-                            "payloadPath": checkpoint_output_path,
-                            "compatibility": {
-                                "runtimeVersion": sys.version.split()[0],
-                                "languageVersion": sys.version.split()[0],
-                                "platform": sys.platform,
+                    # Unread, it is read to be committed as this runtime makes one.
+                    value = bayma_read_checkpoint()
+                    with open(checkpoint_output_path, "wb") as payload:
+                        written = HashingWriter(payload)
+                        pickle.dump(value, written, protocol=5)
+                    if made_alike and written.hash.hexdigest() == committed.get("sha256"):
+                        # Left as committed: nothing to commit.
+                        os.remove(checkpoint_output_path)
+                        event = {"kind": "checkpoint-unchanged"}
+                    else:
+                        event = {
+                            "kind": "checkpoint",
+                            "checkpoint": {
+                                "runtimeId": "python",
+                                "codecId": ${JSON.stringify(PYTHON_CHECKPOINT_CODEC.codecId)},
+                                "codecVersion": ${PYTHON_CHECKPOINT_CODEC.codecVersion},
+                                "payloadKind": ${JSON.stringify(PYTHON_CHECKPOINT_CODEC.payloadKind)},
+                                "payloadPath": checkpoint_output_path,
+                                "compatibility": checkpoint_compatibility(),
                             },
-                        },
-                    }
+                        }
                 write_protocol_line(prefix + json.dumps(event, ensure_ascii=False))
             except Exception as error:
                 emit(prefix, "error", "".join(traceback.format_exception(error)).rstrip())
+            if reuse:
+                # Held no longer than the exec: the next reads it again, if it does.
+                CHECKPOINT = None
+                CHECKPOINT_UNREAD = None
         RUNNING_EXEC = None
         emit(prefix, "done")
 
@@ -392,7 +421,9 @@ function writePythonExecFile(input) {
         payload_kind: input.checkpoint.manifest.payloadKind,
         inline_json: input.checkpoint.manifest.inlineJson,
         payload_path: input.checkpoint.payloadAbsolutePath,
-        sha256: input.checkpoint.manifest.sha256
+        sha256: input.checkpoint.manifest.sha256,
+        codec_version: input.checkpoint.manifest.codecVersion,
+        compatibility: { ...input.checkpoint.manifest.compatibility }
       } : null,
       checkpoint_output_path: checkpointOutputPath,
       checkpoint_reuse: input.checkpointReuse ?? false

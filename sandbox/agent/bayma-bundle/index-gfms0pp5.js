@@ -11,7 +11,7 @@ import {
   buildMarkers2,
   createPromptAwareEnvelopeCollector2,
   ensureRuntimeAsset2
-} from "./main-gg66zwkk.js";
+} from "./main-c0bag0nq.js";
 
 // packages/runtime-dotnet-script/src/profile.ts
 var dotnetScriptModelProfile = {

@@ -7,7 +7,7 @@ import {
   ProcessTransport2,
   buildMarkers2,
   createPromptAwareEnvelopeCollector2
-} from "./main-gg66zwkk.js";
+} from "./main-c0bag0nq.js";
 
 // packages/runtime-lean/src/exec.ts
 import { writeFileSync } from "node:fs";

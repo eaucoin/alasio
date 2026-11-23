@@ -7901,7 +7901,7 @@ async function startTelemetry(attributes, bearerTokenFile) {
 `);
   if (config.exports.length === 0)
     return;
-  const { startSdk } = await import("./sdk-7dnbfe9e.js");
+  const { startSdk } = await import("./sdk-0ha5256t.js");
   running = {
     shutdown: startSdk(config.exports, attributes, bearerTokenFile),
     parent: import_api.propagation.extract(import_api.ROOT_CONTEXT, {
@@ -10117,7 +10117,7 @@ class SessionManager {
       snapshotAtMs,
       ...stopReason === undefined ? {} : { stopReason }
     };
-    const told = [];
+    const failures = [];
     for (const session of this.sessions.values()) {
       if (!session.runtime)
         continue;
@@ -10127,21 +10127,15 @@ class SessionManager {
         continue;
       }
       pending.notice = noticeAfter(pending.notice, notice);
-      told.push(session);
+      try {
+        this.persist(session);
+      } catch (error) {
+        failures.push(error);
+      }
     }
-    return () => {
-      const failures = [];
-      for (const session of told) {
-        try {
-          this.persist(session);
-        } catch (error) {
-          failures.push(error);
-        }
-      }
-      if (failures.length > 0) {
-        throw aggregateFailure("sessions' notices of the sandbox's restore were not persisted", failures);
-      }
-    };
+    if (failures.length > 0) {
+      throw aggregateFailure("sessions' notices of the sandbox's restore were not persisted", failures);
+    }
   }
   shutdown() {
     if (this.shutdownPromise)
@@ -12457,7 +12451,7 @@ async function diagnose(adapters, options) {
 import { createHash as createHash5, randomUUID as randomUUID3, timingSafeEqual } from "node:crypto";
 import { Buffer as Buffer5 } from "node:buffer";
 import http from "node:http";
-import { finished as finished2 } from "node:stream";
+import { finished } from "node:stream";
 
 // node_modules/.bun/@modelcontextprotocol+server@2.0.0/node_modules/@modelcontextprotocol/server/dist/chunk-Br0eD_fh.mjs
 var __create2 = Object.create;
@@ -29456,11 +29450,10 @@ function finish({ span, metric, startedAt }, ended) {
 import { Buffer as Buffer4 } from "node:buffer";
 import { rmSync as rmSync8 } from "node:fs";
 import net from "node:net";
-import { finished } from "node:stream/promises";
 import { getHeapStatistics } from "node:v8";
 function restoreSandboxServer(manager, savedAtMs, stopReason) {
   manager.assertSandboxRestorable();
-  return manager.sandboxRestored(savedAtMs, stopReason);
+  manager.sandboxRestored(savedAtMs, stopReason);
 }
 var MAX_SOCKET_PATH_BYTES = 107;
 var MAX_REQUEST_BYTES = 16 + MAX_STOP_REASON_BYTES;
@@ -29547,15 +29540,14 @@ async function serveSandboxHook(stateDir, handlers) {
             runOn();
           });
         });
-        return { answer: JSON.stringify(caught) };
+        return JSON.stringify(caught);
       }
       case "restore": {
         const restoredFrom = savedAtMs;
         if (restoredFrom === undefined)
           throw new Error("the server was not saved, to be restored");
-        let after;
         try {
-          after = await inSpan("bayma.sandbox.restore", {
+          await inSpan("bayma.sandbox.restore", {
             "bayma.sandbox.saved.duration": (Date.now() - restoredFrom) / 1000
           }, () => handlers.restore(restoredFrom, request.stopReason));
         } catch (error) {
@@ -29572,17 +29564,17 @@ async function serveSandboxHook(stateDir, handlers) {
         stopAsked = false;
         resume();
         handlers.stop?.restored();
-        return after ? { after } : {};
+        return;
       }
       case "resume":
         await inSpan("bayma.sandbox.resume", {}, async () => runOn());
-        return {};
+        return;
       case "stop":
         if (savedAtMs !== undefined)
           stopAsked = true;
         else
           handlers.stop?.goOn("sandbox-hook stop asked it to");
-        return {};
+        return;
     }
   };
   const server = net.createServer((socket) => {
@@ -29604,29 +29596,10 @@ async function serveSandboxHook(stateDir, handlers) {
         return;
       socket.removeAllListeners("data");
       sendsNothing.clear();
-      const line = request.subarray(0, end).toString();
-      queue(async () => {
-        let handled;
-        try {
-          handled = await handle(parseSandboxHookRequest(line));
-        } catch (error) {
-          socket.end(`${failureMessage(error)}
-`);
-          return;
-        }
-        const { answer, after } = handled;
-        socket.end(answer === undefined ? `ok
+      queue(() => handle(parseSandboxHookRequest(request.subarray(0, end).toString()))).then((answer) => socket.end(answer === undefined ? `ok
 ` : `ok ${answer}
-`);
-        await finished(socket, { readable: false }).catch(() => {
-          return;
-        });
-        try {
-          after?.();
-        } catch (error) {
-          report(`bayma: once the sandbox's restore was answered: ${failureMessage(error)}`);
-        }
-      });
+`), (error) => socket.end(`${failureMessage(error)}
+`));
     });
     socket.on("error", () => socket.destroy());
   });
@@ -30017,7 +29990,7 @@ async function serveMcpHttp(adapters, config) {
           track: (trackedResponse) => {
             idleTimer?.clear();
             openResponses += 1;
-            finished2(trackedResponse, () => {
+            finished(trackedResponse, () => {
               openResponses -= 1;
               lastResponseEndedAtMs = Date.now();
               armIdleTimer();
@@ -30026,7 +29999,7 @@ async function serveMcpHttp(adapters, config) {
           trackStream: (trackedResponse) => {
             clientSession.track(trackedResponse);
             openStreams += 1;
-            finished2(trackedResponse, () => {
+            finished(trackedResponse, () => {
               openStreams -= 1;
               outstanding?.abort();
               if (openStreams > 0)
@@ -30133,7 +30106,7 @@ async function serveMcpHttp(adapters, config) {
       },
       collect: () => manager.collectGarbage(),
       restore: async (savedAtMs, stopReason) => {
-        const persistNotices = restoreSandboxServer(manager, savedAtMs, stopReason);
+        restoreSandboxServer(manager, savedAtMs, stopReason);
         try {
           if (tokenFile !== undefined) {
             try {
@@ -30147,7 +30120,6 @@ async function serveMcpHttp(adapters, config) {
           for (const session of sessions.values())
             session.restartTimers();
         }
-        return persistNotices;
       }
     });
   } catch (error) {
@@ -30524,13 +30496,13 @@ Commands:
       was stopped where BAYMA_SANDBOX_STOP_REASON says, as the end of a
       sentence ("it ran out of its memory (4Gi)"). A host whose save fails
       runs resume, and a save neither follows within ten minutes is given
-      up on. A restore is answered before the server persists what it told
-      its sessions. A gVisor sandbox's file locks hold within it alone, so
-      such a host runs one server per state directory. bayma's image
-      carries the hook without Node as bayma-sandbox-hook, which takes the
-      same arguments and variables, for such a host to run in its place:
-      it starts in milliseconds, where Node takes hundreds of them in a
-      sandbox just restored.
+      up on. A gVisor sandbox's file locks hold within it alone, so such a
+      host runs one server per state directory. bayma's image carries the
+      hook without Node as bayma-sandbox-hook, which takes the same
+      arguments and variables, says the same, and fails with the same
+      words, for such a host to run in its place: it starts in
+      milliseconds, where Node takes hundreds of them in a sandbox just
+      restored.
       The state generation, in the state directory's generation.json as
       { "schemaVersion": 1, "generation": N }, is moved on, on the disk,
       before the server persists any change or tells a client of one as
@@ -30581,10 +30553,11 @@ Commands:
 Sessions are checkpointed by default: they outlive the server, whole where
 the server can snapshot their processes, and otherwise from their
 checkpoints. --default-durability ephemeral ends them with the server.
-With --checkpoint-reuse on, a Python session takes the checkpoint committed
-before an exec as the one it holds where that is what it last wrote or
-read, rather than read it again, and a Bun or Python session whose exec left
-its checkpoint as committed commits none.
+With --checkpoint-reuse on, a Python session reads its committed checkpoint
+only as an exec first reads it, rather than at the start of every exec, and
+a Bun or Python session whose exec left its checkpoint as committed, by a
+runtime of the same version, commits none: what each exec reads, and what
+is committed, are as they are without it.
 
 The runtime memory budget, --runtime-memory-budget-mb, bounds what a
 session's host comes to hold of its own, anonymous memory and swap across

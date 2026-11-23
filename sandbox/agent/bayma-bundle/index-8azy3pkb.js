@@ -9,7 +9,7 @@ import {
   ProcessTransport2,
   buildMarkers2,
   createPromptAwareEnvelopeCollector2
-} from "./main-gg66zwkk.js";
+} from "./main-c0bag0nq.js";
 
 // packages/runtime-bun/src/profile.ts
 var bunModelProfile = {
@@ -301,9 +301,14 @@ function writeBunExecFile(input) {
       `  if (__baymaDurabilityMode === "checkpointed") {`,
       `    try {`,
       `      const __baymaSerializedCheckpoint = new Uint8Array(__baymaSerialize(__baymaState.checkpoint ?? null));`,
+      `      const __baymaCompatibility = { runtimeVersion: Bun.version, platform: process.platform, arch: process.arch };`,
+      `      const __baymaSorted = (value) => JSON.stringify(Object.entries(value ?? {}).sort(([a], [b]) => (a < b ? -1 : 1)));`,
       `      if (`,
       `        __baymaCheckpointReuse &&`,
       `        __baymaCheckpointManifest?.payloadKind === "binary-sidecar" &&`,
+      `        __baymaCheckpointManifest.codecId === ${JSON.stringify(BUN_CHECKPOINT_CODEC.codecId)} &&`,
+      `        __baymaCheckpointManifest.codecVersion === ${BUN_CHECKPOINT_CODEC.codecVersion} &&`,
+      `        __baymaSorted(__baymaCheckpointManifest.compatibility) === __baymaSorted(__baymaCompatibility) &&`,
       `        new Bun.CryptoHasher("sha256").update(__baymaSerializedCheckpoint).digest("hex") === __baymaCheckpointManifest.sha256`,
       `      ) {`,
       `        __baymaEmit("checkpoint-unchanged");`,
@@ -315,7 +320,7 @@ function writeBunExecFile(input) {
       `          codecVersion: ${BUN_CHECKPOINT_CODEC.codecVersion},`,
       `          payloadKind: ${JSON.stringify(BUN_CHECKPOINT_CODEC.payloadKind)},`,
       `          payloadPath: __baymaCheckpointOutputPath,`,
-      `          compatibility: { runtimeVersion: Bun.version, platform: process.platform, arch: process.arch },`,
+      `          compatibility: __baymaCompatibility,`,
       `        } });`,
       `      }`,
       `    } catch (__baymaCheckpointError) {`,
