@@ -43,7 +43,12 @@
  * what a workspace's sandbox wrote and deleted before would leave its quota counting less than
  * it holds, short by as much, until the daily quota check repairs it. An attach waits for it,
  * up to QUOTA_HELD_WITHIN_MS; a write, which its file's own bytes may take a while to, does
- * not: where the mount does not hold it, the agent refuses (503), to be asked again.
+ * not: where the mount does not hold it, the agent refuses (503), to be asked again. But a
+ * workspace whose quota was set less than QUOTA_HELD_WITHIN_MS ago, as one made or forked for
+ * the session about to be bound is, as its record of when says (`quota.json`, a QuotaSet,
+ * written as its quota is set), is attached at once, the mount due to load its quota by then,
+ * and its usage is counted anew once the mount holds it, which counts what its sandbox wrote and
+ * deleted meanwhile: its quota goes unenforced for that while, a heartbeat at most.
  *
  * A workspace is made as its session is (create): its directory, with its files' `workspace/`
  * and `home/`, its agent's, and its quota set on the directory (./juicefs.ts), at once; made
@@ -164,6 +169,12 @@ export type Released = typeof Released.Type;
 
 /** The name of a workspace's record of the snapshot it was released into, beside its files. */
 const RELEASED_FILE = "released.json";
+
+/** When a workspace's quota was last set, on the agent's clock, in ms since the epoch. */
+const QuotaSet = Schema.Struct({ setAtMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) });
+
+/** The name of a workspace's record of when its quota was set (QuotaSet), beside its files. */
+const QUOTA_SET_FILE = "quota.json";
 
 /** What a stop asks: the bound pod, by its namespace and name, its bayma's container by its runtime's id, and bayma's hook, `sandbox-hook stop`. */
 export interface StopRequest {
@@ -407,11 +418,37 @@ export const lookOnNode = (host: HostCommands) => (point: string): Promise<void>
     throw Object.assign(new Error(stderr.trim()), { code });
   });
 
+/** Syncs the directory `directory`, so that what was renamed or removed in it lasts. */
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Writes `text` as the file `file`, whole or not at all: a file of its own, synced, then renamed over it, its directory synced after. */
+async function writeRecord(file: string, text: string): Promise<void> {
+  const staged = `${file}.${randomBytes(8).toString("hex")}`;
+  const handle = await open(staged, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    await handle.writeFile(text);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(staged, file);
+  await syncDirectory(join(file, ".."));
+}
+
 export const makeWorkspaces = Effect.fnUntraced(function*(
   { host, runsc, juicefs, mounted = fuseAt, reaches = reaching(lookOnNode(host)), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID, quotaSettleMs = QUOTA_SETTLE_MS, holds = holdsQuota(), quotaHeldWithinMs = QUOTA_HELD_WITHIN_MS, own = OWN_MOUNTS, orphanGraceMs = ORPHAN_GRACE_MS }: WorkspacesOptions,
 ): Effect.fn.Return<Workspaces, never, Scope.Scope> {
   /** Each pod directory's lock of its detaches, held while one is under way. */
   const detaching = yield* RcMap.make({ lookup: (_directory: string) => Semaphore.make(1) });
+  /** What the workspaces run in the background, ended with them. */
+  const scope = yield* Effect.scope;
 
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
@@ -488,6 +525,71 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
   /** `work` done on the node's mount, there, a failure of it refused as workspace storage's not answering. */
   const onMount = <A>(what: string, work: () => Promise<A>) =>
     storage(what).pipe(Effect.andThen(Effect.tryPromise({ try: work, catch: (error) => refused(503, `${what}: ${error instanceof Error ? error.message : String(error)}`) })));
+
+  /** Records, beside `ref`'s files at `files`, that its quota was set now (QUOTA_SET_FILE). */
+  const recordQuotaSet = (ref: WorkspaceRef, files: string) =>
+    Effect.gen(function*() {
+      const setAtMs = yield* Clock.currentTimeMillis;
+      yield* onMount(`${ref.environment}/${ref.workspace}'s quota could not be recorded`, () => writeRecord(join(files, "..", QUOTA_SET_FILE), JSON.stringify({ setAtMs })));
+    });
+  /** When `ref`'s quota was set, its files at `files`, as its record says; null where it has none, or one that cannot be read, which is said. */
+  const quotaSetAt = (ref: WorkspaceRef, files: string) =>
+    Effect.tryPromise(() =>
+      readFile(join(files, "..", QUOTA_SET_FILE), { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error: NodeJS.ErrnoException) =>
+        error.code === "ENOENT" ? null : Promise.reject(error)
+      )
+    ).pipe(
+      Effect.flatMap((text) => (text === null ? Effect.succeed(null) : Schema.decodeUnknownEffect(Schema.fromJsonString(QuotaSet))(text).pipe(Effect.map(({ setAtMs }) => setAtMs)))),
+      Effect.catch((error) => Effect.as(Effect.logWarning(`${ref.environment}/${ref.workspace}'s record of when its quota was set could not be read: ${error.message}`), null)),
+    );
+  /**
+   * Counts anew what the directory of `ref`'s quota holds, until a check after it has settled
+   * finds the quota's usage holds (QUOTA_SETTLE_MS), QUOTA_REPAIRS times at most.
+   */
+  const repairQuota = (command: Juicefs, ref: WorkspaceRef) =>
+    Effect.gen(function*() {
+      for (let repairs = 1; ; repairs += 1) {
+        yield* command.repairQuota(quotaPath(ref));
+        yield* Effect.sleep(quotaSettleMs);
+        if (yield* command.quotaHolds(quotaPath(ref))) return;
+        if (repairs === QUOTA_REPAIRS) {
+          return yield* Effect.logWarning(`${ref.environment}/${ref.workspace}'s quota is still off what it holds after ${QUOTA_REPAIRS} repairs; the daily quota check repairs it`);
+        }
+      }
+    });
+  /** The quotas being counted anew in the background, by their directory's path, each one at a time. */
+  const repairing = new Set<string>();
+  /**
+   * `ref`'s quota held by the node's mount for an attach, as the module says, its files at
+   * `files`: at once where the mount holds it, or where it was set too lately for the mount to
+   * have loaded it yet, its usage then counted anew in the background once the mount holds it;
+   * waited for otherwise, as quotaHeld waits.
+   */
+  const quotaHeldForAttach = (ref: WorkspaceRef, files: string, what: string) =>
+    Effect.gen(function*() {
+      const directory = join(files, "..");
+      if (!(yield* there(directory)) || (yield* Effect.promise(() => holds(directory, workspacesRoot)))) return;
+      const setAtMs = yield* quotaSetAt(ref, files);
+      const now = yield* Clock.currentTimeMillis;
+      const leftMs = setAtMs === null ? 0 : setAtMs + quotaHeldWithinMs - now;
+      // Set long enough ago that the mount should hold it, or by a clock ahead of this node's by more than the mount takes.
+      if (leftMs <= 0 || leftMs > quotaHeldWithinMs) return yield* quotaHeld(ref, files, what, quotaHeldWithinMs);
+      const path = quotaPath(ref);
+      if (repairing.has(path)) return;
+      repairing.add(path);
+      yield* Effect.gen(function*() {
+        const held = yield* Effect.promise(() => holds(directory, workspacesRoot)).pipe(
+          Effect.repeat({ schedule: Schedule.spaced(QUOTA_LOOK_MS), until: (is) => is }),
+          Effect.timeoutOrElse({ duration: leftMs, orElse: () => Effect.succeed(false) }),
+        );
+        if (!held) return yield* Effect.logWarning(`the node's mount of workspace storage did not hold ${ref.environment}/${ref.workspace}'s quota within ${quotaHeldWithinMs} ms of its setting, so its usage is not counted anew; the daily quota check repairs it`);
+        yield* repairQuota(yield* juicefsOr, ref);
+      }).pipe(
+        Effect.catch((error) => Effect.logWarning(`${ref.environment}/${ref.workspace}'s quota was not counted anew once the node's mount held it: ${error.message}`)),
+        Effect.ensuring(Effect.sync(() => repairing.delete(path))),
+        Effect.forkIn(scope),
+      );
+    });
 
   /**
    * Detaches what is attached into the directory of `pod` of `namespace`, as the module says,
@@ -579,6 +681,7 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
           for (const directory of [files, join(files, "workspace"), join(files, "home")]) await chown(directory, agentUid, agentUid);
         });
         yield* command.setQuota(quotaPath(ref), quotaBytes);
+        yield* recordQuotaSet(ref, files);
       }),
 
     clone: (from, to, quotaBytes) =>
@@ -592,17 +695,9 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
         yield* onMount(`${to.environment}/${to.workspace} could not be made`, () => mkdir(join(destination, ".."), { recursive: true }));
         yield* command.clone(source, destination);
         yield* command.setQuota(quotaPath(to), quotaBytes);
-        // The usage the quota is set with, counted as the clone's tree was attached, may be off what the tree holds: counted
-        // anew, until a check after it has settled finds it holds (QUOTA_SETTLE_MS).
-        for (let repairs = 1; ; repairs += 1) {
-          yield* command.repairQuota(quotaPath(to));
-          yield* Effect.sleep(quotaSettleMs);
-          if (yield* command.quotaHolds(quotaPath(to))) break;
-          if (repairs === QUOTA_REPAIRS) {
-            yield* Effect.logWarning(`${to.environment}/${to.workspace}'s quota is still off what it holds after ${QUOTA_REPAIRS} repairs; the daily quota check repairs it`);
-            break;
-          }
-        }
+        yield* recordQuotaSet(to, destination);
+        // The usage the quota is set with, counted as the clone's tree was attached, may be off what the tree holds.
+        yield* repairQuota(command, to);
       }),
 
     remove: (ref) =>
@@ -658,7 +753,7 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
         yield* storage(`${ref.environment}/${ref.workspace} could not be attached`);
         const found = yield* host.run(["test", "-d", files]);
         if (found.exitCode !== 0) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
-        yield* quotaHeld(ref, files, `${ref.environment}/${ref.workspace} could not be attached`, quotaHeldWithinMs).pipe(
+        yield* quotaHeldForAttach(ref, files, `${ref.environment}/${ref.workspace} could not be attached`).pipe(
           withAlasioSpan("alasio.node_agent.attach.quota", { attributes: attachAttributes(ref, pod) }),
         );
         const ws = join(directory, "ws");
@@ -782,22 +877,9 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
         yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be recorded`, async () => {
           if (released === null) {
             await unlink(file).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? undefined : Promise.reject(error)));
+            await syncDirectory(directory);
           } else {
-            const staged = `${file}.${randomBytes(8).toString("hex")}`;
-            const handle = await open(staged, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-            try {
-              await handle.writeFile(JSON.stringify(released));
-              await handle.sync();
-            } finally {
-              await handle.close();
-            }
-            await rename(staged, file);
-          }
-          const parent = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
-          try {
-            await parent.sync();
-          } finally {
-            await parent.close();
+            await writeRecord(file, JSON.stringify(released));
           }
         });
       }),

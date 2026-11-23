@@ -222,6 +222,63 @@ test("a workspace is attached only once the node's mount holds its quota, waited
   }
 });
 
+/** Waits until `holds` says so, looking every 20 ms, for up to `withinMs`; whether it did. */
+const eventually = async (holds: () => boolean, withinMs: number): Promise<boolean> => {
+  for (const deadline = Date.now() + withinMs; Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 20))) if (holds()) return true;
+  return holds();
+};
+
+test("a workspace whose quota was set within the time the node's mount loads it in is attached at once, its quota repaired once the mount holds it", async () => {
+  const at = workspacesNode({ quotaHeldWithinMs: 1_200 });
+  try {
+    const made = { environment: "main", workspace: "fs-made" };
+    await Effect.runPromise(at.workspaces.create(made, 1024 ** 3));
+    at.pod("pool-0");
+    at.unheld.add("fs-made");
+    const asked = Date.now();
+    await Effect.runPromise(at.workspaces.attach(made, "pool-0", "t", {}));
+    assert.ok(Date.now() - asked < 400, `the attach took ${Date.now() - asked} ms`);
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-0", "ws")]);
+    // Its usage counted anew only once the mount holds its quota, as writes before are counted after.
+    const repairs = () => at.juicefsCalls().filter((call) => call.startsWith("quota check redis://valkey.alasio.svc:6379/1 --path /main/fs-made ")).map((call) => call.split(" META_PASSWORD")[0]);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(repairs(), []);
+    at.unheld.delete("fs-made");
+    assert.ok(await eventually(() => repairs().length === 2, 2_000), `quota checks: ${repairs().join("; ")}`);
+    assert.deepEqual(repairs(), [
+      "quota check redis://valkey.alasio.svc:6379/1 --path /main/fs-made --repair",
+      "quota check redis://valkey.alasio.svc:6379/1 --path /main/fs-made",
+    ]);
+  } finally {
+    at.done();
+  }
+});
+
+test("a fork whose quota was set within the time the node's mount loads it in is attached at once too, and a workspace whose quota is older waits for the mount as before", async () => {
+  const at = workspacesNode({ quotaHeldWithinMs: 600 });
+  try {
+    const source = { environment: "main", workspace: "fs-source" };
+    await Effect.runPromise(at.workspaces.create(source, 1024 ** 3));
+    const fork = { environment: "main", workspace: "fs-fork" };
+    await Effect.runPromise(at.workspaces.clone(source, fork, 1024 ** 3));
+    at.pod("pool-0");
+    at.pod("pool-1");
+    at.unheld.add("fs-fork");
+    const asked = Date.now();
+    await Effect.runPromise(at.workspaces.attach(fork, "pool-0", "t", {}));
+    assert.ok(Date.now() - asked < 300, `the attach took ${Date.now() - asked} ms`);
+    // Past the time its mount was to load it in: an attach waits for the mount as before, and is refused where it does not hold it.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    at.unheld.add("fs-source");
+    const later = Date.now();
+    assert.equal(await refusal(at.workspaces.attach(source, "pool-1", "t", {})), 503);
+    assert.ok(Date.now() - later >= 500, `the attach was refused after ${Date.now() - later} ms`);
+    assert.deepEqual(at.mounts, [join(at.attachRoot, "main", "pool-0", "ws")]);
+  } finally {
+    at.done();
+  }
+});
+
 test("an attach is traced, its wait for the node's mount to hold the workspace's quota a step of its own", async () => {
   const at = workspacesNode({ quotaHeldWithinMs: 1_200 });
   try {
