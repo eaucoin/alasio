@@ -165,6 +165,15 @@ export const ATTACH_ROOT = `${NODE_DIRECTORY}/attach`;
 /** The file of a harness pool's pod's binding in its directory, which its node's agent writes as the gateway binds it, and the pod serves once it is there (src/harness/program.ts). */
 export const BINDING_FILE = "binding.json";
 
+/**
+ * What of a node's memory kubelet keeps from its pods (kube-reserved and system-reserved), and
+ * how little it lets be available before it evicts them softly (eviction-soft), as alasio's nodes
+ * run it (cli/src/cluster/k3s.ts KUBELET_ARGS): what the agent's memory budget leaves aside
+ * (./memory.ts).
+ */
+export const NODE_MEMORY_RESERVED_BYTES = (1024 + 512) * 1024 ** 2;
+export const NODE_MEMORY_SOFT_EVICTION_BYTES = 1536 * 1024 ** 2;
+
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */
 export const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
 

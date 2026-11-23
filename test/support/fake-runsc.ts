@@ -263,6 +263,8 @@ export interface FakeReleases {
   readonly unchecked: (containerId: string) => void;
   /** Installs `release` beside the others, as a node is given one it keeps. */
   readonly installs: (release: string) => void;
+  /** Adds `annotations` to those containerd gives the container, as its pod's are passed to its runtime. */
+  readonly annotate: (containerId: string, annotations: Readonly<Record<string, string>>) => void;
 }
 
 /** The uid of the pod a container runs in, as containerd's annotations say it, unless FakeReleases.runs is given another. */
@@ -313,6 +315,13 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     const of = kept[containerId];
     if (of === undefined) throw new Error(`no container ${containerId} runs`);
     kept[containerId] = { ...of, annotations: { ...of.annotations, "io.kubernetes.cri.container-type": "sandbox" } };
+    writeFileSync(containers, JSON.stringify(kept));
+  };
+  const annotate = (containerId: string, annotations: Readonly<Record<string, string>>) => {
+    const kept = JSON.parse(readFileSync(containers, "utf8")) as Record<string, { annotations: Record<string, string> }>;
+    const of = kept[containerId];
+    if (of === undefined) throw new Error(`no container ${containerId} runs`);
+    kept[containerId] = { ...of, annotations: { ...of.annotations, ...annotations } };
     writeFileSync(containers, JSON.stringify(kept));
   };
   const died = (containerId: string, program?: string) => {
@@ -369,6 +378,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     runs,
     held,
     rooted,
+    annotate,
     died,
     unchecked,
     installs,

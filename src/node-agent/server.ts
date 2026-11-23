@@ -185,6 +185,7 @@ import { makeHostCommands } from "./host.ts";
 import { makeJuicefs } from "./juicefs.ts";
 import { makeWorkspaces, Released, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
 import {
+  ATTACH_ROOT,
   BACKGROUND_READ_SECONDS_VARIABLE,
   CONTAINERD,
   GVISOR_RELEASES,
@@ -213,6 +214,7 @@ import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket, type StoreUnconditional } from "./s3.ts";
 import { makeStandbyRestores, StandbyRestoreRequest, type StandbyRestores } from "./standby.ts";
 import { makeStoreProxy, type StoreProxyError } from "./store-proxy.ts";
+import { type NodeMemory, nodeMemory, observeNodeMemory } from "./memory.ts";
 import { observeStorageUsage } from "./storage-usage.ts";
 
 /** What serveNodeAgent is given: where it listens, the token it takes, and the agent and workspaces it serves. */
@@ -224,6 +226,8 @@ export interface NodeAgentServerOptions {
   readonly workspaces: Workspaces;
   /** The restores into standby pods on the node, whose shims listen in STANDBY_SOCKETS, as root, unless given. */
   readonly standbys?: StandbyRestores;
+  /** What the node's memory holds (./memory.ts nodeMemory), as `GET /memory` answers it; none unless given. */
+  readonly memory?: Effect.Effect<NodeMemory>;
 }
 
 /** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
@@ -353,6 +357,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   agent,
   workspaces,
   standbys = makeStandbyRestores(),
+  memory,
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
   const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred | SaveDeferred>(scope, failureOf);
@@ -477,6 +482,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "POST" && url === "/bindings") {
       return body(BindingRequest).pipe(Effect.flatMap(({ namespace, pod, uid, gid, binding }) => workspaces.bindFree(namespace, pod, { uid, gid }, binding)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    if (method === "GET" && url === "/memory") {
+      return memory === undefined ? Effect.succeed(answer(501, { error: "this node agent reads no memory of its node" })) : Effect.map(memory, (read) => answer(200, read));
     }
     if (method === "GET" && url === "/attachments") return workspaces.attachments.pipe(Effect.map((attachments) => answer(200, { attachments })));
     if (method === "POST" && url === "/sync") {
@@ -638,7 +646,10 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   // What workspace storage holds, as the node's mount counts it, where the agent works with it.
   if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
   const workspaces = yield* makeWorkspaces({ host, runsc, juicefs });
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces });
+  // What the node's memory holds, its sandboxes' and the budget of what is held ahead, as gauges and as its API answers it.
+  const memory = { runsc, nodeRoot: NODE_ROOT, attachRoot: ATTACH_ROOT };
+  yield* observeNodeMemory(memory);
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, memory: nodeMemory(memory) });
   // What is attached on the node, kept to the pods the cluster has on it.
   yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
   // As it stops, before its API does: its restores' reads of the bucket done first.
