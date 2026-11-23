@@ -303,6 +303,20 @@ export const savesWithLoadWait = (release: string, since: string): boolean => re
 export const SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE = "ALASIO_GVISOR_SAVES_WITH_LOAD_WAIT_SINCE";
 
 /**
+ * Whether gVisor's `release` checks a restore's files in the bucket itself: its checkpoint gofer,
+ * told each file's ETag (s3 options' `etags`), asks the store for that version of its object on
+ * every read, and runsc reads the end of every image's pages file before it loads any, so that a
+ * restore whose images were lost or written over fails before its sandbox runs, and the prepare
+ * need not look at each first (./agent.ts prepare). One at or past `since`, the first release that
+ * does, as cluster/node/pins.json says it (gvisor.restoresWithETagsSince) and the installation
+ * gives the node agent it (RESTORES_WITH_ETAGS_SINCE_VARIABLE); none where `since` names none.
+ */
+export const restoresWithETags = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that checks a restore's files in the bucket itself (restoresWithETags). */
+export const RESTORES_WITH_ETAGS_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_WITH_ETAGS_SINCE";
+
+/**
  * How long a save, of a release that bounds it (savesWithLoadWait), waits for the pages that its
  * sandbox's restore from the bucket has not loaded yet (./agent.ts SaveDeferred): those it saves,
  * and those bayma's hook touches, the hook's own time aside. 5 minutes, well within the

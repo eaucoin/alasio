@@ -49,7 +49,7 @@ export interface FakeS3 {
   getDelayMs: number;
   /** Whether a get of a whole object is answered with its ETag, as S3 does; a test's to unset, as of a store that does not. */
   getsTagged: boolean;
-  /** Whether a put or a delete honours its conditions (If-Match, If-None-Match), as S3 does; a test's to unset, as of a store that ignores them. */
+  /** Whether a get, a put or a delete honours its conditions (If-Match, If-None-Match), as S3 does; a test's to unset, as of a store that ignores them. */
   honoursConditions: boolean;
   /**
    * Whether a put of the object `key` is answered: "written" writes it and drops the connection unanswered, as a store whose
@@ -327,6 +327,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     if (method === "GET") {
       const object = objects.get(key);
       if (!object) return error(response, 404, "NoSuchKey", "The specified key does not exist.");
+      if (unmet()) return error(response, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
       const asRange = /^bytes=(\d+)-(\d+)$/u.exec(String(request.headers.range ?? ""));
       if (asRange) {
         const [first, last] = [Number(asRange[1]), Math.min(Number(asRange[2]), object.length - 1)];

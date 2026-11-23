@@ -1402,6 +1402,25 @@ test("a restore runsc refuses, its kernel failing to restore the sandbox, falls 
   assert.ok(bound._tag === "Success" && /^none-/u.test(bound.success.pod));
 });
 
+test("a restore runsc refuses before its sandbox runs as its images in the bucket are not as they were put, which a release that checks them itself finds where no prepare looked, falls back at once, as one whose prepare found it so does: abandoned, its snapshot forgotten, the workspace bound to a free pod", async () => {
+  const { counted, recorded, abandoned, name, bindAgain } = await failedRestore("fs-stale", {
+    restartCount: 1,
+    state: { waiting: { reason: "CrashLoopBackOff" } },
+    lastState: {
+      terminated: {
+        exitCode: 128,
+        reason: "StartError",
+        message: `failed to start containerd task "bayma": OCI runtime restore failed: starting container: starting root container: restoring container "bayma": layer 1: layers/${"a".repeat(64)}/pages.img: reading its last byte, at 4095: GetObject on s3://snapshots/main/fs-stale/layers/${"a".repeat(64)}/pages.img: stale file handle`,
+      },
+    },
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=restore": 1 });
+  assert.deepEqual(abandoned, [`node-a ${name}`]);
+  assert.ok(recorded.asked.includes("forget fs-stale"), recorded.asked.join("\n"));
+  const bound = await bindAgain();
+  assert.ok(bound._tag === "Success" && /^none-/u.test(bound.success.pod));
+});
+
 test("a restore whose container ran, then ended, before it was seen running falls back, as its node's agent may have resumed it meanwhile: its snapshot forgotten, never restored again", async () => {
   const { counted, recorded } = await failedRestore("fs-ran", {
     restartCount: 0,

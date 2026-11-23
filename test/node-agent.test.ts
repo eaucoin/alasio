@@ -257,6 +257,8 @@ interface NodeOptions {
   /** The first release that bounds a save's wait for pages still loading, none unless given, and how its agent waits (NodeAgentOptions loadWait). */
   readonly savesWithLoadWaitSince?: string;
   readonly loadWait?: NodeAgentOptions["loadWait"];
+  /** The first release that checks a restore's files in the bucket itself, none unless given (NodeAgentOptions restoresWithETagsSince). */
+  readonly restoresWithETagsSince?: string;
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
   /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
@@ -270,7 +272,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, restoresWithETagsSince = "", backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -295,6 +297,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         host: host.host,
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
         savesWithLoadWaitSince,
+        restoresWithETagsSince,
         ...(loadWait === undefined ? {} : { loadWait }),
         backgroundReadMs,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
@@ -712,6 +715,41 @@ test("a checkpoint looks at the files of its own image and of those it refers to
       assert.equal((yield* preparing(third.agent, workspace)).source, "bucket");
       assert.deepEqual(s3.requests.slice(asked).filter((each) => each.startsWith("HEAD")).toSorted(), files.toSorted());
       assert.equal(s3.mostHeading(), files.length);
+    })
+  ));
+
+test("a restore from the bucket under a release that checks its files itself looks at none of them, its checkpoint gofer told each file's ETag, its own image's by its path and its layers' under theirs; under one before, each is looked at, and the gofer told none", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      // Restored on another node, its next snapshot there a delta of it: a chain of two images.
+      const there = yield* node("node-2");
+      const { manifest } = yield* preparing(there.agent, workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* fetched(there, base);
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      const [own, layer] = delta.layers;
+      assert.ok(own && layer);
+      const heads = (asked: number) => s3.requests.slice(asked).filter((each) => each.startsWith("HEAD"));
+      // Restored from the bucket by a release that checks the files itself: none looked at.
+      const checking = yield* node("node-3", { restoresWithETagsSince: RELEASE });
+      let asked = s3.requests.length;
+      const checked = yield* preparing(checking.agent, workspace);
+      assert.equal(checked.source, "bucket");
+      assert.deepEqual(heads(asked), []);
+      assert.deepEqual(goferOptionsOf(checked.imagePath).options["etags"], Object.fromEntries([
+        ...own.files.map(({ path, etag }) => [path, etag]),
+        ...layer.files.map(({ path, etag }) => [`layers/${layer.digest}/${path}`, etag]),
+      ]));
+      // By one before it, each is looked at, and the gofer, which would refuse them, is told no ETags.
+      const before = yield* node("node-4", { restoresWithETagsSince: "20260921.0-eaucoin.9" });
+      asked = s3.requests.length;
+      const looked = yield* preparing(before.agent, workspace);
+      assert.equal(looked.source, "bucket");
+      assert.deepEqual(heads(asked).toSorted(), delta.layers.flatMap(({ digest, files }) => files.map(({ path }) => `HEAD main/fs-abc/layers/${digest}/${path}`)).toSorted());
+      assert.equal(goferOptionsOf(looked.imagePath).options["etags"], undefined);
     })
   ));
 
