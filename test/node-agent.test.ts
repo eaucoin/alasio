@@ -65,6 +65,7 @@ import {
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
+import type { NodeMemory } from "../src/node-agent/memory.ts";
 import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags, SandboxGone } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
@@ -3734,6 +3735,31 @@ const unusedWorkspaces: Workspaces = {
   released: () => Effect.die("no workspace's release is read"),
   setReleased: () => Effect.die("no workspace's release is recorded"),
 };
+
+test("the agent's API answers what the node's memory holds where it reads it, and says it reads none where it does not", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const memory: NodeMemory = {
+        totalBytes: 16 * 1024 ** 3,
+        availableBytes: 9 * 1024 ** 3,
+        agentBytes: 150 * 1024 ** 2,
+        budgetBytes: 3 * 1024 ** 3,
+        budgetedBytes: 32 * 1024 ** 2,
+        sandboxes: [{ namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 1024 ** 3, anonBytes: 1024 ** 2, fileBytes: 0, shmemBytes: 0, zswapBytes: 0 }],
+      };
+      const asked = (port: number, token = "the token") =>
+        Effect.promise(async () => {
+          const response = await fetch(`http://127.0.0.1:${port}/memory`, { headers: { authorization: `Bearer ${token}` } });
+          return { status: response.status, body: (await response.json()) as unknown };
+        });
+      const reading = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: unusedWorkspaces, memory: Effect.succeed(memory) });
+      assert.deepEqual(yield* asked(reading.port), { status: 200, body: memory });
+      assert.equal((yield* asked(reading.port, "another token")).status, 401);
+      const none = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: unusedWorkspaces });
+      assert.deepEqual(yield* asked(none.port), { status: 501, body: { error: "this node agent reads no memory of its node" } });
+    })
+  ));
 
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
   withBucket(({ s3, node }) =>

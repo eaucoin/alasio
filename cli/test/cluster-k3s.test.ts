@@ -11,8 +11,9 @@ import { test } from "node:test";
 import { KubeConfig } from "@kubernetes/client-node";
 
 import pins from "../../cluster/node/pins.json" with { type: "json" };
+import { NODE_MEMORY_RESERVED_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
-import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, nodeHostsWith, normalizedReference, readySince, registriesYaml, SANDBOX_IMAGE, staleRuntimeClasses, unservedPods } from "../src/cluster/k3s.ts";
+import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, KUBELET_ARGS, nodeHostsWith, normalizedReference, readySince, registriesYaml, SANDBOX_IMAGE, staleRuntimeClasses, unservedPods } from "../src/cluster/k3s.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "../src/cluster/stargz.ts";
 
 /** The kubeconfig k3s writes. */
@@ -187,4 +188,16 @@ test("clusterKubeconfig names k3s's kubeconfig after the cluster, at the server 
   assert.equal(read(clusterKubeconfig(K3S_YAML, "alasio")).getCurrentCluster()?.server, "https://127.0.0.1:6443");
   assert.equal(clusterKubeconfig("", "dev"), null);
   assert.equal(clusterKubeconfig("apiVersion: v1\nclusters: [", "dev"), null);
+});
+
+test("the node agent's memory budget leaves aside what kubelet reserves and its soft eviction threshold, as alasio's nodes run kubelet", () => {
+  // The memory quantity kubelet's argument `name` gives right after `key`: `memory=1Gi`, `memory.available<1536Mi`.
+  const memoryOf = (name: string, key: string): number => {
+    const argument = KUBELET_ARGS.find((each) => each.startsWith(`${name}=`)) ?? "";
+    const [, count = "", unit = ""] = new RegExp(`${key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}([0-9]+)(Gi|Mi)\\b`, "u").exec(argument) ?? [];
+    assert.ok(count !== "", `kubelet's ${name} gives no ${key}`);
+    return Number(count) * (unit === "Gi" ? 1024 ** 3 : 1024 ** 2);
+  };
+  assert.equal(NODE_MEMORY_RESERVED_BYTES, memoryOf("kube-reserved", "memory=") + memoryOf("system-reserved", "memory="));
+  assert.equal(NODE_MEMORY_SOFT_EVICTION_BYTES, memoryOf("eviction-soft", "memory.available<"));
 });
