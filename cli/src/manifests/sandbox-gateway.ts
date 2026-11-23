@@ -250,6 +250,8 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
           { name: "HOME", value: "/home/agent" },
           { name: "USER", value: "agent" },
           { name: "BAYMA_PAYLOAD_DIR", value: "/opt/bayma/payload" },
+          // Where the nodes serve its image through passthrough, it opens the binaries a restore reads as it starts.
+          ...(sessions.imagePassthrough ? [{ name: "ALASIO_WARM", value: "1" }] : []),
         ],
         ports: [{ name: "mcp", containerPort: POOL_POD_PORT }],
         readinessProbe: { tcpSocket: { port: "mcp" }, periodSeconds: 2 },
