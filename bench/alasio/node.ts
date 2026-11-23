@@ -173,6 +173,11 @@ export async function bootLogs(node: string): Promise<void> {
     const options = `${CONTAINERD}/${gvisorHandler(release)}.toml`;
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
     await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n' >> ${options}; tail -n 4 ${options}`);
+    // Spike: more runsc options, as name:value words separated by ',' (BENCH_RUNSC_OPTIONS).
+    for (const word of (process.env["BENCH_RUNSC_OPTIONS"] ?? "").split(",").filter(Boolean)) {
+      const [name, value] = word.split(":");
+      await onNode(node, `grep -q '^  ${name} ' ${options} || printf '  ${name} = "${value}"\\n' >> ${options}; tail -n 6 ${options}`);
+    }
   }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));

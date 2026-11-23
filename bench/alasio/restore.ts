@@ -18,7 +18,7 @@ import { bootLog, diskReadBytes, podMemory, sandboxIdOf, storeBytes, storeQuiet 
 import type { Metrics } from "./results.ts";
 import { restoreLogged } from "./runsc-log.ts";
 import { compactionAtT0, resumeSteps, type Span } from "./spans.ts";
-import { PAGE_CACHE, VARIANT } from "./settings.ts";
+import { BENCH_DIR, PAGE_CACHE, VARIANT } from "./settings.ts";
 
 /** What the driver's probe says of a restore (bench/common/driver/driver.ts probe). */
 export interface Probed {
@@ -67,7 +67,10 @@ export async function restore(node: string, workspace: string, sessionId: string
   const memory = await podMemory(node, pod.metadata?.uid ?? "");
   // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
   const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
-  const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
+  const bootLines = await bootLog(node, await sandboxIdOf(node, name));
+  // Spike: every restore's boot log whole.
+  await import("node:fs").then((fs) => fs.writeFileSync(`${BENCH_DIR}/logs/boot-${kind}-${runId}-${name}.txt`, bootLines.join("\n")));
+  const logged = restoreLogged(bootLines, standby);
   const { line: prepared, snapshot: restoredSnapshot } = await preparedLine(node, workspace, manifest.snapshot);
   const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${restoredSnapshot}`);
   const logs = await loggedOf(node, workspace);

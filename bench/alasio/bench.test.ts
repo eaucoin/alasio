@@ -122,7 +122,9 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     // Spike (A/B): BENCH_EXEC_RUNNING=probe (the probe, its verify reading every page), first (its first exec alone), off (none).
     const asked = process.env["BENCH_EXEC_RUNNING"] ?? "probe";
     if (asked !== "probe") {
-      if (asked === "first") await driver(workspace, "first", "--session", sessionId, "--fixture", fixture);
+      if (asked === "first" || asked === "first-wait") await driver(workspace, "first", "--session", sessionId, "--fixture", fixture);
+      // Spike: the exec then 60 s before the saves, as a session idle a while after its last exec.
+      if (asked === "first-wait" || asked === "off-wait") await new Promise((resolve) => setTimeout(resolve, 60_000));
       held.push({ result: { fixture, sizeMib, run, phase: "exec-running", ok: true, failure: null, metrics: {}, details: { k3s, exec_running: asked } }, fromMs: Date.now(), toMs: Date.now() });
     }
     const running = asked !== "probe" ? null : await driver<Probed>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
