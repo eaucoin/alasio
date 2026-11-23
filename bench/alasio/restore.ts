@@ -10,10 +10,11 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { STANDBY_ANNOTATION, STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
+import type { NodeMemory } from "../../src/node-agent/memory.ts";
 import { SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { boundPodOf, kube, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
-import { driver, gone, loggedOf, msBetween, preparedLine, release, restores, sleep, sourceOf, watchRestore } from "./alasio.ts";
+import { agentOk, driver, gone, loggedOf, msBetween, preparedLine, release, restores, sleep, sourceOf, watchRestore } from "./alasio.ts";
 import { bootLog, diskReadBytes, podMemory, sandboxIdOf, storeBytes, storeQuiet } from "./node.ts";
 import type { Metrics } from "./results.ts";
 import { restoreLogged } from "./runsc-log.ts";
@@ -65,6 +66,16 @@ export async function restore(node: string, workspace: string, sessionId: string
   const name = pod.metadata?.name ?? "";
   if (pod.spec?.nodeName !== node) throw new Error(`the restore's pod ${name} runs on ${pod.spec?.nodeName}, not on ${node}, whose counters the run reads`);
   const memory = await podMemory(node, pod.metadata?.uid ?? "");
+  // What the node agent reads of the node's memory (src/node-agent/memory.ts): this sandbox's, as its pod's cgroup and its Sentry
+  // say it, and the node's budget of what is held ahead; none from an agent that does not answer it.
+  const nodeMemory = await agentOk(node, "GET", "/memory").then((said) => JSON.parse(said) as NodeMemory, () => null);
+  const agentMemory = nodeMemory === null ? null : {
+    sandbox: nodeMemory.sandboxes.find((sandbox) => sandbox.pod === name) ?? null,
+    available_bytes: nodeMemory.availableBytes,
+    agent_bytes: nodeMemory.agentBytes,
+    budget_bytes: nodeMemory.budgetBytes,
+    budgeted_bytes: nodeMemory.budgetedBytes,
+  };
   // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
   const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
@@ -95,7 +106,7 @@ export async function restore(node: string, workspace: string, sessionId: string
   const window = { fromMs: probed.t0_wall_ms, toMs: probed.t0_wall_ms + probed.first_exec_ms };
   const details = {
     pod: name, node, standby, source, prepared, restored_snapshot: restoredSnapshot, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said,
-    memory_stat: memory.stat, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
+    memory_stat: memory.stat, agent_memory: agentMemory, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
     ...(timeline === null ? {} : { pod_timeline: await timeline.stop(pod) }),
   };
   return { probed, metrics, details, pod: name, window };
