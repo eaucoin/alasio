@@ -307,6 +307,12 @@ before(async () => {
 }, { timeout: 150 * 60_000 });
 
 after(async () => {
+  // Spike: where the setting BENCH_FUSE_PROBE is 1, the latency of opening and closing the files of the containers'
+  // root filesystems, as the gofer does them, beside the runner's disk's (./fuse-probe.py), before the cluster goes.
+  if (process.env["BENCH_FUSE_PROBE"] === "1") {
+    const probed = await onNode("", `python3 ${join(import.meta.dirname, "fuse-probe.py")}`).catch((error: unknown) => String(error));
+    writeFileSync(join(BENCH_DIR, "logs", "fuse-probe.json"), probed);
+  }
   await tearDown();
 }, { timeout: 30 * 60_000 });
 
