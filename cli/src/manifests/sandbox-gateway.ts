@@ -241,6 +241,10 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
           "/attach/token",
           "--telemetry-token-file",
           "/attach/token",
+          // A checkpointed session keeps the checkpoint it holds rather than read again what it wrote, and
+          // commits none an exec left unchanged: what a restore's first exec reads, and a release stores.
+          "--checkpoint-reuse",
+          "on",
           ...(snapshotted ? [STOP_WAIT_ARG, String(stopWaitSeconds(config) * 1000)] : []),
         ],
         workingDir: "/attach",
