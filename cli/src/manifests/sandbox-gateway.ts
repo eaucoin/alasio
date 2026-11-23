@@ -241,6 +241,8 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
           "/attach/token",
           "--telemetry-token-file",
           "/attach/token",
+          "--checkpoint-reuse",
+          "on",
           ...(snapshotted ? [STOP_WAIT_ARG, String(stopWaitSeconds(config) * 1000)] : []),
         ],
         workingDir: "/attach",
