@@ -146,6 +146,12 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
    * held to that harness's binding (`held`). One a branch inherited forked from its parent's first.
    */
   readonly ensureSession: (volumeId: string, held?: HeldTo) => Effect.Effect<{ readonly bayma: BaymaEndpoint }, SessionError>;
+  /**
+   * Binds the session, as ensureSession does before it gives its bayma's endpoint: so that its
+   * restore runs beside what else a turn waits on first, as its harness's bind, and the turn's
+   * ensureSession finds it bound.
+   */
+  readonly bindSession: (volumeId: string) => Effect.Effect<void, SessionError>;
   /** A file from the session, at `path` as it sees it (filesPath), of `maxBytes` at most: `{ bytes }`, or `{ note }` saying why not. */
   readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, SessionFileError>;
   /** Writes `bytes` into the session's file at `path` as it sees it (filesPath), its directories made. */
@@ -174,6 +180,15 @@ export function makeSessionSandboxes({ workspaces, environment: own, stateDir, n
         ),
       )
       : Effect.void;
+
+  /** The session `id` bound, one a branch inherited forked first: the internet it was made with. */
+  const bound = (id: string): Effect.Effect<NetMode, SessionError> =>
+    Effect.gen(function*() {
+      yield* inherited(id);
+      const mode = yield* modeOf(id);
+      yield* workspaces.bind(id, mode);
+      return mode;
+    });
 
   return SessionSandboxes.of({
     volumes: {
@@ -208,11 +223,11 @@ export function makeSessionSandboxes({ workspaces, environment: own, stateDir, n
     ensureSession: (volumeId, held) =>
       Effect.gen(function*() {
         const id = assertValidVolumeId(volumeId);
-        yield* inherited(id);
-        const mode = yield* modeOf(id);
-        yield* workspaces.bind(id, mode);
+        const mode = yield* bound(id);
         return { bayma: yield* (held ? workspaces.endpoint(id, mode, held) : proxy.reach(sessionKey(id), workspaces.endpoint(id, mode))) };
       }).pipe(withLogScope("sandbox")),
+
+    bindSession: (volumeId) => Effect.suspend(() => bound(assertValidVolumeId(volumeId))).pipe(Effect.asVoid, withLogScope("sandbox")),
 
     readFile: (volumeId, path, maxBytes) => {
       const named = filesPath(path);

@@ -118,6 +118,7 @@ function fakeVolumes({ forkFails = false, forking = Effect.void, listed = [], de
     },
     harnessDirectory: () => assert.fail("harnessDirectory"),
     ensureSession: () => Effect.die(new Error("no session is ensured")),
+    bindSession: () => Effect.die(new Error("no session is bound")),
     readFile: () => Effect.die(new Error("no file is read")),
     writeFile: () => Effect.die(new Error("no file is written")),
   };

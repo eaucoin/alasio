@@ -41,6 +41,7 @@ function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string
         ensured.push(volumeId);
         return { bayma: BAYMA };
       }),
+    bindSession: unused,
     readFile: unused,
     writeFile: unused,
   };

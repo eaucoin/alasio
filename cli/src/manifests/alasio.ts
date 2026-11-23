@@ -189,6 +189,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     // Its environment's wake topic, which it tells the lake's loader of each transcript it writes on, as that principal.
     ...(lakeRuns(config) ? [{ name: "ALASIO_LAKE_WAKE_TOPIC", value: lakeWakeTopic(environmentName(environment)) }] : []),
     ...(alasio.defaultHarness ? [{ name: "ALASIO_DEFAULT_HARNESS", value: alasio.defaultHarness }] : []),
+    ...(config.harness.bindSessionAhead ? [{ name: "ALASIO_BIND_SESSION_AHEAD", value: "1" }] : []),
     ...(host.enabled && host.workspaceRoot ? [{ name: "ALASIO_WORKSPACE_ROOT", value: host.workspaceRoot }] : []),
     ...(alasio.claude.existingSecret
       ? [{ name: "CLAUDE_CODE_OAUTH_TOKEN", valueFrom: { secretKeyRef: { name: alasio.claude.existingSecret, key: alasio.claude.key } } }]

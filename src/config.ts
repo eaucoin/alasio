@@ -47,6 +47,12 @@ export interface AlasioConfig {
   /** Where alasio's harness pools' pods reach its environment's relay of its Codex login (src/codex/relay.ts). */
   readonly codexLoginUrl: string;
   /**
+   * Whether a session conversation's session is bound as its harness is reserved, beside the
+   * harness's bind, rather than once its turn starts (src/harness/pooled-host.ts): off until it
+   * is measured, as the install configuration's harness.bindSessionAhead says.
+   */
+  readonly bindSessionAhead: boolean;
+  /**
    * alasio's own pod's name, as its Deployment gives it (ALASIO_POD), which it holds its
    * conversations' claims as (src/codex/worker-claims.ts); without it, alasio does not start.
    */
@@ -112,6 +118,7 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     },
     folders: env[ALASIO_GATEWAY_FOLDERS_VARIABLE] === "1",
     codexLoginUrl: requireEnv(env, "ALASIO_CODEX_LOGIN_URL"),
+    bindSessionAhead: env["ALASIO_BIND_SESSION_AHEAD"] === "1",
     pod: requireEnv(env, "ALASIO_POD").trim(),
     inKubernetes: true,
   };
