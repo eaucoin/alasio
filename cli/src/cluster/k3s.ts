@@ -13,7 +13,7 @@ import { type Cluster, KubeConfig, type User, type V1Node, type V1Pod, type V1Ru
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
-import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
+import { CONTAINERD, evictsAndReopensFiles, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
 import type { KubeApi } from "../kube/api.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "./stargz.ts";
 
@@ -176,11 +176,16 @@ const GVISOR_POD_ANNOTATIONS = ["dev.gvisor.internal.restore.*", "dev.gvisor.int
  * k3s's own configuration with the CRI's images pulled through the daemon (./stargz.ts),
  * and a runtime for each release, which runs that release's shim; and each runtime's runsc
  * options, which run that release's runsc, and, where `systemd` runs the machine, place
- * its sandboxes' cgroups through systemd, as kubelet does there. alasio writes them on the
+ * its sandboxes' cgroups through systemd, as kubelet does there; a release at or past
+ * `evictsAndReopensFilesSince` (cluster/node/pins.json's) evicts its gofer's cached files
+ * before a checkpoint's pause and reopens a restore's in parallel. alasio writes them on the
  * machine (the host target), and puts them into each node's container (the cluster in
  * Docker). Pure, for tests.
  */
-export function containerdFiles(releases: readonly string[], { systemd }: { readonly systemd: boolean }): ReadonlyMap<string, string> {
+export function containerdFiles(
+  releases: readonly string[],
+  { systemd, evictsAndReopensFilesSince = pins.gvisor.evictsAndReopensFilesSince }: { readonly systemd: boolean; readonly evictsAndReopensFilesSince?: string },
+): ReadonlyMap<string, string> {
   const optionsPath = (release: string) => `${CONTAINERD}/${gvisorHandler(release)}.toml`;
   const runtime = (release: string) => {
     const table = `plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.${gvisorHandler(release)}`;
@@ -211,6 +216,17 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     "  # touches in its first seconds after a restore are recorded, for its next restore to read first.",
     `  dirty-tracking = "wp"`,
     `  working-set-window = "3s"`,
+    ...(evictsAndReopensFiles(release, evictsAndReopensFilesSince)
+      ? [
+          "  # A checkpoint evicts the files the gofer caches, which it does not save, while the sandbox runs, just before it",
+          "  # pauses it, which then evicts only those cached since: tens of milliseconds out of the pause of a sandbox that",
+          "  # looked many up. A restore reopens the files the checkpoint holds 8 at once, each once its directory is: about",
+          "  # as many lookups as their tree is deep rather than as it has files, each a few milliseconds on a root",
+          "  # filesystem freshly mounted for the restored pod.",
+          `  save-dentry-eviction = "running"`,
+          `  restore-file-parallelism = "8"`,
+        ]
+      : []),
     "  # A checkpoint ends the sandbox's TCP connections through its network device, whose link saves and restores",
     "  # none (fdbased, without SaveRestore): a checkpoint that stops the sandbox aborts and closes each as it saves",
     "  # it, and a live one marks each, to be closed in a sandbox restored from it (the fork's",

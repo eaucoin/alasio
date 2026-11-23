@@ -299,6 +299,15 @@ export const LOADING_SAVE_TEST_TIMINGS_VARIABLE = "ALASIO_LOADING_SAVE_TEST_TIMI
  */
 export const savesWithLoadWait = (release: string, since: string): boolean => releaseAtOrPast(release, since);
 
+/**
+ * Whether gVisor's `release` evicts the files its gofer caches while the sandbox runs, before a
+ * checkpoint pauses it (runsc --save-dentry-eviction=running), rather than in the pause, and
+ * reopens a restore's files several at once (--restore-file-parallelism): one at or past `since`,
+ * the first release that does, as cluster/node/pins.json says it (gvisor.evictsAndReopensFilesSince);
+ * none where `since` names none. One before it knows neither flag, and its runsc refuses them.
+ */
+export const evictsAndReopensFiles = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
 /** The variable that gives the node agent the first gVisor release that bounds a save's wait for pages still loading (savesWithLoadWait). */
 export const SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE = "ALASIO_GVISOR_SAVES_WITH_LOAD_WAIT_SINCE";
 

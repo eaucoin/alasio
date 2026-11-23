@@ -121,6 +121,19 @@ test("where systemd runs the machine, runsc places its sandboxes' cgroups throug
   assert.doesNotMatch(options(false), /systemd/u);
 });
 
+test("a release at or past the first that evicts and reopens files outside the pause and in parallel has runsc do so, and one before it, which knows neither flag, does not", () => {
+  const since = "20261102.0-eaucoin.11";
+  const options = (release: string) => containerdFiles([release], { systemd: false, evictsAndReopensFilesSince: since }).get(`${CONTAINERD}/runsc-${release.replaceAll(".", "-")}.toml`) ?? "";
+  for (const release of [since, "20261102.0-eaucoin.12", "20261109.0-eaucoin.1"]) {
+    assert.match(options(release), /\n {2}save-dentry-eviction = "running"\n {2}restore-file-parallelism = "8"\n/u, release);
+  }
+  for (const release of ["20261102.0-eaucoin.10", "20260921.0-eaucoin.16", "20990101.0"]) {
+    assert.doesNotMatch(options(release), /save-dentry-eviction|restore-file-parallelism/u, release);
+  }
+  // As pinned: the first release that does is past the releases alasio keeps until it is pinned.
+  assert.equal(pins.gvisor.evictsAndReopensFilesSince, since);
+});
+
 test("the gvisor RuntimeClass runs the current release, and each release kept has one of its own, labelled as alasio's", () => {
   const labels = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
   assert.deepEqual(gvisorRuntimeClasses(["21000101.0", "20990101.0"]).map(({ apiVersion, kind, metadata, handler }) => [apiVersion, kind, metadata?.name, metadata?.labels, handler]), [

@@ -14,6 +14,7 @@
     "restoresThroughSocketSince": "20260921.0-eaucoin.9",
     "restoresIntoStandbySince": "20261102.0-eaucoin.5",
     "savesWithLoadWaitSince": "20261102.0-eaucoin.10",
+    "evictsAndReopensFilesSince": "20261102.0-eaucoin.11",
     "releases": [
       {
         "release": "20261102.0-eaucoin.10",
