@@ -3576,7 +3576,7 @@ describe("the sandbox service", () => {
       ]);
       // Under a soft core limit of 0, as bayma's image runs it.
       assert.deepEqual(bayma?.command, ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js"]);
-      assert.deepEqual(bayma?.args?.slice(-6, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"]);
+      assert.deepEqual(bayma?.args?.slice(-8, -2), ["--token-file", "/attach/token", "--telemetry-token-file", "/attach/token", "--checkpoint-reuse", "on"]);
       // Its sessions snapshotted, as main's are by the gateway: held to the nodes' CPU baseline, its bayma holding a stop it is
       // not given for the gateway's save, and its template named by its own hash, which a snapshot taken on it records.
       assert.deepEqual(bayma?.args?.slice(-2), ["--stop-wait-ms", "60000"]);
