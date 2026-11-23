@@ -18,9 +18,9 @@
  * with, or as a release's save of its sandbox has waited on its reads too long (revoke). A
  * request the proxy takes is a GET of an object under that restore's layers prefix, in the
  * snapshots bucket, signed by its token, as the official signer (@smithy/signature-v4) signs
- * it, within SKEW_MS of now, its host, its date, its payload's hash, its range and every header
- * of Amazon's it sends among what it signs, for the bucket's region and S3. Anything else is refused, as S3 refuses it. What it takes, it asks
- * of the bucket again, signed with the agent's own credentials, and streams the answer back
+ * it, within SKEW_MS of now, its host, its date, its payload's hash, its range, the version of
+ * the object it asks for (If-Match), and every header of Amazon's it sends among what it signs, for the bucket's region and S3. Anything else is refused, as S3 refuses it. What it takes, it asks
+ * of the bucket again, for that range and version, signed with the agent's own credentials, and streams the answer back
  * as the bucket gives it, its status and its body, a request its client ends ending the
  * bucket's too.
  *
@@ -418,7 +418,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
     if (!signingDate || amzDate.slice(0, 8) !== day) return { refused: "the request's date is not the one it is signed on" };
     if (Math.abs(Date.now() - signingDate.getTime()) > SKEW_MS) return { refused: `the request's date is more than ${SKEW_MS / 60_000} minutes from now` };
     const signed = signedList.split(";");
-    const required = ["host", "x-amz-date", "x-amz-content-sha256", ...(request.headers.range === undefined ? [] : ["range"])];
+    const required = ["host", "x-amz-date", "x-amz-content-sha256", ...(["range", "if-match"] as const).filter((name) => request.headers[name] !== undefined)];
     const unsigned = [...required, ...Object.keys(request.headers).filter((name) => name.startsWith("x-amz-"))].filter((name) => !signed.includes(name));
     if (unsigned.length > 0) return { refused: `the request does not sign ${[...new Set(unsigned)].join(", ")}` };
     const headers: Record<string, string> = {};
@@ -457,6 +457,7 @@ export const makeStoreProxy = Effect.fnUntraced(function*({
   ): Promise<void> => {
     const headers: Record<string, string> = { host: upstream.host, "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" };
     if (request.headers.range !== undefined) headers["range"] = String(request.headers.range);
+    if (request.headers["if-match"] !== undefined) headers["if-match"] = String(request.headers["if-match"]);
     const signed = await upstreamSigner.sign({ method: "GET", protocol: upstream.protocol, hostname: upstream.hostname, ...(upstream.port === "" ? {} : { port: Number(upstream.port) }), path, query, headers });
     const search = new URLSearchParams(query).toString();
     const asked = (upstream.protocol === "https:" ? httpsRequest : httpRequest)({
