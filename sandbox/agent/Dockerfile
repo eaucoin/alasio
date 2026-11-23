@@ -26,3 +26,6 @@ RUN mkdir -p /tmp/bayma-build \
       node /opt/bayma/bayma.js install-toolbelt \
  && chown -R agent:agent /opt/bayma-data \
  && rm -rf /tmp/bayma-build
+# Measurement only: bayma's hook without Node, as its next image carries it.
+COPY sandbox-hook.c /tmp/sandbox-hook.c
+RUN gcc -O2 -Wall -Wextra -Werror -o /usr/local/bin/bayma-sandbox-hook /tmp/sandbox-hook.c && rm /tmp/sandbox-hook.c
