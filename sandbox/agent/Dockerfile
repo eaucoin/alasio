@@ -26,3 +26,6 @@ RUN mkdir -p /tmp/bayma-build \
       node /opt/bayma/bayma.js install-toolbelt \
  && chown -R agent:agent /opt/bayma-data \
  && rm -rf /tmp/bayma-build
+# Measurement only: bayma's bundle with no runtime collecting as a save ends the sandbox.
+RUN rm -f /opt/bayma/*.js
+COPY bayma-bundle /opt/bayma
