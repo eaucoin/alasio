@@ -1,10 +1,12 @@
 /**
  * The two-sandbox OOM measure (BENCH_MODE=oom): does an OOM above two sessions' sandboxes, as
- * one session's memory grows past what the node's pods may hold, end the other session too?
- * Each trial binds two new sessions on the node, their pods' limits above what the node's pods
- * may hold (test/e2e/harness.ts), so that the kernel's OOM is of the pods' cgroup or the node's,
- * not of a pod's own: B holds 1.5 GiB and charges and frees 4 MiB every 20 ms beside it; A grows
- * by 64 MiB every 80 ms until it is killed. Then whether B's pod runs on, the same pod, its
+ * one session's memory grows past what the cgroup above them may hold, end the other session too?
+ * Each trial binds two new sessions on the node, their pods' limits far above (test/e2e/harness.ts),
+ * and holds the cgroup of the node's Burstable pods, theirs, to what it holds then and HEADROOM
+ * more, so that the kernel's OOM is of that cgroup, above both sandboxes, and not of a pod's own
+ * nor of the node, which a runner's memory filled whole starves before the kernel kills: B holds
+ * 1.5 GiB and charges and frees 4 MiB every 20 ms beside it; A grows by 64 MiB every 80 ms until it
+ * is killed. The cgroup's limit is given back after. Then whether B's pod runs on, the same pod, its
  * process alive, and what the kernel killed and kubelet evicted meanwhile, a line of
  * logs/oom.jsonl a trial. Both sessions are forgotten after.
  */
@@ -17,6 +19,11 @@ import type { CoreV1Event, V1Pod } from "@kubernetes/client-node";
 import { bindSession, gatewayCall, kube, mainToken, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
 import { errorText, forgetWorkspace } from "./alasio.ts";
 import { BENCH_DIR, RUNS } from "./settings.ts";
+
+/** What the Burstable pods' cgroup is held to beyond what it holds as A begins: B's 1.5 GiB and as much again. */
+const HEADROOM_BYTES = 3 * 1024 ** 3;
+/** Where the node's Burstable pods' cgroup is, as kubelet makes it under systemd's driver or cgroupfs's. */
+const BURSTABLE = "$(ls -d /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice /sys/fs/cgroup/kubepods/burstable 2>/dev/null | head -n 1)";
 
 /** How long A may grow before the trial gives up on an OOM. */
 const GROWTH_BOUND_MS = 120_000;
@@ -50,12 +57,19 @@ async function trial(number: number): Promise<Record<string, unknown>> {
   const a = await boundWorkspace();
   try {
     await kube.execOk(SESSIONS, b.pod, ["sh", "-c", `nohup node -e "${HOLDER}" > /tmp/holder.log 2>&1 & sleep 3`], { container: "bayma" });
+    // The Burstable pods' cgroup held to what it holds now and HEADROOM_BYTES more: its limit before, to give back.
+    const limited = (await onNode(b.node, `dir=${BURSTABLE}; before=$(cat "$dir/memory.max"); echo $(( $(cat "$dir/memory.current") + ${HEADROOM_BYTES} )) > "$dir/memory.max"; echo "$dir $before $(cat "$dir/memory.max")"`)).trim();
+    const [cgroup = "", limitBefore = "max", limit = ""] = limited.split(" ");
     const grown = Date.now();
     const ran = await Promise.race([
       kube.exec(SESSIONS, a.pod, ["node", "-e", GROWER], { container: "bayma" }).then((done) => ({ code: done.code, said: done.stderr.slice(-400) }), (error: unknown) => ({ code: null, said: errorText(error).slice(-400) })),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), GROWTH_BOUND_MS)),
     ]);
     const aEndedMs = Date.now() - grown;
+    // One not killed in time ended first, so that it grows no further once the limit is given back.
+    if (ran === null) await kube.kill(SESSIONS, a.pod);
+    await onNode(b.node, `echo ${limitBefore} > ${cgroup}/memory.max`);
+    const events = (await onNode(b.node, `cat ${cgroup}/memory.events`)).trim().split("\n");
     await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     const podOf = async (uid: string, name: string) => {
       const pod = await kube.get<V1Pod>(ref("Pod", name, SESSIONS));
@@ -77,6 +91,7 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       a: { pod: a.pod, ended: ran !== null, exec: ran, ended_ms: aEndedMs, ...aPod },
       b: { pod: b.pod, ...bPod, stamp_age_ms: stampAge },
       b_survived: bPod.there && bPod.phase === "Running" && stampAge !== null && stampAge < 2_000,
+      cgroup: { path: cgroup, limit_before: limitBefore, limit: Number(limit), events },
       kernel,
       evicted,
       took_ms: Date.now() - started,
