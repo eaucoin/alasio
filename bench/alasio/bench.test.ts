@@ -47,7 +47,7 @@ import { emit, emitSpans, type Phase, type Result, store } from "./results.ts";
 import { probeExecMs, type Probed, restore, restoreBefore, restoreOutcome, restoreSpanMetrics } from "./restore.ts";
 import { saveLogged } from "./runsc-log.ts";
 import { awaitSpans, hasSpan, liveDurableMs, releaseDurableMs } from "./spans.ts";
-import { BENCH_DIR, CASES, COMMON, LIVE_SAVES, PAGE_CACHE, PROFILE, RELEASE_UNDER_TEST, RUNS, VARIANT } from "./settings.ts";
+import { BENCH_DIR, CASES, COMMON, IDLE_BEFORE_RELEASE_S, IDLE_BEFORE_SAVES_S, LIVE_SAVES, PAGE_CACHE, PROFILE, RELEASE_UNDER_TEST, RUNS, VARIANT } from "./settings.ts";
 import { storeMeasures } from "./store.ts";
 import { replayTurns } from "./turns.ts";
 
@@ -136,6 +136,9 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     // A chain-N's N - 1 live saves, each a delta of the one before, all but the last written in its details; none of `whole`'s.
     const lives: Record<string, unknown>[] = [];
     for (let saved = 1; saved <= LIVE_SAVES; saved++) {
+      // Left idle first, where the variant says.
+      const idleS = IDLE_BEFORE_SAVES_S[saved - 1] ?? 0;
+      await sleep(idleS * 1000);
       const heldBeforeSave = heldLive;
       await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
       const liveT0 = Date.now();
@@ -145,7 +148,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
       const liveSentBytes = (await storeBytes(node)).sent - liveSent;
       heldLive = await bucketBytes(node, workspace);
       const logged = saveLogged(await bootLog(node, sandboxId));
-      const details = { state_dir: request.live.stateDir, logged: logged.said, gaps, pause_split: logged.split, t0_wall_ms: liveT0, end_wall_ms: Date.now(), restored_before: restoredBefore };
+      const details = { state_dir: request.live.stateDir, logged: logged.said, gaps, pause_split: logged.split, t0_wall_ms: liveT0, end_wall_ms: Date.now(), restored_before: restoredBefore, idle_s: idleS };
       const metrics = {
         unavailable_ms: gaps.max_gap_ms, pause_reported_ms: logged.pauseMs, slowdown: gaps.slowdown, precopy_passes: logged.passes, precopy_bytes: logged.precopyBytes, uploaded_bytes: heldLive - heldBeforeSave,
         kernel_save_ms: logged.kernelMs, memory_save_ms: logged.memoryMs, overall_save_ms: logged.overallMs, store_sent_bytes: liveSentBytes,
@@ -156,7 +159,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
       }
       const imageBytes = checkpointed.manifest.layers[0]?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null;
       if (saved < LIVE_SAVES) {
-        lives.push({ ...metrics, save_total_ms: checkpointed.ms, image_bytes: imageBytes, chain: checkpointed.manifest.layers.length, snapshot: checkpointed.manifest.snapshot });
+        lives.push({ ...metrics, save_total_ms: checkpointed.ms, image_bytes: imageBytes, chain: checkpointed.manifest.layers.length, snapshot: checkpointed.manifest.snapshot, idle_s: idleS });
         continue;
       }
       hold({
@@ -167,6 +170,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     }
 
     phase = "save-stop";
+    await sleep(IDLE_BEFORE_RELEASE_S * 1000);
     const stopT0 = Date.now();
     const stopSent = (await storeBytes(node)).sent;
     const released = await release(workspace);
@@ -195,6 +199,7 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
       details: {
         snapshot: manifest.snapshot, runsc_checkpoint_ms: manifest.pauseMs, upload_ms: manifest.uploadMs, chain: manifest.layers.length, bytes: manifest.bytes, compacted_from: manifest.compactedFrom ?? null,
         compaction_due: compactionDue(manifest.layers) !== null, logged: stopLogged.said, pause_split: stopLogged.split, t0_wall_ms: stopT0, end_wall_ms: Date.now(),
+        idle_s: IDLE_BEFORE_RELEASE_S,
       },
     }, stopT0, Date.now());
     await gone(request.pod);
