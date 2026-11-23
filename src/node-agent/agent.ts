@@ -126,6 +126,7 @@ import {
   LOADING_STALL_SECONDS,
   RESTORE_RUNNING_WAIT_MS,
   restoresFromBucket,
+  restoresWithETags,
   runscVersion,
   SAVE_HOOK_SECONDS,
   SAVE_LOAD_WAIT_SECONDS,
@@ -788,6 +789,8 @@ export interface NodeAgentOptions {
   readonly savesWithLoadWaitSince: string;
   /** The first gVisor release that writes a checkpoint's summary (savesSummary), which describes its image; none where empty. */
   readonly savesSummarySince: string;
+  /** The first gVisor release that checks a restore's files in the bucket itself (restoresWithETags); none where empty. */
+  readonly restoresWithETagsSince: string;
   /**
    * How long a save of a release that bounds it waits for pages still loading, in seconds
    * (SAVE_LOAD_WAIT_SECONDS unless told), and how long a workspace's release saves may have been
@@ -1164,6 +1167,15 @@ async function syncImage(directory: string): Promise<void> {
   await syncPath(dirname(directory), true);
 }
 
+/**
+ * The ETag of each file of a snapshot's images `layers`, as the bucket answered its upload, by
+ * the path its restore's checkpoint gofer reads it at: its own image's by their own, the
+ * others' under `layers/<digest>/`, as runsc names a layer's files.
+ */
+function etagsOf(layers: readonly Layer[]): Record<string, string> {
+  return Object.fromEntries(layers.flatMap(({ digest, files }, index) => files.map(({ path, etag }) => [index === 0 ? path : `${LAYERS_DIR}/${digest}/${path}`, etag])));
+}
+
 /** Whether `found`, an image's files on the disk, are `layer`'s. */
 const sameFiles = (found: readonly ImageFile[], layer: Layer): boolean =>
   JSON.stringify(found) === JSON.stringify(layer.files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })));
@@ -1206,7 +1218,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, restoresWithETagsSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -2314,9 +2326,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * bucket with `token`, the restore's own, which reads that prefix alone: by the agent's
    * pod's address, or by the proxy's socket on the node, as `transport` says; GOFER_READ_PARALLEL
    * reads at once; reading again, for as long as the sandbox runs, the pages a read of failed,
-   * where `pagesRetry`.
+   * where `pagesRetry`; asking the bucket for each file as `etags` says it was put, where given
+   * (etagsOf).
    */
-  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken, transport: Transport, pagesRetry: boolean): string =>
+  const goferOptions = (ref: WorkspaceRef, own: string, { accessKeyId, secretAccessKey }: StoreToken, transport: Transport, pagesRetry: boolean, etags: Readonly<Record<string, string>> | null): string =>
     JSON.stringify({
       ...(transport === "socket" && storeProxy.socket !== null ? { endpoint: STORE_SOCKET_ENDPOINT, socket: storeProxy.socket } : { endpoint: storeProxy.endpoint }),
       region: storeProxy.region,
@@ -2327,6 +2340,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       credentials: { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
       read_parallel: GOFER_READ_PARALLEL,
       ...(pagesRetry ? { pages_retry: "while-running" } : {}),
+      ...(etags === null ? {} : { etags }),
     });
 
   /**
@@ -2491,9 +2505,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             Effect.tapErrorTag("SnapshotCorrupt", () => cache.clear(environment, workspace).pipe(Effect.ignore)),
           );
         }
-        if (imagePath === null) {
-          // Read as the restore goes, each of its images must be in the bucket as it was put: the files of all of them
-          // looked at together, as a chain's are many, and each look a round trip to the store.
+        // Read as the restore goes, each of its images must be in the bucket as it was put. A release that checks so itself
+        // (restoresWithETags) is told each file's ETag, and fails the restore before its sandbox runs where one is not;
+        // under another, the files of all of them are looked at together, as a chain's are many, and each look a round trip to
+        // the store.
+        const checked = restoresWithETags(release, restoresWithETagsSince);
+        if (imagePath === null && !checked) {
           const [missing] = yield* notInBucket(ref, manifest.layers).pipe(step("alasio.node_agent.prepare.heads", ref));
           if (missing !== undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${missing.digest} is not in the bucket as it was put` });
         }
@@ -2505,7 +2522,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const transport: Transport = gofer?.transport === "socket" && storeProxy.socket !== null ? "socket" : "tcp";
           const token = yield* Effect.sync(() => storeProxy.mint(prefixOf(ref), `${prefixOf(ref)}/${LAYERS_DIR}/`, transport)).pipe(step("alasio.node_agent.prepare.token", ref));
           if (token === null) return yield* new AgentStopping({ environment, workspace });
-          const options = goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false);
+          const options = goferOptions(ref, own.digest, token, transport, gofer?.pagesRetry ?? false, checked ? etagsOf(manifest.layers) : null);
           imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, options).pipe(
             Effect.tap(() => expectPages(ref, snapshot, token.accessKeyId, release, options)),
             step("alasio.node_agent.prepare.gofer", ref),

@@ -45,6 +45,7 @@ import {
   POD_IP_VARIABLE,
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SAVES_SUMMARY_SINCE_VARIABLE,
+  RESTORES_WITH_ETAGS_SINCE_VARIABLE,
   SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
 } from "../../../src/node-agent/names.ts";
@@ -159,6 +160,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               { name: SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE, value: NODE_PINS.gvisor.savesWithLoadWaitSince },
               { name: SAVES_SUMMARY_SINCE_VARIABLE, value: NODE_PINS.gvisor.savesSummarySince },
+              { name: RESTORES_WITH_ETAGS_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresWithETagsSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               // How long a release's save of a sandbox its restore from the bucket still reads may see no byte of it served (src/node-agent/agent.ts).
               { name: LOADING_STALL_SECONDS_VARIABLE, value: String(durationSeconds(sessions.snapshots.loadingStallWait) ?? 0) },
