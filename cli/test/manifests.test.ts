@@ -223,7 +223,7 @@ describe("configuration", () => {
     assert.equal(config.sessions.namespace, "alasio-sessions");
     assert.equal(config.sessions.runtimeClassName, "gvisor");
     assert.equal(config.host.enabled, false);
-    assert.equal(config.harness.bindSessionAhead, false);
+    assert.equal(config.harness.bindSessionAhead, true);
     assert.deepEqual(config.neon.safekeepers.scaling, { min: 3, max: 3 });
     assert.equal(config.neon.image.digest, "sha256:166022a72bf9983eba96d061d794f4740edbd4c3301e66202c1180acce9a323c");
     assert.deepEqual(config.alasio.resources, { requests: { cpu: "250m", memory: "768Mi" }, limits: { memory: "8Gi" } });
@@ -535,10 +535,10 @@ describe("alasio", () => {
     assert.deepEqual(folders(install({ host: { enabled: true } })), { name: "ALASIO_GATEWAY_FOLDERS", value: "1" });
   });
 
-  test("tells alasio to bind a session conversation's session as its harness is reserved only where the configuration says so, as it does not by default", () => {
+  test("tells alasio to bind a session conversation's session as its harness is reserved, as it does by default, but where the configuration says not to", () => {
     const ahead = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_BIND_SESSION_AHEAD");
-    assert.equal(ahead(install()), undefined);
-    assert.deepEqual(ahead(install({ harness: { bindSessionAhead: true } })), { name: "ALASIO_BIND_SESSION_AHEAD", value: "1" });
+    assert.deepEqual(ahead(install()), { name: "ALASIO_BIND_SESSION_AHEAD", value: "1" });
+    assert.equal(ahead(install({ harness: { bindSessionAhead: false } })), undefined);
   });
 });
 

@@ -48,8 +48,8 @@ export interface AlasioConfig {
   readonly codexLoginUrl: string;
   /**
    * Whether a session conversation's session is bound as its harness is reserved, beside the
-   * harness's bind, rather than once its turn starts (src/harness/pooled-host.ts): off until it
-   * is measured, as the install configuration's harness.bindSessionAhead says.
+   * harness's bind, rather than once its turn starts (src/harness/pooled-host.ts), as the install
+   * configuration's harness.bindSessionAhead says.
    */
   readonly bindSessionAhead: boolean;
   /**

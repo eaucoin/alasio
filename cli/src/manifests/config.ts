@@ -481,9 +481,10 @@ const Harness = Schema.Struct({
   folder: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "3Gi" } }) }), {}),
   /**
    * Whether a session conversation's session is bound as its harness's pod is, the two at once,
-   * rather than once its harness is bound (src/harness/pooled-host.ts): off until it is measured.
+   * rather than once its harness is bound (src/harness/pooled-host.ts): so a released session's
+   * restore and its harness's pod overlap, which shortens such a turn's wait by the harness's bind.
    */
-  bindSessionAhead: defaulted(Schema.Boolean, false),
+  bindSessionAhead: defaulted(Schema.Boolean, true),
 });
 
 /** The bayma the host profile's folder instances run, as this release pins it. */
