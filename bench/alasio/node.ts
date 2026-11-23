@@ -175,10 +175,12 @@ export async function bootLogs(node: string): Promise<void> {
     if (!/^[a-z0-9-]+$/u.test(flag) || !/^[A-Za-z0-9_./-]+$/u.test(value)) throw new Error(`BENCH_RUNSC_CONFIG names ${pair}, no flag:value`);
     return `  ${flag} = "${value}"\\n`;
   });
+  // Spike: a flag the options set already, as working-set-window, set to the setting's value instead.
+  const unset = (process.env["BENCH_RUNSC_CONFIG"] ?? "").split(",").filter(Boolean).map((pair) => `sed -i '/^  ${pair.split(":")[0] ?? ""} = /d' `);
   for (const { release } of NODE_PINS.gvisor.releases) {
     const options = `${CONTAINERD}/${gvisorHandler(release)}.toml`;
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
-    await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n${flags.join("")}' >> ${options}; tail -n ${4 + flags.length} ${options}`);
+    await onNode(node, `grep -q '^  debug-log' ${options} || { ${unset.map((sed) => `${sed}${options}; `).join("")}printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n${flags.join("")}' >> ${options}; }; tail -n ${4 + flags.length} ${options}`);
   }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));

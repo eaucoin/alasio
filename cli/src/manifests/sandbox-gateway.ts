@@ -232,7 +232,13 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         // of GBs, would be left in the session's workspace. Its node without V8's memory reducer,
         // as bayma's own entrypoint runs it, its garbage collected by bayma as a save ends its
         // sandbox (--expose-gc), never between execs.
-        command: ["/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "--no-memory-reducer", "--expose-gc", "/opt/bayma/bayma.js"],
+        // Spike: node's flags as the benchmark's settings ask, BENCH_SERVER_NODE_FLAGS before the others, and V8's
+        // memory reducer on with BENCH_SERVER_REDUCER=on.
+        command: [
+          "/usr/bin/prlimit", "--core=0:", "--", "/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node",
+          ...(process.env["BENCH_SERVER_NODE_FLAGS"] ?? "").split(" ").filter(Boolean),
+          ...(process.env["BENCH_SERVER_REDUCER"] === "on" ? [] : ["--no-memory-reducer"]), "--expose-gc", "/opt/bayma/bayma.js",
+        ],
         args: [
           "mcp-http",
           "--host",

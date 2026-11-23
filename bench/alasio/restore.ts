@@ -5,6 +5,8 @@
  * counters, the sandbox's boot log, and, of the `trace` variant, the pod's own steps as kubelet
  * says them. What alasio's spans say of it is read once the run is over (withSpans).
  */
+import { appendFileSync, writeFileSync } from "node:fs";
+
 import type { V1Pod } from "@kubernetes/client-node";
 
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
@@ -19,7 +21,7 @@ import { bootLog, diskReadBytes, podMemory, sandboxIdOf, storeBytes, storeQuiet 
 import type { Metrics } from "./results.ts";
 import { restoreLogged } from "./runsc-log.ts";
 import { compactionAtT0, resumeSteps, type Span } from "./spans.ts";
-import { PAGE_CACHE, VARIANT } from "./settings.ts";
+import { BENCH_DIR, PAGE_CACHE, VARIANT } from "./settings.ts";
 
 /** What the driver's probe says of a restore (bench/common/driver/driver.ts probe). */
 export interface Probed {
@@ -78,7 +80,12 @@ export async function restore(node: string, workspace: string, sessionId: string
   };
   // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
   const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
-  const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
+  const sandboxId = await sandboxIdOf(node, name);
+  const logged = restoreLogged(await bootLog(node, sandboxId), standby);
+  // Spike: which sandbox's boot log (logs/runsc-boot-logs.tar.zst) is this restore's, cut at its first exec's
+  // answer, and what bayma's server printed (its --trace-gc lines), on the wall clock.
+  appendFileSync(`${BENCH_DIR}/logs/restores-index.jsonl`, `${JSON.stringify({ kind, run_id: runId, fixture, pod: name, sandbox_id: sandboxId, standby, t0_wall_ms: probed.t0_wall_ms, first_exec_ms: probed.first_exec_ms })}\n`);
+  writeFileSync(`${BENCH_DIR}/logs/podlog-${kind}-${runId}.txt`, await onNode(node, `k3s kubectl logs --namespace ${SESSIONS} ${name} --container bayma --timestamps 2>&1 || true`));
   const { line: prepared, snapshot: restoredSnapshot } = await preparedLine(node, workspace, manifest.snapshot);
   const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${restoredSnapshot}`);
   const logs = await loggedOf(node, workspace);
