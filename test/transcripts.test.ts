@@ -161,12 +161,12 @@ describe("claude transcripts against the store", () => {
     const sessionId = randomUUID();
     const { projectKey, main } = writeLocal(dir, sessionId, []);
     const key = { projectKey, sessionId };
-    // Turns of 64 KiB, as a tool's output makes them, each stored in brief, as matching by
+    // Turns of 96 KiB, as a tool's output makes them, each stored in brief, as matching by
     // uuid reads no more of them, with the metadata Claude Code writes again on each.
-    const turn = (n: number) => message(`00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, `${n} `.padEnd(64 * 1024, "x"));
+    const turn = (n: number) => message(`00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, `${n} `.padEnd(96 * 1024, "x"));
     const prompt = (n: number) => ({ type: "last-prompt", lastPrompt: `prompt ${n}`, sessionId });
     const turns = Array.from({ length: 4096 }, (_, n) => n);
-    // The first megabyte of turns not stored, so they are appended as the rest is read.
+    // The first turns not stored, so they are appended as the rest is read.
     const unstored = 16;
     await store.append(key, turns.flatMap((n) => [...(n < unstored ? [] : [{ ...turn(n), message: { role: "user", content: "brief" } }]), prompt(n)]));
     const file = openSync(main, "w");
@@ -174,9 +174,10 @@ describe("claude transcripts against the store", () => {
     // And what the mirror dropped.
     writeSync(file, `${JSON.stringify(message("99999999-9999-4999-8999-999999999999", "dropped"))}\n${JSON.stringify({ type: "cost-state", totalCostUSD: 1 })}\n`);
     closeSync(file);
-    assert.ok(statSync(main).size > 256 * 1024 ** 2);
+    assert.ok(statSync(main).size > 384 * 1024 ** 2);
 
-    // The reconcile in a process of its own, as the harness runs it, its heap limited to a quarter of the transcript.
+    // The reconcile in a process of its own, as the harness runs it, its heap limited to a quarter of the transcript: some
+    // 30 MB of it are the modules it loads and what it matches by, and a thousand lines read ahead would be 96 MB more.
     const script = [
       'import { Effect } from "effect";',
       'import pg from "pg";',
@@ -190,7 +191,7 @@ describe("claude transcripts against the store", () => {
       `await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId: ${JSON.stringify(sessionId)}, workingDirectory: ${JSON.stringify(dir)} }] }));`,
       "await pool.end();",
     ].join("\n");
-    await promisify(execFile)(process.execPath, ["--max-old-space-size=64", "--input-type=module", "-e", script], { cwd: new URL("..", import.meta.url).pathname, env: { ...process.env, CLAUDE_CONFIG_DIR: home } });
+    await promisify(execFile)(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-e", script], { cwd: new URL("..", import.meta.url).pathname, env: { ...process.env, CLAUDE_CONFIG_DIR: home } });
 
     const stored = (await store.load(key)) ?? [];
     assert.equal(stored.length, 2 * turns.length + 2);
