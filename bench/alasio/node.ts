@@ -58,6 +58,17 @@ export async function podMemory(node: string, uid: string): Promise<{ readonly p
   return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 } };
 }
 
+/** Spike: the CPU time, in microseconds, that the pod of `uid` on `node` has used, as its cgroup's cpu.stat says; null where it has no cgroup. */
+export async function podCpuUsec(node: string, uid: string): Promise<number | null> {
+  const printed = await onNode(node, [
+    `dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${uid}*' -o -name '*pod${uid.replaceAll("-", "_")}*' \\) | head -n 1)`,
+    `[ -n "$dir" ] || exit 0`,
+    `grep '^usage_usec ' "$dir/cpu.stat"`,
+  ].join("; "));
+  const value = printed.split(" ")[1];
+  return value === undefined ? null : Number(value);
+}
+
 /**
  * The bytes that moved between the node agents' network and the store, as counted by
  * the rules countStore puts in the agent's network namespace on `node`: sent to it and received

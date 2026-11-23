@@ -38,11 +38,11 @@ import { gvisorDirectory, RUNSC_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { dumpClusterState, kube, nodeAgents, onNode, SESSIONS, setUp, tearDown } from "../../test/e2e/harness.ts";
 import {
-  agentApi, agentOk, checkpointRequest, coldCaches, driver, endUnsaved, errorText, forgetWorkspace, gone, liveCheckpoint, loggedOf, msBetween, newSession, now, release, sleep,
+  agentApi, agentOk, checkpointRequest, coldCaches, driver, endUnsaved, errorText, forgetWorkspace, gone, liveCheckpoint, loggedOf, msBetween, newSession, now, podNamed, release, sleep,
   standbyArm, standbyFor,
 } from "./alasio.ts";
 import { mixedLoad } from "./mixed.ts";
-import { bootLog, bootLogs, bucketBytes, countStore, dropPageCache, inAgentNetwork, k3sReady, probeStore, sandboxIdOf, sayK3sRestarted, sayRunner, shapeAgents, storeBytes, vacuum } from "./node.ts";
+import { bootLog, bootLogs, bucketBytes, countStore, dropPageCache, inAgentNetwork, k3sReady, podCpuUsec, probeStore, sandboxIdOf, sayK3sRestarted, sayRunner, shapeAgents, storeBytes, vacuum } from "./node.ts";
 import { emit, emitSpans, type Phase, type Result, store } from "./results.ts";
 import { probeExecMs, type Probed, restore, restoreBefore, restoreOutcome, restoreSpanMetrics } from "./restore.ts";
 import { saveLogged } from "./runsc-log.ts";
@@ -122,10 +122,19 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     // Spike (A/B): BENCH_EXEC_RUNNING=probe (the probe, its verify reading every page), first (its first exec alone), off (none).
     const asked = process.env["BENCH_EXEC_RUNNING"] ?? "probe";
     if (asked !== "probe") {
+      // Spike: the session's pod's CPU time as the exec runs and while it idles after (runsc's recording costs).
+      const { node: on, request: { pod: podName } } = await checkpointRequest(workspace);
+      const uid = (await podNamed(podName)).metadata?.uid ?? "";
+      const cpu0 = await podCpuUsec(on, uid);
+      const t0 = Date.now();
       if (asked === "first" || asked === "first-wait") await driver(workspace, "first", "--session", sessionId, "--fixture", fixture);
+      const execMs = Date.now() - t0;
+      const cpu1 = await podCpuUsec(on, uid);
       // Spike: the exec then 60 s before the saves, as a session idle a while after its last exec.
       if (asked === "first-wait" || asked === "off-wait") await new Promise((resolve) => setTimeout(resolve, 60_000));
-      held.push({ result: { fixture, sizeMib, run, phase: "exec-running", ok: true, failure: null, metrics: {}, details: { k3s, exec_running: asked } }, fromMs: Date.now(), toMs: Date.now() });
+      const cpu2 = await podCpuUsec(on, uid);
+      const ms = (a: number | null, b: number | null) => (a === null || b === null ? null : (b - a) / 1000);
+      held.push({ result: { fixture, sizeMib, run, phase: "exec-running", ok: true, failure: null, metrics: { exec_running_ms: asked === "off" || asked === "off-wait" ? null : execMs }, details: { k3s, exec_running: asked, exec_cpu_ms: ms(cpu0, cpu1), idle_cpu_ms: ms(cpu1, cpu2) } }, fromMs: Date.now(), toMs: Date.now() });
     }
     const running = asked !== "probe" ? null : await driver<Probed>(workspace, "probe", "--session", sessionId, "--fixture", fixture, "--run-id", runId);
     if (running !== null) 
