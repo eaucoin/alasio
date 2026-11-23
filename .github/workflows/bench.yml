@@ -167,6 +167,10 @@ jobs:
           total=$(jq --slurp 'length' "$BENCH_DIR/results.jsonl")
           echo "$failed of $total lines failed"
           [ "$failed" -eq 0 ] || { jq --compact-output 'select(.ok | not) | {fixture, size_mib, run, phase, failure}' "$BENCH_DIR/results.jsonl" | head -n 40; echo "::error::$failed of $total lines failed"; exit 1; }
+      # Spike: every sandbox's boot log, as runsc wrote it (bench/alasio/node.ts bootLogs).
+      - name: Keep the boot logs
+        if: always()
+        run: sudo tar -C /var/log -cf - runsc 2>/dev/null | zstd -q >"$BENCH_DIR/logs/runsc-boot-logs.tar.zst" || true
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
