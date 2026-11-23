@@ -479,6 +479,11 @@ const Harness = Schema.Struct({
   ),
   session: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "100m", memory: "384Mi" }, limits: { memory: "1536Mi" } }) }), {}),
   folder: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "3Gi" } }) }), {}),
+  /**
+   * Whether a session conversation's session is bound as its harness's pod is, the two at once,
+   * rather than once its harness is bound (src/harness/pooled-host.ts): off until it is measured.
+   */
+  bindSessionAhead: defaulted(Schema.Boolean, false),
 });
 
 /** The bayma the host profile's folder instances run, as this release pins it. */

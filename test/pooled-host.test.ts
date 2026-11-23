@@ -184,7 +184,7 @@ test("alasio reaches each conversation's pooled host through the front, a token 
     try {
       // Each bayma's bearer held to the binding its bind answered with.
       const heldTo: unknown[] = [];
-      const sessions = { ensureSession: (volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: { Authorization: `Bearer session-${volumeId}` } } })) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: (volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: { Authorization: `Bearer session-${volumeId}` } } })) } as unknown as SessionSandboxes["Service"];
       // A folder's bind that waits a while, saying on what, then is bound: what the turn's status read meanwhile.
       const waitedOn: (string | null)[] = [];
       const folders = {
@@ -291,7 +291,7 @@ test("a turn's reservation binds its conversation's harness ahead, asked again w
   const scope = Effect.runSync(Scope.make());
   try {
     const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
-    const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+    const sessions = { bindSession: () => Effect.void, ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
     const hostOn = async (url: string) =>
       Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
@@ -333,6 +333,67 @@ test("a turn's reservation binds its conversation's harness ahead, asked again w
   }
 });
 
+/**
+ * A session conversation's turn, reserved then started, its harness's pool slow to bind it (a
+ * BIND_RETRY), on a host binding sessions ahead or not, of the chat `chatId`: what the turn's
+ * session was asked, in order, and when; when the reservation was asked and made; and the turn's bayma.
+ */
+async function sessionTurn(chatId: string, bindSessionAhead: boolean) {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId, user: { id: Number(chatId) } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  await run(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));
+  const started: TurnStart[] = [];
+  const scope = Effect.runSync(Scope.make());
+  try {
+    const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
+    // The harness's pool has no pod serving for it at first: bound only once asked again, a BIND_RETRY on.
+    const stand = await front(port, { refusals: [{ error: `harness:${conversationId} could not be bound now`, reason: "it waited for its pod to serve" }] });
+    try {
+      // When the session's bind began and ended, and its bayma asked for with the harness's binding, after.
+      const steps: (readonly [string, number])[] = [];
+      const sessions = {
+        bindSession: (volumeId: string) => Effect.andThen(Effect.sync(() => void steps.push([`bind ${volumeId}`, Date.now()])), Effect.sleep(300)).pipe(Effect.andThen(Effect.sync(() => void steps.push([`bound ${volumeId}`, Date.now()])))),
+        ensureSession: (volumeId: string, held: { readonly binding: string }) => Effect.sync(() => (steps.push([`endpoint ${volumeId} ${held.binding}`, Date.now()]), { bayma: { url: "http://gateway/mcp", headers: { Authorization: `Bearer session-${volumeId}` } } })),
+      } as unknown as SessionSandboxes["Service"];
+      const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME }, bindSessionAhead }).pipe(
+        Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
+      )).pipe(Scope.provide(scope))), HarnessHost);
+      const epoch = await run(store.claimTurn({ conversationId, chatId, messageId: "1", sessionId: null, harness: CODEX_HARNESS, prompt: "go" }));
+      const asked = Date.now();
+      let reservedAt = 0;
+      const answer = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        assert.equal(yield* host.reserve(conversationId), true);
+        reservedAt = Date.now();
+        return yield* host.startTurn({ conversationId, chatId, messageId: "1", harness: CODEX_HARNESS, workingDirectory: sessionFsWorkspace("fs-abc123"), prompt: "go", fileIds: [], resumeSession: null, modelChoice: null, epoch, jobId: null, attachedTurn: null });
+      })));
+      assert.equal(answer.pendingResponseId, "pending-1");
+      return { steps, asked, reservedAt, bayma: started.at(-1)?.bayma };
+    } finally {
+      stand.close();
+    }
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+  }
+}
+
+test("a session conversation's session is bound as its harness is reserved, beside its harness's bind, where sessions are bound ahead, and its turn given the session's bayma once both are", async () => {
+  const { steps, asked, reservedAt, bayma } = await sessionTurn("48", true);
+  assert.deepEqual(steps.map(([step]) => step), ["bind fs-abc123", "bound fs-abc123", "endpoint fs-abc123 binding-1"]);
+  // Its bind began as the reservation did, and was through long before the harness's bind was.
+  const [[, bindAt = 0] = [], [, boundAt = 0] = []] = steps;
+  assert.ok(bindAt - asked < 500, `the session's bind began ${bindAt - asked} ms after the reservation`);
+  assert.ok(boundAt < reservedAt - 1_000, `the session was bound ${reservedAt - boundAt} ms before the harness`);
+  assert.deepEqual(bayma, { endpoint: { url: "http://gateway/mcp", headers: { Authorization: "Bearer session-fs-abc123" } }, notice: null });
+});
+
+test("a session conversation's session is bound only as its turn starts where sessions are not bound ahead, as by default", async () => {
+  const { steps, reservedAt } = await sessionTurn("49", false);
+  assert.deepEqual(steps.map(([step]) => step), ["endpoint fs-abc123 binding-1"]);
+  const [[, endpointAt = 0] = []] = steps;
+  assert.ok(endpointAt >= reservedAt, "the session was asked for before its harness was reserved");
+});
+
 test("a turn whose harness is bound anew after its reservation, its pod gone, runs on the new binding's pod with that binding's grant and bayma, never the old one's", async () => {
   const schema = newSchema();
   const store = await testStore({ schema });
@@ -347,7 +408,7 @@ test("a turn whose harness is bound anew after its reservation, its pod gone, ru
     const stand = await front(port, { movesOn: HOST_PATHS.turns });
     try {
       const heldTo: unknown[] = [];
-      const sessions = { ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
@@ -391,7 +452,7 @@ test("a reservation the host refuses, as another holds its conversation, leaves 
     const stand = await front(port);
     try {
       const heldTo: unknown[] = [];
-      const sessions = { ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: (_volumeId: string, held: unknown) => Effect.sync(() => (heldTo.push(held), { bayma: { url: "http://gateway/mcp", headers: {} } })) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
@@ -455,7 +516,7 @@ test("a Codex turn's token for alasio's relay is renewed as it runs; alasio, the
     const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started, { renewed, turnMs: 1_000 })).pipe(Scope.provide(scope)));
     const stand = await front(port);
     try {
-      const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME, renewMs: 300 } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
@@ -510,7 +571,7 @@ test("a refresh of the Codex login under way as the turn it is kept fresh for is
     const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
     const stand = await front(port);
     try {
-      const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: RELAY.url, home: CODEX_HOME } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);
@@ -547,7 +608,7 @@ test("a Codex turn whose login is refused fails saying to log in again, started 
     const { port } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
     const stand = await front(port);
     try {
-      const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
       const refused = Layer.succeed(CodexLoginFreshness, CodexLoginFreshness.of({ fresh: Effect.fail(new CodexLoginRefused()) }));
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: "http://alasio-codex-login:4320/v1", home: CODEX_HOME } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), refused, Layer.succeed(SessionSandboxes, sessions))),
@@ -580,7 +641,7 @@ test("a Codex turn starts once its environment's relay of its Codex login answer
     const { port: podPort } = await Effect.runPromise(Effect.provideService(serveHost({ port: 0, host: "127.0.0.1", conversationId, token: "host-token", given: givenTo(started) }), HarnessHost, podHost(started)).pipe(Scope.provide(scope)));
     const stand = await front(podPort);
     try {
-      const sessions = { ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
+      const sessions = { bindSession: () => Effect.void, ensureSession: () => Effect.succeed({ bayma: { url: "http://gateway/mcp", headers: {} } }) } as unknown as SessionSandboxes["Service"];
       const host = Context.get(await Effect.runPromise(Layer.build(pooledHarnessHost({ url: stand.url, environment: "main", callerKey: CALLER_KEY, codexLogin: { url: `http://127.0.0.1:${port}/v1`, home: CODEX_HOME } }).pipe(
         Layer.provide(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Harnesses, harnesses), loginFreshness(store), Layer.succeed(SessionSandboxes, sessions))),
       )).pipe(Scope.provide(scope))), HarnessHost);

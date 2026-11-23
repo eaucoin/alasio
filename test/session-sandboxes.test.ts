@@ -76,6 +76,27 @@ test("a session is brought up bound to a pod of the internet alasio records, non
   assert.equal(failed._tag === "GatewayError" && failed.status, 503);
 });
 
+test("a session is bound alone, as ensureSession binds it, a branch's inherited one forked first, its bayma reached nowhere", async () => {
+  const stand = gateway();
+  const recorded: string[] = [];
+  const modes = new Map<string, NetMode>();
+  const inherit: Inheritance = {
+    fork: (volumeId) => Effect.sync(() => (recorded.push(`fork ${volumeId}`), "full" as const)),
+    record: (volumeId, netMode) => Effect.sync(() => (recorded.push(`record ${volumeId} ${netMode}`), void modes.set(volumeId, netMode))),
+  };
+  const sessions = makeSessionSandboxes({ environment: GATEWAY.environment, proxy: { reach: () => Effect.die("no bayma is reached") }, stateDir: "/state", netModeOf: (volumeId) => Effect.succeed(modes.get(volumeId) ?? null), inherit, workspaces: stand });
+  await run(sessions.bindSession("fs-parent1"));
+  assert.deepEqual(recorded, ["fork fs-parent1", "record fs-parent1 full"]);
+  assert.deepEqual(stand.asked, ["quota fs-parent1", "bind fs-parent1 full"]);
+  // One whose bind the gateway refuses: its refusal.
+  const refusing = makeSessionSandboxes({ environment: GATEWAY.environment, proxy: loopback, stateDir: "/state", netModeOf: () => Effect.succeed(null), workspaces: gateway({ refuse: new Map([["bind", 503]]) }) });
+  const failed = await run(Effect.flip(refusing.bindSession("fs-plain1")));
+  assert.equal(failed._tag === "GatewayError" && failed.status, 503);
+  // Of a name that is none: refused, nothing asked.
+  await assert.rejects(run(sessions.bindSession("../etc")));
+  assert.equal(stand.asked.length, 2);
+});
+
 test("a branch's session it inherited, not here yet, is forked from its parent's first, and recorded with the internet its parent says; one here is not, nor one its parent has not", async () => {
   const stand = gateway({ there: new Set(["fs-here01"]) });
   const recorded: string[] = [];

@@ -16,7 +16,9 @@
  * reach the pod bound then, given the binding's grant (./grant.ts), kept as the conversation's
  * as it is bound, which the pod reaches the conversation's rows by and no other's. Each turn
  * is given its workspace's bayma as alasio brings it up, as the host there has no key to
- * (TurnStart.bayma): a session's, a branch's inherited session forked first; a folder
+ * (TurnStart.bayma): a session's, a branch's inherited session forked first, and, where sessions
+ * are bound ahead, bound as the reservation binds the harness, beside it, so its restore and the
+ * pool's pod overlap; a folder
  * instance's, bound, what a long
  * bind of it waits on said in the turn's status, its chat told of a bind that failed. Its
  * bearer stops at no time, but is held to the binding of the conversation's harness the bind
@@ -34,7 +36,7 @@
  * since it is alasio that takes the turn's answer to its chat. The operator's panels are alasio's (./panels.ts): a fork of a session, and a thread's
  * goals, of the conversation's pod, bound ahead for them (forkSession, goals).
  */
-import { Clock, Effect, Layer, Option, Result, Schedule, Schema } from "effect";
+import { Clock, Effect, Fiber, Layer, Option, Result, Schedule, Schema } from "effect";
 
 import { type HeldTo, mintToken } from "../binder/tokens.ts";
 import { codexConfiguration } from "../codex/configuration.ts";
@@ -95,10 +97,12 @@ export interface PooledHostOptions {
   readonly codexLogin: { readonly url: string; readonly home: string; readonly renewMs?: number };
   /** Tells the lake's loader of what a pod committed, as each turn of its ends, the pod telling it nothing itself; nothing where none is given. */
   readonly written?: (() => void) | undefined;
+  /** Whether a session conversation's session is bound as its harness is reserved (sessionBound), rather than once its turn starts: not unless given. */
+  readonly bindSessionAhead?: boolean | undefined;
 }
 
 /** The host of each conversation, bound in its harness's pool, as the module says. */
-export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {} }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | CodexLoginFreshness> =>
+export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, written = () => {}, bindSessionAhead = false }: PooledHostOptions): Layer.Layer<HarnessHost, never, Store | CodexLoginFreshness> =>
   Layer.effect(
     HarnessHost,
     Effect.gen(function*() {
@@ -118,6 +122,8 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
           }));
       /** The binding of each conversation's harness its reservation bound ahead, while it is reserved: what its turn's bayma is held to. */
       const reserved = new Map<string, HeldTo>();
+      /** The bind of each reserved conversation's session its reservation began, beside its harness's (sessionBound), which its turn waits for. */
+      const sessionBinds = new Map<string, Fiber.Fiber<unknown>>();
       /** A conversation bound nowhere: nothing runs in it, since ever, and a hold of the store's keeps it as it would anywhere. */
       const unbound = (conversationId: string) =>
         Effect.map(store.isConversationHeld(conversationId), (held) => ({ busy: held, running: false, cliInitiated: false, held, idleSince: 0 }));
@@ -157,15 +163,15 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
           }
         });
       /**
-       * `call` of the conversation's host, as its mount places it now, given its token's making;
-       * or, where it has no harness in a workspace, so that nothing is bound for it, what `none`
-       * says.
+       * `call` of the conversation's host, as its mount places it now, given its token's making
+       * and its workspace; or, where it has no harness in a workspace, so that nothing is bound
+       * for it, what `none` says.
        */
-      const onHost = <A, E, R>(conversationId: string, call: (host: RemoteHost, token: Effect.Effect<string>) => Effect.Effect<A, E, R>, none: Effect.Effect<A, E, R>) =>
+      const onHost = <A, E, R>(conversationId: string, call: (host: RemoteHost, token: Effect.Effect<string>, workingDirectory: string) => Effect.Effect<A, E, R>, none: Effect.Effect<A, E, R>) =>
         Effect.flatMap(store.getMount(conversationId), ({ harness, workingDirectory }) => {
           if (!harness || !workingDirectory) return none;
           const token = tokenOf(conversationId, harness, workingDirectory);
-          return call(hostBy(token), token);
+          return call(hostBy(token), token, workingDirectory);
         });
 
       /** What a long bind of the turn `start`'s waits on, said in its status message, as a harness says what its turn waits on (TurnPersistence.setWaiting). */
@@ -226,12 +232,27 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
           return answered;
         });
 
+      /**
+       * The bind of the session of `workingDirectory`, where it is a session's, begun as a
+       * reservation begins its harness's bind, as a turn needs both: so that the session's restore
+       * and the harness's pool's pod overlap, not one after the other. A fiber of the
+       * reservation's scope; what fails of it is the turn's to say, as ensureSession binds it
+       * again (baymaOf). None where the workspace is no session's, or sessions are not bound ahead.
+       */
+      const sessionBound = (workingDirectory: string) => {
+        const workspace = parseWorkspace(workingDirectory);
+        return !bindSessionAhead || !sandboxes || workspace?.kind !== "sessionfs" ? Effect.succeed(null) : Effect.forkScoped(Effect.exit(sandboxes.bindSession(workspace.volumeId)));
+      };
+
       /** The bayma of the turn `start`'s workspace, brought up for it, its bearer held to the binding `held` of the conversation's harness, as the module says. */
       const baymaOf = (start: TurnRequest, held: HeldTo): Effect.Effect<TurnBayma> =>
         Effect.gen(function*() {
           const workspace = parseWorkspace(start.workingDirectory);
           if (workspace?.kind === "sessionfs") {
             if (!sandboxes) return { endpoint: null, notice: "This deployment offers no session filesystems, so this turn runs without bayma's tools." };
+            // The bind its reservation began through first, however it ended.
+            const binding = sessionBinds.get(start.conversationId);
+            if (binding) yield* Fiber.await(binding);
             return yield* sandboxes.ensureSession(workspace.volumeId, held).pipe(
               Effect.map(({ bayma }): TurnBayma => ({ endpoint: bayma, notice: null })),
               Effect.catch((error) => Effect.succeed<TurnBayma>({ endpoint: null, notice: `Session ${workspace.volumeId}: its bayma did not start (${error.message}). This turn runs without bayma's tools.` })),
@@ -283,14 +304,22 @@ export const pooledHarnessHost = ({ url, environment, callerKey, codexLogin, wri
         // held to: by a reservation the host made alone, and let go of by that one alone, so a
         // reservation refused, as another holds the conversation, leaves the other's as it is.
         reserve: (conversationId, waiting = () => Effect.void) =>
-          onHost(conversationId, (_host, token) =>
+          onHost(conversationId, (_host, token, workingDirectory) =>
             Effect.gen(function*() {
+              const binding = yield* sessionBound(workingDirectory);
               const [made, held] = yield* onBinding(conversationId, yield* boundAhead(conversationId, token, waiting), (_held, bound) => hostBy(token, bound).reserve(conversationId));
               if (made) {
-                yield* Effect.acquireRelease(Effect.sync(() => void reserved.set(conversationId, held)), () =>
+                yield* Effect.acquireRelease(
                   Effect.sync(() => {
-                    if (reserved.get(conversationId) === held) reserved.delete(conversationId);
-                  }));
+                    reserved.set(conversationId, held);
+                    if (binding) sessionBinds.set(conversationId, binding);
+                  }),
+                  () =>
+                    Effect.sync(() => {
+                      if (reserved.get(conversationId) === held) reserved.delete(conversationId);
+                      if (binding && sessionBinds.get(conversationId) === binding) sessionBinds.delete(conversationId);
+                    }),
+                );
               }
               return made;
             }), Effect.succeed(false)),

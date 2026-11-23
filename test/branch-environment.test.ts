@@ -195,6 +195,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     },
     harnessDirectory: () => directory,
     ensureSession: () => Effect.die("the parent brings no session up for a branch"),
+    bindSession: () => Effect.die("the parent binds no session for a branch"),
     readFile: () => Effect.die("the parent reads no file for a branch"),
     writeFile: () => Effect.die("the parent writes no file for a branch"),
   });
@@ -405,6 +406,7 @@ test("a branch environment mounts and makes no folder, forks no workspace itself
     volumes: { create: () => Effect.die("no session is made"), fork: () => Effect.die("no session is forked"), destroy: () => Effect.die("no session is deleted"), list: Effect.succeed([]) },
     harnessDirectory: () => "/nonexistent",
     ensureSession: () => Effect.die("no session is brought up"),
+    bindSession: () => Effect.die("no session is bound"),
     readFile: () => Effect.die("no file is read"),
     writeFile: () => Effect.die("no file is written"),
   });

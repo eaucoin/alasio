@@ -149,9 +149,9 @@ export const stateStore = (options: Pick<AlasioOptions, "pool" | "stateSchema" |
  * events topic; its Codex turns given tokens for its environment's relay of its Codex login
  * (./codex/relay.ts), a component of its own, which no pod holds the login past.
  */
-function harnessHost({ codexLoginUrl, sessionsGateway, lakeWritten }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexLoginFreshness> {
+function harnessHost({ codexLoginUrl, sessionsGateway, lakeWritten, bindSessionAhead }: AlasioOptions): Layer.Layer<HarnessHost | HarnessEvents, never, Store | EventsConsumer | CodexLoginFreshness> {
   return Layer.mergeAll(
-    pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: codexLoginUrl, home: codexHome() }, written: lakeWritten }),
+    pooledHarnessHost({ ...sessionsGateway, codexLogin: { url: codexLoginUrl, home: codexHome() }, written: lakeWritten, bindSessionAhead }),
     HarnessEvents.fromLog({ written: lakeWritten }),
   );
 }

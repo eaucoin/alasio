@@ -107,6 +107,7 @@ test("a file sent to a conversation on a session workspace is kept, its prompt n
     volumes: { create: unused, fork: unused, destroy: unused, list: Effect.die("no workspace is listed") },
     harnessDirectory: () => assert.fail("no harness runs"),
     ensureSession: unused,
+    bindSession: unused,
     readFile: unused,
     writeFile: (volumeId, path, bytes) => Effect.sync(() => void written.push(`${volumeId} ${path} ${Buffer.from(bytes).toString()}`)),
   };
