@@ -37,8 +37,13 @@ const HOLDER = [
   "let n = 0; setInterval(() => Buffer.allocUnsafe(4 << 20).fill(n++ & 255), 20);",
   "setInterval(() => fs.writeFileSync('/tmp/holder.alive', String(Date.now())), 500);",
 ].join(" ");
-/** A: 64 MiB more every 80 ms, every page written, until it is killed. */
-const GROWER = "const held = []; setInterval(() => held.push(Buffer.alloc(64 << 20, 7)), 80);";
+/**
+ * A: 64 MiB more every 80 ms, every page written, until it is killed, or holds GROWER_MOST_BYTES,
+ * twice HEADROOM_BYTES, and stops: one not killed so never fills the node, as the runner, starved,
+ * would end the job.
+ */
+const GROWER_MOST_BYTES = 2 * HEADROOM_BYTES;
+const GROWER = `const held = []; const grow = setInterval(() => (held.length * 64 * 1024 * 1024 >= ${GROWER_MOST_BYTES} ? clearInterval(grow) : held.push(Buffer.alloc(64 << 20, 7))), 80);`;
 
 /** A new session's workspace, bound: its name, and its pod's. */
 async function boundWorkspace(): Promise<{ readonly workspace: string; readonly pod: string; readonly uid: string; readonly node: string }> {
