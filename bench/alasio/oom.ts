@@ -16,12 +16,13 @@ import { join } from "node:path";
 
 import type { CoreV1Event, V1Pod } from "@kubernetes/client-node";
 
-import { bindSession, gatewayCall, kube, mainToken, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
-import { errorText, forgetWorkspace } from "./alasio.ts";
+import { NAMESPACE } from "../../cli/src/manifests/common.ts";
+import { bindSession, boundPodOf, gatewayCall, kube, mainToken, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
+import { errorText, forgetWorkspace, loggedOf } from "./alasio.ts";
 import { BENCH_DIR, RUNS } from "./settings.ts";
 
-/** What the Burstable pods' cgroup is held to beyond what it holds as A begins: B's 1.5 GiB and as much again. */
-const HEADROOM_BYTES = 3 * 1024 ** 3;
+/** What the Burstable pods' cgroup is held to beyond what it holds as A begins, which A outgrows. */
+const HEADROOM_BYTES = 2 * 1024 ** 3;
 /** Where the node's Burstable pods' cgroup is, as kubelet makes it under systemd's driver or cgroupfs's. */
 const BURSTABLE = "$(ls -d /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice /sys/fs/cgroup/kubepods/burstable 2>/dev/null | head -n 1)";
 
@@ -42,7 +43,7 @@ const HOLDER = [
  * twice HEADROOM_BYTES, and stops: one not killed so never fills the node, as the runner, starved,
  * would end the job.
  */
-const GROWER_MOST_BYTES = 2 * HEADROOM_BYTES;
+const GROWER_MOST_BYTES = 3 * HEADROOM_BYTES;
 const GROWER = `const held = []; const grow = setInterval(() => (held.length * 64 * 1024 * 1024 >= ${GROWER_MOST_BYTES} ? clearInterval(grow) : held.push(Buffer.alloc(64 << 20, 7))), 80);`;
 
 /** A new session's workspace, bound: its name, and its pod's. */
@@ -55,9 +56,26 @@ async function boundWorkspace(): Promise<{ readonly workspace: string; readonly 
   return { workspace, pod: name, uid: pod?.metadata?.uid ?? "", node };
 }
 
+/** The restarts of each container of the platform's pods (alasio's namespace), by pod and container. */
+async function platformRestarts(): Promise<Record<string, number>> {
+  const restarts: Record<string, number> = {};
+  for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE })) {
+    for (const status of pod.status?.containerStatuses ?? []) restarts[`${pod.metadata?.name ?? ""}/${status.name}`] = status.restartCount;
+  }
+  return restarts;
+}
+
+/** Whose each process the kernel's OOM killed was, by the pod its memory cgroup names: A's, B's, or another's (its name). */
+const victimOf = (line: string, a: { readonly uid: string }, b: { readonly uid: string }): string => {
+  const cgroup = /task_memcg=(\S+)/u.exec(line)?.[1] ?? "";
+  const task = /task=([^,]+)/u.exec(line)?.[1] ?? "";
+  return cgroup.includes(a.uid.replaceAll("-", "_")) || cgroup.includes(a.uid) ? `A ${task}` : cgroup.includes(b.uid.replaceAll("-", "_")) || cgroup.includes(b.uid) ? `B ${task}` : `other ${task} ${cgroup}`;
+};
+
 /** One trial, as the module says: its line. */
 async function trial(number: number): Promise<Record<string, unknown>> {
   const started = Date.now();
+  const restartsBefore = await platformRestarts();
   const b = await boundWorkspace();
   const a = await boundWorkspace();
   try {
@@ -88,6 +106,14 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       : null;
     const since = Math.floor(started / 1000);
     const kernel = (await onNode(b.node, `journalctl -k --since @${since} --no-pager -o short-iso-precise 2>/dev/null | grep -iE 'oom-kill|killed process|out of memory' || true`)).trim().split("\n").filter(Boolean);
+    // Of each OOM, the kernel's whole report, the tasks it weighed with their RSS and scores among it.
+    const report = (await onNode(b.node, `journalctl -k --since @${since} --no-pager -o short-iso-precise 2>/dev/null | sed -n '/invoked oom-killer/,/Killed process/p' | tail -n 400 || true`)).trim().split("\n").filter(Boolean);
+    const victims = kernel.filter((line) => line.includes("oom-kill:constraint")).map((line) => victimOf(line, a, b));
+    const restartsAfter = await platformRestarts();
+    const platformRestarted = Object.entries(restartsAfter).filter(([name, count]) => count > (restartsBefore[name] ?? 0)).map(([name]) => name);
+    // A's session after: its pod gone and its binding let go, as a broken sandbox's is, and what the gateway said of it.
+    const aBound = await boundPodOf(a.workspace);
+    const aGateway = (await loggedOf(b.node, a.workspace)).gateway.filter((line) => /releas|broken|oom|memory/iu.test(line)).slice(-6);
     const evicted = (await kube.list<CoreV1Event>("Event", { namespace: SESSIONS }))
       .filter(({ reason, lastTimestamp, eventTime }) => reason === "Evicted" && new Date(String(lastTimestamp ?? eventTime ?? 0)).getTime() >= started)
       .map(({ involvedObject, message }) => `${involvedObject?.name ?? ""}: ${message ?? ""}`);
@@ -96,6 +122,10 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       a: { pod: a.pod, ended: ran !== null, exec: ran, ended_ms: aEndedMs, ...aPod },
       b: { pod: b.pod, ...bPod, stamp_age_ms: stampAge },
       b_survived: bPod.there && bPod.phase === "Running" && stampAge !== null && stampAge < 2_000,
+      victims,
+      platform_restarted: platformRestarted,
+      a_after: { bound: aBound?.name ?? null, gateway: aGateway },
+      report,
       cgroup: { path: cgroup, limit_before: limitBefore, limit: Number(limit), events },
       kernel,
       evicted,
