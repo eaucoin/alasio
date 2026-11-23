@@ -429,6 +429,13 @@ test("status is Docker's version and the cluster's nodes, the server first, and 
   });
 });
 
+test("every node's stargz-snapshotter serves the session image's files through FUSE passthrough where the cluster is told to", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, imagePassthrough: true });
+  const stargz = fake.requests.filter(({ path }) => path === "/containers/create").map(({ body }) => (body as { Env: string[] }).Env.find((variable) => variable.startsWith("ALASIO_STARGZ_CONFIG=")));
+  assert.deepEqual(stargz, [`ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, true)}`, `ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, true)}`]);
+});
+
 test("every node is made with the registries, as k3s's registries.yaml, and made anew when they change", async (t) => {
   const { fake, kubeconfig, run } = await rig(t);
   const registries = { mirrors: { "registry.example:5000": { endpoint: ["http://registry.example:5000"] } } };

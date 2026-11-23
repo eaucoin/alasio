@@ -174,6 +174,8 @@ export interface HostClusterOptions {
   readonly hostAliases?: readonly HostAlias[];
   /** The registries the node pulls from; containerd's defaults unless given. */
   readonly registries?: typeof Registries.Type;
+  /** Whether its stargz-snapshotter serves the session image's files through FUSE passthrough (./stargz.ts); not unless given. */
+  readonly imagePassthrough?: boolean;
   /** How long each wait for the cluster may take, and how often it looks. */
   readonly readyTimeout?: Duration.Input;
   readonly poll?: Duration.Input;
@@ -305,6 +307,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
   storagePath,
   hostAliases = [],
   registries,
+  imagePassthrough = false,
   readyTimeout = WAITS.readyTimeout,
   poll = WAITS.poll,
 }: HostClusterOptions): Effect.fn.Return<HostCluster["Service"], never, FileSystem.FileSystem | Machine | Systemd | Root | NodeReleases> {
@@ -316,7 +319,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
   const onMachine = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | Machine>) =>
     effect.pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Machine, machine));
   /** The node's configuration, its containerd's runtimes those of the gVisor releases `kept`. */
-  const configOf = (kept: readonly string[]): NodeConfig => ({ role: "server", storagePath, ...(registries ? { registries } : {}), gvisor: [...kept] });
+  const configOf = (kept: readonly string[]): NodeConfig => ({ role: "server", storagePath, ...(registries ? { registries } : {}), gvisor: [...kept], ...(imagePassthrough ? { imagePassthrough } : {}) });
   const waitFor = awaitReady(CLUSTER, { readyTimeout, poll });
 
   /** The firewall active on this machine, which lets in only what it is told to: ufw, as its config says, or firewalld, as its service is; none. */

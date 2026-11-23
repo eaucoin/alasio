@@ -35,6 +35,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
         storagePath: host.storagePath ?? (yield* defaultStoragePath),
         hostAliases: host.hostAliases,
         ...(host.registries ? { registries: host.registries } : {}),
+        imagePassthrough: host.imagePassthrough,
       },
       kubeconfig,
     };
@@ -56,6 +57,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
       mounts: [...docker.mounts, ...hostPaths.filter(({ target }) => !docker.mounts.some((mount) => mount.target === target))],
       agents: docker.agents,
       ...(docker.registries ? { registries: docker.registries } : {}),
+      imagePassthrough: docker.imagePassthrough,
     },
     kubeconfig,
   };

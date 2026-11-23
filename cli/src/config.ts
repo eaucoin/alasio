@@ -89,6 +89,13 @@ const HostTarget = Schema.Struct({
   hostAliases: defaulted(HostAliases, []),
   storagePath: Schema.optionalKey(AbsolutePath),
   registries: Schema.optionalKey(Registries),
+  /**
+   * Whether the nodes' stargz-snapshotter serves the session image's files through FUSE passthrough,
+   * so the kernel reads them from the daemon's merged files with no round trip through it, a pool's
+   * pod opening the binaries a restore reads as it starts (sandbox/agent/start.sh); off unless said.
+   * It applies to the layers a node mounts after the daemon starts with it.
+   */
+  imagePassthrough: defaulted(Schema.Boolean, false),
 });
 
 /** The cluster alasio makes on this machine in Docker, its DockerClusterOptions. */
@@ -103,6 +110,13 @@ const DockerTarget = Schema.Struct({
   image: Schema.optionalKey(NonEmpty),
   agents: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 }, { message: "must be from 0 to 16" })), 0),
   registries: Schema.optionalKey(Registries),
+  /**
+   * Whether the nodes' stargz-snapshotter serves the session image's files through FUSE passthrough,
+   * so the kernel reads them from the daemon's merged files with no round trip through it, a pool's
+   * pod opening the binaries a restore reads as it starts (sandbox/agent/start.sh); off unless said.
+   * It applies to the layers a node mounts after the daemon starts with it.
+   */
+  imagePassthrough: defaulted(Schema.Boolean, false),
 });
 
 /** A cluster a kubeconfig reaches: the default kubeconfig and its current context unless they are given. */
