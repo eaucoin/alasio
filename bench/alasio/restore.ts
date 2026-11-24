@@ -106,7 +106,7 @@ export async function restore(node: string, workspace: string, sessionId: string
   const window = { fromMs: probed.t0_wall_ms, toMs: probed.t0_wall_ms + probed.first_exec_ms };
   const details = {
     pod: name, node, standby, source, prepared, restored_snapshot: restoredSnapshot, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said,
-    memory_stat: memory.stat, agent_memory: agentMemory, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
+    memory_stat: memory.stat, scopes: memory.scopes, agent_memory: agentMemory, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
     ...(timeline === null ? {} : { pod_timeline: await timeline.stop(pod) }),
   };
   return { probed, metrics, details, pod: name, window };
