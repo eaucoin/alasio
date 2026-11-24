@@ -174,6 +174,11 @@ export async function bootLogs(node: string): Promise<void> {
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
     await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n' >> ${options}; tail -n 4 ${options}`);
   }
+  // Spike: the node's snapshot cache on a disk of its own, the runner's /mnt, where BENCH_CACHE_DISK=separate, apart from
+  // the store's, to tell what its writes cost the restore's loading on the disk they share from the copy's cost.
+  if (process.env["BENCH_CACHE_DISK"] === "separate") {
+    await onNode(node, "mkdir -p /mnt/wpi-cache /var/lib/alasio/snapshots && mount --bind /mnt/wpi-cache /var/lib/alasio/snapshots && findmnt /var/lib/alasio/snapshots && df -h /mnt /var/lib/alasio/snapshots /");
+  }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));
   for (const pod of free) await gone(pod.metadata?.name ?? "");
