@@ -347,6 +347,13 @@ const Snapshots = Schema.Struct({
    */
   deltaAfterColdRestore: defaulted(Schema.Boolean, true),
   /**
+   * Whether a restore from the bucket, under a gVisor release that can, writes the pages it reads
+   * through to its node's snapshot cache, so the node need not download the snapshot again for
+   * the session's next one (src/node-agent/agent.ts fetchLater); off unless said, as it slows
+   * the restore's loading on a node whose cache and store share a disk.
+   */
+  restoreWritesCache: defaulted(Schema.Boolean, false),
+  /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
    * limit is at least that and its budget of what it holds written and not yet on the disk

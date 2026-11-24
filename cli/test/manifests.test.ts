@@ -235,6 +235,7 @@ describe("configuration", () => {
       nodeCache: "5Gi",
       onePassSaves: true,
       deltaAfterColdRestore: true,
+      restoreWritesCache: false,
       nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
   });
@@ -2686,7 +2687,7 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the gVisor release their node's runtime starts sandboxes with, the first that restores from the bucket, the first that bounds a save's wait for pages still loading, the first that writes a checkpoint's summary, the first that checks a restore's files in the bucket itself, how long a resumed restore may read it through them, how long a release's save of a sandbox whose restore reads it still may see no byte of it served, whether a checkpoint uploads its image in one pass, and workspace storage's metadata engine", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the gVisor release their node's runtime starts sandboxes with, the first that restores from the bucket, the first that bounds a save's wait for pages still loading, the first that writes a checkpoint's summary, the first that checks a restore's files in the bucket itself, the first that writes a restore's pages through to the cache where the config says so, how long a resumed restore may read it through them, how long a release's save of a sandbox whose restore reads it still may see no byte of it served, whether a checkpoint uploads its image in one pass, and workspace storage's metadata engine", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
@@ -2701,7 +2702,8 @@ describe("node agents", () => {
       ALASIO_GVISOR_SAVES_WITH_LOAD_WAIT_SINCE: "20261102.0-eaucoin.10",
       ALASIO_GVISOR_SAVES_SUMMARY_SINCE: "20261102.0-eaucoin.11",
       ALASIO_GVISOR_RESTORES_WITH_ETAGS_SINCE: "20261102.0-eaucoin.11",
-      ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE: "20261102.0-eaucoin.11",
+      // None unless the config says so.
+      ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE: "",
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
       ALASIO_LOADING_STALL_SECONDS: "90",
@@ -2722,6 +2724,9 @@ describe("node agents", () => {
     assert.equal(env({ sessions: { snapshots: { loadingStallWait: "2m" } } })["ALASIO_LOADING_STALL_SECONDS"], "120");
     assert.equal(env({ sessions: { snapshots: { onePassSaves: false } } })["ALASIO_ONE_PASS_SAVES"], "false");
     assert.equal(env({ sessions: { snapshots: { deltaAfterColdRestore: false } } })["ALASIO_DELTA_AFTER_COLD_RESTORE"], "false");
+    // A restore's pages written through to the node's cache from the release that can, where the config says so alone.
+    assert.equal(env({ sessions: { snapshots: { restoreWritesCache: true } } })["ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE"], "20261102.0-eaucoin.11");
+    assert.equal(env({ sessions: { snapshots: { restoreWritesCache: false } } })["ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE"], "");
     // Without a collector, it exports nothing.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
   });
