@@ -15,6 +15,7 @@
     "restoresIntoStandbySince": "20261102.0-eaucoin.5",
     "savesWithLoadWaitSince": "20261102.0-eaucoin.10",
     "restoresWithETagsSince": "20261102.0-eaucoin.11",
+    "restoresWithPagesCacheSince": "20261102.0-eaucoin.11",
     "recordsWorkingSetAfterSaveSince": "20261102.0-eaucoin.11",
     "releases": [
       {
