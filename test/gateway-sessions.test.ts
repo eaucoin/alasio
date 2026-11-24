@@ -28,6 +28,7 @@ import { type AttachRequest, NodeAgentError, type NodeAgents } from "../src/sand
 import { sessionKey } from "../src/sandbox/names.ts";
 import { currentTraceparent, TracingLayer } from "../src/telemetry/index.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
+import { eventually } from "./support/wait.ts";
 
 // The gateway's session workspaces on a real API server, each pool's pods at the loopback's
 // address, where a stand-in for bayma answers /status as the test says, and the node
@@ -682,19 +683,25 @@ test("a release whose save fails, outlasts alasio's wait for it, or is deferred 
       } else {
         await letGo(env.none, key);
         // Released into none, what was saved of it before forgotten, in the bucket and in every node's cache.
-        assert.deepEqual(recorded.asked, [
+        assert.deepEqual(besidesDiscards(recorded.asked), [
           `checkpoint node-a ${bound.pod}`,
           `record ${env.namespace}/fs-abc123 released into none`,
           `forget ${env.namespace}/fs-abc123`,
-          `discard node-a ${env.namespace}/fs-abc123 keeping none`,
           `detach node-a ${env.namespace}/${bound.pod}`,
         ], outcome);
+        await discarded(recorded.asked, `discard node-a ${env.namespace}/fs-abc123 keeping none`);
       }
     } finally {
       stand.close();
     }
   }
 });
+
+/** What the stand-in agents were asked but their discards, which a forget asks of them in the background. */
+const besidesDiscards = (asked: readonly string[]): string[] => asked.filter((each) => !each.startsWith("discard "));
+/** Once each of `discards` has been asked of the stand-in agents, as a forget asks them in the background. */
+const discarded = (asked: readonly string[], ...discards: readonly string[]): Promise<true> =>
+  eventually(discards.join(", "), () => (discards.every((each) => asked.includes(each)) || undefined), { seen: () => asked });
 
 /** A record of a release into `snapshot`, taken under `release`, with a manifest that says it, as the stand-in agents' checkpoints answer. */
 const recordOf = (snapshot: string, release: string): Released => ({ snapshot, release, manifest: { snapshot, release } as unknown as Manifest });
@@ -1013,14 +1020,14 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
     const counted = await added("alasio.sandbox.releases", async () => assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]));
     assert.deepEqual(counted, { "alasio.sandbox.release.outcome=unsaveable": 1 });
     await letGo(env.none, key);
-    assert.deepEqual(recorded.asked, [
+    assert.deepEqual(besidesDiscards(recorded.asked), [
       `checkpoint node-a ${bound.pod}`,
       `stop node-a ${bound.pod} node --no-memory-reducer --expose-gc /opt/bayma/bayma.js sandbox-hook stop --state-dir /attach/ws/home/.bayma`,
       `record ${env.namespace}/fs-abc123 released into none`,
       `forget ${env.namespace}/fs-abc123`,
-      `discard node-a ${env.namespace}/fs-abc123 keeping none`,
       `detach node-a ${env.namespace}/${bound.pod}`,
     ]);
+    await discarded(recorded.asked, `discard node-a ${env.namespace}/fs-abc123 keeping none`);
   } finally {
     stand.close();
   }
@@ -1049,15 +1056,18 @@ function restoringAgents(current: Manifest | null, released: (Omit<Released, "ma
   const base = agents();
   const manifest = released?.manifest ?? current;
   if (released !== null && manifest === null) throw new Error("a record of a release names a manifest");
-  const state: { current: Manifest | null; released: Released | null } = { current, released: released === null || manifest === null ? null : { ...released, manifest } };
+  const state: { current: Manifest | null; released: Released | null; forgotten: boolean } = { current, released: released === null || manifest === null ? null : { ...released, manifest }, forgotten: false };
   const restoring: NodeAgents = {
     ...base.agents,
     released: () => Effect.sync(() => state.released),
     setReleased: (ref, into) => Effect.sync(() => (base.asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`), void (state.released = into))),
     current: () => Effect.sync(() => state.current),
     held: (node) => Effect.succeed({ node, releases: [{ release: "r1", cpuFeatures: ["sse", "avx"] }], cached: [] }),
+    // Forgotten, its images are in no bucket nor cache: what a prepare of them finds.
     prepare: (node, ref, manifest, gofer) =>
-      prepare === "fails"
+      state.forgotten
+        ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 422, reason: "its image is not in the bucket as it was put, nor in this node's cache" }))
+        : prepare === "fails"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
         : prepare === "finds it corrupt"
         ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 422, reason: "its image is not in the bucket as it was put" }))
@@ -1072,7 +1082,7 @@ function restoringAgents(current: Manifest | null, released: (Omit<Released, "ma
       ),
     // As an agent does it: only where the workspace is at `snapshot` still.
     spend: (node, _ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${node} ${snapshot}`), void (state.current = state.current?.snapshot === snapshot ? null : state.current))),
-    forget: (ref) => Effect.sync(() => (base.asked.push(`forget ${ref.workspace}`), void (state.current = null))),
+    forget: (ref) => Effect.sync(() => (base.asked.push(`forget ${ref.workspace}`), void (state.current = null), void (state.forgotten = true))),
   };
   return { ...base, state, agents: restoring };
 }
@@ -1549,13 +1559,12 @@ test("a release whose record cannot be written, which may leave a record its res
       await letGo(env.none, key);
       const into = checkpoint === "saves" ? "s-1" : "none";
       // Tried four times in all, then forgotten everywhere.
-      assert.deepEqual(recorded.asked.slice(0, 7), [
+      assert.deepEqual(besidesDiscards(recorded.asked).slice(0, 6), [
         `checkpoint node-a ${bound.pod}`,
         ...Array.from({ length: 4 }, () => `record ${env.namespace}/fs-unrecorded released into ${into}`),
         `forget ${env.namespace}/fs-unrecorded`,
-        `discard node-a ${env.namespace}/fs-unrecorded keeping none`,
       ], checkpoint);
-      assert.ok(recorded.asked.includes(`discard node-b ${env.namespace}/fs-unrecorded keeping none`), recorded.asked.join("\n"));
+      await discarded(recorded.asked, `discard node-a ${env.namespace}/fs-unrecorded keeping none`, `discard node-b ${env.namespace}/fs-unrecorded keeping none`);
     } finally {
       stand.close();
     }
@@ -1798,6 +1807,126 @@ test("a restore whose readiness cannot be set falls back once its record's clear
     "forget fs-unready",
     `record ${env.namespace}/fs-unready released into none`,
   ]);
+});
+
+test("a restore whose record cannot be cleared once its sandbox resumed falls back, its snapshots forgotten, rather than leave its session bound with a record that names the snapshot it moves on from; its next bind is not restored from it", async () => {
+  const env = await environment(2, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-0000002c";
+  const recorded = restoringAgents(manifestOf(env, "fs-uncleared", snapshot), { snapshot, release: "r1" });
+  // Its record can be written no more, as workspace storage on the node is away: neither cleared nor written over.
+  const agents: NodeAgents = {
+    ...recorded.agents,
+    setReleased: () => Effect.fail(new NodeAgentError({ node: "node-a", call: "record the release", status: 503, reason: "workspace storage is not mounted on this node now" })),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-uncleared");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const counted = await added("alasio.sandbox.restores", async () => {
+    const binding = Effect.runPromise(Effect.flip(binder.bind(placement.pool, key, placement)));
+    await runs(env, (await restorePodOf(env)).metadata?.name ?? "");
+    assert.match((await binding).message, /its record of its release could not be cleared/u);
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=restore": 1 });
+  assert.ok(recorded.asked.includes("forget fs-uncleared"), recorded.asked.join("\n"));
+  // Its record names the snapshot still, as nothing could clear it: its next bind finds nothing of it to restore, and binds a free pod.
+  assert.equal(recorded.state.released?.snapshot, snapshot);
+  const again = await added("alasio.sandbox.restores", async () => assert.match((await Effect.runPromise(binder.bind(placement.pool, key, placement))).pod, /^none-/u));
+  assert.deepEqual(again, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=prepare": 1 });
+});
+
+test("a forget of a workspace's snapshots goes on in every ready node's cache where the bucket's fails, and asks a node's agent that declines, as other work on the workspace runs, again", async () => {
+  const env = await environment(1, { gvisor: true });
+  const stand = await bayma();
+  const recorded = agents("fails, ending it");
+  const declines = { "node-a": 2 } as Record<string, number>;
+  const forgetting: NodeAgents = {
+    ...recorded.agents,
+    // node-c's agent is not ready, and is listed by none.
+    nodes: Effect.succeed(["node-a", "node-b"]),
+    forget: (ref) => recorded.agents.forget(ref).pipe(Effect.andThen(Effect.fail(new NodeAgentError({ node: "node-a", call: "forget", status: 502, reason: "the snapshots bucket failed" })))),
+    discard: (node, ref, keep) =>
+      recorded.agents.discard(node, ref, keep).pipe(Effect.map(() => {
+        const left = declines[node] ?? 0;
+        declines[node] = Math.max(0, left - 1);
+        return left === 0;
+      })),
+  };
+  try {
+    const { binder, sessions } = await sessionsOf({ ...options(env, stand.port), releaseAfterMs: 0 }, forgetting);
+    const key = sessionKey("fs-forgotten");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
+    assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
+    await letGo(env.none, key);
+    const count = (said: string) => recorded.asked.filter((each) => each === said).length;
+    // The bucket's tried six times in all; node-a's asked, in the background, until it took it, node-b's once.
+    assert.equal(count(`forget ${env.namespace}/fs-forgotten`), 6);
+    await eventually("node-a's discard taken", () => (count(`discard node-a ${env.namespace}/fs-forgotten keeping none`) === 3 || undefined), { seen: () => recorded.asked });
+    assert.equal(count(`discard node-b ${env.namespace}/fs-forgotten keeping none`), 1);
+  } finally {
+    stand.close();
+  }
+});
+
+test("a forget of a workspace's snapshots holds off nothing that follows it while a node's agent declines to discard them, as one does while a restore of the workspace there runs on until its pod is gone: the agent is asked again in the background", async () => {
+  const env = await environment(1, { gvisor: true });
+  const stand = await bayma();
+  const recorded = agents("fails, ending it");
+  // Declined five times, some 6 s of asking.
+  let declines = 5;
+  const declining: NodeAgents = {
+    ...recorded.agents,
+    discard: (node, ref, keep) => recorded.agents.discard(node, ref, keep).pipe(Effect.map(() => declines-- <= 0)),
+  };
+  try {
+    const { binder, sessions } = await sessionsOf({ ...options(env, stand.port), releaseAfterMs: 0 }, declining);
+    const key = sessionKey("fs-declined");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
+    assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
+    await letGo(env.none, key);
+    const discards = () => recorded.asked.filter((each) => each === `discard node-a ${env.namespace}/fs-declined keeping none`).length;
+    // Released, its pod detached, while node-a's agent is still asked.
+    assert.ok(recorded.asked.includes(`detach node-a ${env.namespace}/${bound.pod}`), recorded.asked.join("\n"));
+    assert.ok(discards() < 6, recorded.asked.join("\n"));
+    await eventually("node-a's discard taken", () => (discards() === 6 || undefined), { seen: () => recorded.asked });
+  } finally {
+    stand.close();
+  }
+});
+
+test("a bound pod ending whose save cannot even begin, as its pod cannot be read, leaves its workspace's record empty, as it was while bound: its next bind restores nothing", async () => {
+  const env = await environment(1, { gvisor: true, holdsStop: true });
+  const recorded = agents();
+  const records = new Map<string, Released | null>();
+  const unread = { pod: "" };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recording(recorded, records), (kube) => ({
+    ...kube,
+    read: (apiVersion, kind, namespace, name) =>
+      // Its first read alone, which its save begins with.
+      kind === "Pod" && name === unread.pod
+        ? Effect.sync(() => void (unread.pod = "")).pipe(Effect.andThen(Effect.fail(new KubeApiError({ status: 503, cause: new Error("etcdserver: request timed out") }))))
+        : kube.read(apiVersion, kind, namespace, name),
+  }));
+  const key = sessionKey("fs-unbegun");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  await run(withKube((kube) => kube.remove("v1", "Pod", env.namespace, bound.pod)));
+  unread.pod = bound.pod;
+  const counted = await added("alasio.sandbox.stop_releases", async () => {
+    await Effect.runPromise(Effect.provide(sessions.drain, Layer.fresh(KubeClient.layer)));
+    // Its bayma, holding a stop no save comes for, ends at its grace's end, as kubelet would end it: here at once.
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 0 } } }] } })));
+    for (const deadline = Date.now() + 15_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) {
+      assert.ok(Date.now() < deadline, `its binding was not let go: ${recorded.asked.join(", ")}`);
+    }
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=error": 1 });
+  assert.equal(records.get(`${env.namespace}/fs-unbegun`) ?? null, null);
+  assert.ok(!recorded.asked.some((each) => each.startsWith("checkpoint")), recorded.asked.join(", "));
 });
 
 test("what a restore attached beside a prepare that failed is detached: the restore deferred where the failure may pass, fallen back where its snapshot is corrupt", async () => {

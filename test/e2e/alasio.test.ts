@@ -826,7 +826,7 @@ if (inShard("upgrade")) {
       // What follows the upgrade: each record of a release the release before wrote given its manifest, the shard's among them.
       assert.match(
         again.stderr,
-        /^[^\n]* waiting for this release's node agents \(records\.log\)\n[^\n]* giving each record of a release its manifest, through the node agent \S+ \(records\.log\)\n[^\n]* records of releases given their manifests: [1-9][0-9]*; removed: 0; holding one already: 0\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u,
+        /^[^\n]* waiting for this release's node agents \(records\.log\)\n[^\n]* giving each record of a release its manifest, through the node agent \S+ \(records\.log\)\n[^\n]* records of releases given their manifests: [1-9][0-9]*; removed: 0; holding one already: 0; written meanwhile: 0\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u,
       );
       assert.deepEqual(await alasioApplied(), applied);
       upgraded = Date.now();
