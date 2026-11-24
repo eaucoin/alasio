@@ -105,24 +105,26 @@ export async function sandboxCgroup(pod: string): Promise<string> {
   return holding.length === 1 ? (holding[0] ?? pod) : pod;
 }
 
+/** Of what the cgroup `dir` holds, its page cache the kernel reclaims as it nears its limit, clean: its active and inactive file pages, but those dirty or being written back. */
+export async function reclaimableIn(dir: string): Promise<number> {
+  const stat = await text(join(dir, "memory.stat"));
+  const of = (key: string) => statOf(stat, key) ?? 0;
+  return Math.max(0, of("active_file") + of("inactive_file") - of("file_dirty") - of("file_writeback"));
+}
+
 /**
  * What each cgroup above the pods `pods`, under the root `cgroups`, has left under its
- * memory.max: what it does not hold, and of what it holds its page cache the kernel reclaims as it
- * nears its limit, clean (its active and inactive file pages, but those dirty or being written
- * back). The least, or Infinity where none has a limit.
+ * memory.max: what it does not hold, and of what it holds what `reclaimable` says the kernel
+ * reclaims as it nears its limit (reclaimableIn). The least, or Infinity where none has a limit.
  */
-export async function aboveRoom(cgroups: string, pods: readonly string[]): Promise<number> {
+export async function aboveRoom(cgroups: string, pods: readonly string[], reclaimable: (dir: string) => Promise<number> = reclaimableIn): Promise<number> {
   const above = new Set<string>();
   for (const pod of pods) for (let dir = dirname(pod); dir.startsWith(`${cgroups}/`); dir = dirname(dir)) above.add(dir);
   let room = Number.POSITIVE_INFINITY;
   for (const dir of above) {
     const max = await numberIn(join(dir, "memory.max"));
     const current = await numberIn(join(dir, "memory.current"));
-    if (max === null || current === null) continue;
-    const stat = await text(join(dir, "memory.stat"));
-    const of = (key: string) => statOf(stat, key) ?? 0;
-    const reclaimable = Math.max(0, of("active_file") + of("inactive_file") - of("file_dirty") - of("file_writeback"));
-    room = Math.min(room, max - current + reclaimable);
+    if (max !== null && current !== null) room = Math.min(room, max - current + (await reclaimable(dir)));
   }
   return room;
 }
@@ -138,20 +140,21 @@ const keyOf = ({ namespace, pod }: Pick<SandboxCgroup, "namespace" | "pod">): st
 /** How many MiB `bytes` is, for a log. */
 const mib = (bytes: number): string => `${Math.round(bytes / 1024 ** 2)} MiB`;
 
-/** What guardNodeMemory looks at the node with, and how often. */
+/** What guardNodeMemory looks at the node with, and how often; and what each cgroup above the pods holds that the kernel reclaims (reclaimableIn unless given). */
 export interface GuardOptions extends Pick<MemoryOptions, "runsc" | "nodeRoot" | "attachRoot"> {
   readonly everyMs?: number;
+  readonly reclaimable?: (dir: string) => Promise<number>;
 }
 
 /** One look of the guard's, as the module says; the sandboxes it ended so far, by their pods' cgroups, kept and forgotten as they go. */
-export const guardOnce = ({ runsc, nodeRoot, attachRoot }: GuardOptions, endedBefore: Set<string>): Effect.Effect<void> =>
+export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimableIn }: GuardOptions, endedBefore: Set<string>): Effect.Effect<void> =>
   Effect.gen(function*() {
     const cgroups = join(nodeRoot, "sys", "fs", "cgroup");
-    const sandboxes = (yield* sandboxesOf({ runsc, nodeRoot, attachRoot })).filter((sandbox): sandbox is SandboxCgroup & { readonly cgroup: string } => sandbox.cgroup !== null);
+    const sandboxes = (yield* sandboxesOf({ runsc, nodeRoot, attachRoot }, false)).filter((sandbox): sandbox is SandboxCgroup & { readonly cgroup: string } => sandbox.cgroup !== null);
     // Those ended that are gone are forgotten, as a pod's cgroup goes with it.
     for (const cgroup of endedBefore) if (!sandboxes.some((sandbox) => sandbox.cgroup === cgroup)) endedBefore.delete(cgroup);
     const available = meminfoOf(yield* Effect.promise(() => text(join(nodeRoot, "proc", "meminfo"))), "MemAvailable");
-    const above = yield* Effect.promise(() => aboveRoom(cgroups, sandboxes.map(({ cgroup }) => cgroup)));
+    const above = yield* Effect.promise(() => aboveRoom(cgroups, sandboxes.map(({ cgroup }) => cgroup), reclaimable));
     const room = Math.min(available === null ? Number.POSITIVE_INFINITY : available - NODE_MEMORY_SOFT_EVICTION_BYTES, above);
     const lastRoom = Math.min(available === null ? Number.POSITIVE_INFINITY : available - NODE_MEMORY_HARD_EVICTION_BYTES, above);
     const scopes = new Map<string, string>();
@@ -189,14 +192,30 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot }: GuardOptions, endedBe
 
 /**
  * Guards the node's memory, as the module says, every `everyMs` (GUARD_MS), for as long as the
- * scope is open; its sandboxes listed by runsc every LIST_MS at most, their pods' cgroups read at
- * every look.
+ * scope is open: what each cgroup holds read at every look; its sandboxes listed by runsc every
+ * LIST_MS at most; and what the cgroups above the pods hold that the kernel reclaims (their
+ * memory.stat) every LIST_MS at most, and at the next look once one has reached its limit since
+ * (its memory.events' max), as the kernel then reclaims its page cache, which a count read before
+ * would overstate its room by. A cgroup's memory.stat has the kernel gather its counts from every
+ * processor as it is read: every look's, the pods' and those above, slowed a stop's save of 3 GiB
+ * by some 250 ms (memory files' save 380 to 628 ms at the median).
  */
 export const guardNodeMemory = (options: GuardOptions): Effect.Effect<void, never, Scope.Scope> =>
   Effect.gen(function*() {
     const containers = yield* Effect.cachedWithTTL(options.runsc.containers, (exit) => (Exit.isSuccess(exit) ? LIST_MS : 0));
+    const reclaimable = options.reclaimable ?? reclaimableIn;
+    const read = new Map<string, { readonly at: number; readonly reached: number | null; readonly bytes: number }>();
+    const reclaimableNow = async (dir: string) => {
+      // How often it has reached its limit: a read of its events, which has the kernel gather nothing.
+      const reached = statOf(await text(join(dir, "memory.events")), "max");
+      const known = read.get(dir);
+      if (known !== undefined && known.reached === reached && Date.now() - known.at < LIST_MS) return known.bytes;
+      const bytes = await reclaimable(dir);
+      read.set(dir, { at: Date.now(), reached, bytes });
+      return bytes;
+    };
     const endedBefore = new Set<string>();
-    yield* guardOnce({ ...options, runsc: { containers } }, endedBefore).pipe(
+    yield* guardOnce({ ...options, runsc: { containers }, reclaimable: reclaimableNow }, endedBefore).pipe(
       Effect.catchDefect((defect) => Effect.logWarning(`the node's memory could not be guarded: ${String(defect)}`)),
       Effect.repeat(Schedule.spaced(options.everyMs ?? GUARD_MS)),
       Effect.forkScoped,

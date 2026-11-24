@@ -12,7 +12,7 @@ import { test } from "node:test";
 import { Effect } from "effect";
 
 import { STANDBY_ANNOTATION } from "../src/kube/sandbox-shape.ts";
-import { meminfoOf, nodeMemory, ownMemory, podCgroup, statOf } from "../src/node-agent/memory.ts";
+import { meminfoOf, nodeMemory, ownMemory, podCgroup, sandboxesOf, statOf } from "../src/node-agent/memory.ts";
 import { NODE_MEMORY_RESERVED_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES, RUNSC_ROOT } from "../src/node-agent/names.ts";
 import { makeRunsc } from "../src/node-agent/runsc.ts";
 import { fakeReleases } from "./support/fake-runsc.ts";
@@ -56,7 +56,7 @@ function memoryNode() {
   };
   const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: RELEASE });
   const read = () => Effect.runPromise(nodeMemory({ runsc, nodeRoot, attachRoot, ownProc, ownCgroups }));
-  return { root, releases, cgroupOf, pod, bound, read, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, releases, runsc, nodeRoot, attachRoot, cgroupOf, pod, bound, read, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("memory.stat's and /proc/meminfo's values are read by their keys, none of a key they lack", () => {
@@ -131,6 +131,22 @@ test("each sandbox's memory is read from its pod's cgroup, its MemoryFile's of i
     assert.deepEqual([memory.totalBytes, memory.availableBytes, memory.agentBytes], [16 * GIB, 9 * GIB, 150 * MIB]);
     assert.equal(memory.budgetBytes, (16 * GIB - NODE_MEMORY_RESERVED_BYTES - NODE_MEMORY_SOFT_EVICTION_BYTES - 3 * GIB) / 2);
     assert.equal(memory.budgetedBytes, 32 * MIB);
+  } finally {
+    node.done();
+  }
+});
+
+test("the sandboxes are read without their split where asked, of what their cgroups hold alone, their memory.stat not read", async () => {
+  const node = memoryNode();
+  try {
+    node.pod("sandboxes-none-0aaa", "aaaa-0001");
+    node.cgroupOf("aaaa-0001", 3 * GIB, 64 * MIB, 2900 * MIB, 64 * MIB);
+    node.bound("sandboxes-none-0aaa");
+    const [sandbox] = await Effect.runPromise(sandboxesOf({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, false));
+    assert.deepEqual(
+      { ...sandbox, cgroup: sandbox?.cgroup?.endsWith("kubepods-burstable-podaaaa_0001.slice") },
+      { namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 3 * GIB, anonBytes: null, fileBytes: null, shmemBytes: null, zswapBytes: null, cgroup: true },
+    );
   } finally {
     node.done();
   }

@@ -202,3 +202,26 @@ test("the node's memory is guarded look after look for as long as the agent runs
     node.done();
   }
 });
+
+test("what the cgroups above the pods hold that the kernel reclaims is read at most every 2 s, as its read is the kernel's work, and at the next look once one has reached its limit since", async () => {
+  const node = guardedNode();
+  const scope = Effect.runSync(Scope.make());
+  try {
+    node.memory(9 * GIB, 5 * GIB, 8 * GIB);
+    const events = join(node.nodeRoot, "sys", "fs", "cgroup", "kubepods.slice", "kubepods-burstable.slice", "memory.events");
+    writeFileSync(events, "low 0\nhigh 0\nmax 0\noom 0\n");
+    node.pod("sandboxes-none-0aaa", "aaaa-0001", 2 * GIB, true);
+    let reads = 0;
+    const reclaimable = async () => ((reads += 1), 0);
+    await Effect.runPromise(guardNodeMemory({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot, everyMs: 20, reclaimable }).pipe(Scope.provide(scope)));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(reads, 1);
+    // It reached its limit: read again at the next look, then not again while it reaches it no more.
+    writeFileSync(events, "low 0\nhigh 0\nmax 3\noom 0\n");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(reads, 2);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    node.done();
+  }
+});
