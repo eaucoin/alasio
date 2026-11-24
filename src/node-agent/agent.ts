@@ -230,6 +230,13 @@ export const Manifest = Schema.Struct({
   /** For a snapshot taken live, what it caught: it holds the session only while bayma's state generation is that one. */
   live: Schema.optional(Caught),
   /**
+   * For a snapshot a release took, what its save caught: it holds the session only while bayma's
+   * state generation is that one, as a live one's does. Absent: it was taken before what a
+   * release caught was recorded, of a sandbox whose request named no state directory, or by a
+   * save whose last-save.json could not be read once it had ended its sandbox.
+   */
+  caught: Schema.optional(Caught),
+  /**
    * For a snapshot of a compacted image, the snapshot whose memory it holds, as a workspace
    * released into that one names it: the same sandbox, at the same moment, in one image.
    */
@@ -315,6 +322,12 @@ export const CheckpointRequest = Schema.Struct({
   podTemplate: Schema.Record(Schema.String, Schema.Unknown),
   /** Where the sandbox is saved live, running on: never at a release, which ends it. */
   live: Schema.optional(LiveSave),
+  /**
+   * Of a release's save, the state directory, in the container, of the bayma it runs, where
+   * bayma's hook says what the save caught (last-save.json), which the snapshot records
+   * (Manifest caught): never of a live save, whose `live` says it.
+   */
+  stateDir: Schema.optional(AbsolutePath),
   /**
    * Whether the pod ends as its sandbox is saved, its bayma holding its stop for the save: a
    * release whose save is not deferred (loadWaitOf), as the pod's end ends the sandbox that a
@@ -614,8 +627,9 @@ export function recentReads(seen: readonly ReadsSeen[], stallMs: number): ReadsS
 export const PAGES_UNREAD = "previous async page loading failed";
 
 /**
- * A sandbox restored from a snapshot taken live is not let run, its snapshot holding the
- * session no more: bayma's state generation has moved on since, or cannot be told.
+ * A sandbox restored from a snapshot whose save caught bayma's state generation, taken live or
+ * by a release, is not let run, its snapshot holding the session no more: bayma's state
+ * generation has moved on since, or cannot be told.
  */
 export class SnapshotOutlived extends Schema.TaggedError<SnapshotOutlived>()("SnapshotOutlived", {
   environment: Schema.String,
@@ -624,7 +638,7 @@ export class SnapshotOutlived extends Schema.TaggedError<SnapshotOutlived>()("Sn
   reason: Schema.String,
 }) {
   override get message(): string {
-    return `the snapshot ${this.snapshot} of ${this.environment}/${this.workspace}, taken live, holds the session no more: ${this.reason}; its sandbox is left paused`;
+    return `the snapshot ${this.snapshot} of ${this.environment}/${this.workspace} holds the session no more: ${this.reason}; its sandbox is left paused`;
   }
 }
 
@@ -945,6 +959,10 @@ const sizes = meter.createHistogram("alasio.node_agent.snapshot.size", {
 const layerChecks = meter.createCounter("alasio.node_agent.checkpoint.layer_checks", {
   description: "The images a checkpoint taken in one pass refers to, looked at in the bucket once it is committed, by outcome: held, put again from the node's cache, or what failed",
   unit: "{image}",
+});
+const uncaught = meter.createCounter("alasio.node_agent.checkpoint.uncaught", {
+  description: "Release saves whose bayma's last-save.json could not be read once runsc's save had ended the sandbox, each kept recording no generation of bayma's state",
+  unit: "{checkpoint}",
 });
 const copies = meter.createCounter("alasio.node_agent.copies", {
   description: "Snapshots copied from one workspace to another by the node agent, by outcome",
@@ -1552,6 +1570,14 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const [own] = parent?.layers ?? [];
       const hookSeconds = restoreHookSeconds(backgroundReadMs);
       const waits = yield* loadWaitOf(request, release, askedAt);
+      // Of a release's save, where its bayma's hook says what it caught, found while the container's bundle says it, as the save
+      // ends the container.
+      const caughtAt = live === undefined && request.stateDir !== undefined
+        ? yield* stateFileHeld(request.stateDir, "last-save.json", [container]).pipe(
+          withinStateRead(posix.join(request.stateDir, "last-save.json")),
+          Effect.mapError((error) => new SnapshotCorrupt({ environment, workspace, reason: `what its save caught cannot be told: ${error.message}` })),
+        )
+        : null;
       // Its summary, of a release that writes one, beside what it staged, which goes with it.
       const summaryFile = savesSummary(release, savesSummarySince) ? `${staged}.summary.json` : null;
       const saved = runsc.checkpoint(release, {
@@ -1569,8 +1595,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         Effect.tap(([took]) => Effect.annotateCurrentSpan({ "alasio.snapshot.pause_ms": took })),
         step("alasio.node_agent.checkpoint.runsc", request),
       );
-      // What the save caught, as bayma's hook wrote it as the sandbox was saved.
-      const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
+      // What the save caught, as bayma's hook wrote it as the sandbox was saved. A release's save has ended its sandbox by now,
+      // so one whose last-save.json cannot be read, as workspace storage is slow or fails, is kept all the same, recording no
+      // generation, said and counted: the clear of its record before its next bind is what keeps a stale one from restoring.
+      const caught = live !== undefined ? yield* lastSave(request, live, [container]) : caughtAt === null || request.stateDir === undefined ? undefined : yield* stateFileAt(caughtAt, posix.join(request.stateDir, "last-save.json"), LastSaveFile).pipe(
+        withinStateRead(posix.join(request.stateDir, "last-save.json")),
+        Effect.map(({ generation, running }): Caught => ({ stateDir: request.stateDir ?? "", generation, running })),
+        Effect.catch((error) =>
+          Effect.logWarning(`the snapshot ${snapshot} of ${environment}/${workspace} records no generation of bayma's state, as what its release's save caught could not be read: ${error.message}`).pipe(
+            Effect.andThen(Effect.sync(() => uncaught.add(1))),
+            Effect.as(undefined),
+          )
+        ),
+      );
       // Its image and the images it holds pages of, as its summary says them; or as runsc's inspect and layers say them, each
       // a process of its own, of a release that writes none.
       const described = summaryFile === null
@@ -1635,7 +1672,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         pauseMs,
         uploadMs,
         durability: "store",
-        ...(caught === undefined ? {} : { live: caught }),
+        ...(caught === undefined ? {} : live !== undefined ? { live: caught } : { caught }),
       };
       // Committed: in the cache, then in the bucket, its manifest and its commit, which make it durable; in one pass, the
       // two written at once, the one waiting on the other no more.
@@ -2546,12 +2583,30 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * STATE_READ_TIMEOUT_MS: one not read by then, as a volume that hangs leaves it, is unread,
    * what it says not told. Fails saying why, as an Error.
    */
-  const stateFile = <A>(stateDir: string, name: string, schema: Schema.Decoder<A>, containers: readonly RunningContainer[]): Effect.Effect<A, Error> => {
+  const stateFile = <A>(stateDir: string, name: string, schema: Schema.Decoder<A>, containers: readonly RunningContainer[]): Effect.Effect<A, Error> =>
+    Effect.flatMap(stateFileHeld(stateDir, name, containers), (held) => stateFileAt(held, posix.join(stateDir, name), schema)).pipe(withinStateRead(posix.join(stateDir, name)));
+
+  /** `effect`, a read of bayma's state file `path`, failed where it is not done within STATE_READ_TIMEOUT_MS. */
+  const withinStateRead = (path: string) => <A>(effect: Effect.Effect<A, Error>): Effect.Effect<A, Error> =>
+    effect.pipe(Effect.timeoutOrElse({ duration: STATE_READ_TIMEOUT_MS, orElse: () => Effect.fail(new Error(`${path} was not read within ${STATE_READ_TIMEOUT_MS / 1000} s`)) }));
+
+  /** Where the file `name` of bayma's state directory `stateDir` is on the node, as the volumes of `containers`' pod hold it: what stateFileAt reads, as a container's bundle says it only while it is there. */
+  const stateFileHeld = (stateDir: string, name: string, containers: readonly RunningContainer[]): Effect.Effect<UnderRoot, Error> => {
     const path = posix.join(stateDir, name);
     return Effect.tryPromise({
       try: async () => {
         const held = (await Promise.all(containers.map(({ bundle }) => hostPathOf(nodeRoot, bundle, path)))).find((found): found is UnderRoot => found !== null);
         if (held === undefined) throw new Error(`no volume of its pod holds ${path}`);
+        return held;
+      },
+      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+    });
+  };
+
+  /** The file of bayma's state directory `held` names, `path` in its container, as `schema` decodes it, read as stateFile says. */
+  const stateFileAt = <A>(held: UnderRoot, path: string, schema: Schema.Decoder<A>): Effect.Effect<A, Error> =>
+    Effect.tryPromise({
+      try: async () => {
         const bytes = await readUnder(held, STATE_FILE_BYTES);
         try {
           return Schema.decodeUnknownSync(schema, { onExcessProperty: "error" })(UTF8.decode(bytes));
@@ -2560,10 +2615,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         }
       },
       catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-    }).pipe(
-      Effect.timeoutOrElse({ duration: STATE_READ_TIMEOUT_MS, orElse: () => Effect.fail(new Error(`${path} was not read within ${STATE_READ_TIMEOUT_MS / 1000} s`)) }),
-    );
-  };
+    });
 
   /** What the live save of the sandbox `request` names caught, as bayma's last-save.json says. */
   const lastSave = (request: CheckpointRequest, { stateDir }: LiveSave, containers: readonly RunningContainer[]): Effect.Effect<Caught, SnapshotCorrupt> =>
@@ -2573,7 +2625,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
-   * Whether `manifest`, taken live, holds the session still, a restored sandbox let run from
+   * Whether `manifest`, taken live or by a release, holds the session still, a restored sandbox let run from
    * it: bayma's state generation is the one the save caught, as its generation.json says on
    * the volume of the pod's containers that holds it. Fails where it has moved on, or where
    * it cannot be told.
@@ -2646,7 +2698,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(running.containerIds, (id) => ofPod(id, request.namespace, request.pod)).pipe(step("alasio.node_agent.resume.containers", request));
       const from = yield* restoredFrom(request);
-      if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
+      // Taken live or by a release, of the generation of bayma's state it caught: refused where bayma has moved on since.
+      const caughtBy = from.live ?? from.caught;
+      if (caughtBy !== undefined) yield* holdsStill(from, caughtBy, containers);
       yield* Effect.forEach(running.podIPs, forgetConnections, { discard: true }).pipe(step("alasio.node_agent.resume.conntrack", request));
       // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.

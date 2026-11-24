@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -45,7 +45,7 @@ function machine() {
   const config = join(root, "config.json");
   const agentExec = join(root, "agent-exec");
   mkdirSync(bin);
-  writeFileSync(agentExec, "cat >/dev/null\necho 'records of releases given their manifests: 0; removed: 0; holding one already: 0'\n");
+  writeFileSync(agentExec, "cat >/dev/null\necho 'records of releases given their manifests: 0; removed: 0; holding one already: 0; written meanwhile: 0'\n");
   writeFileSync(namespaces, "");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(join(bin, "kubectl"), `#!/bin/sh
@@ -106,7 +106,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
-    assert.match(run.said, /cutting over from 10\.0\.25[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* waiting for this release's node agents[^\n]*\n[^\n]* giving each record of a release its manifest, through the node agent alasio-node-agent-x1y2z \(records\.log\)\n[^\n]* records of releases given their manifests: 0; removed: 0; holding one already: 0\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 10\.0\.25[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* waiting for this release's node agents[^\n]*\n[^\n]* giving each record of a release its manifest, through the node agent alasio-node-agent-x1y2z \(records\.log\)\n[^\n]* records of releases given their manifests: 0; removed: 0; holding one already: 0; written meanwhile: 0\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
     at.remove();
   }
@@ -243,6 +243,16 @@ test("once upgraded, the cut-over gives each record of a release its manifest, t
   };
   for (const [workspace, record] of [["fs-same", { snapshot: S1, release: "r1", pod: "pool-0" }], ["fs-comp", { snapshot: S1, release: "r1" }], ["fs-moved", { snapshot: S1, release: "r1" }], ["fs-gone", { snapshot: S1, release: "r1" }], ["fs-done", done]] as const) records.set(workspace, record);
   mkdirSync(join(workspaces, "main", "fs-none"), { recursive: true });
+  // One that is no record, and one that is a link, as the agent reads neither: removed.
+  records.set("fs-corrupt", {});
+  writeFileSync(recordPath("fs-corrupt"), "{");
+  mkdirSync(join(workspaces, "main", "fs-link"), { recursive: true });
+  symlinkSync(recordPath("fs-done"), recordPath("fs-link"));
+  // One the gateway writes again, a binding of it ending, as its current snapshot is read: left as the gateway wrote it.
+  records.set("fs-raced", { snapshot: S1, release: "r1" });
+  const raced = { snapshot: S2, release: "r1", manifest: manifestOf("fs-raced", S2) };
+  s3.objects.set("main/fs-raced/current.json", Buffer.from(JSON.stringify(manifestOf("fs-raced", S1))));
+  s3.holdGet = (key) => (key === "main/fs-raced/current.json" ? Promise.resolve(records.set("fs-raced", raced)).then(() => (s3.holdGet = () => null, undefined)) : null);
   const asked: string[] = [];
   for (const [workspace, current] of [["fs-same", manifestOf("fs-same", S1)], ["fs-comp", manifestOf("fs-comp", C1, S1)], ["fs-moved", manifestOf("fs-moved", S2)], ["fs-done", manifestOf("fs-done", S1)]] as const) {
     s3.objects.set(`main/${workspace}/current.json`, Buffer.from(JSON.stringify(current)));
@@ -255,7 +265,7 @@ test("once upgraded, the cut-over gives each record of a release its manifest, t
       const path = request.url ?? "";
       asked.push(`${request.method} ${path}`);
       if (path === "/workspaces") return response.writeHead(200).end(JSON.stringify({ environments: ["main"] }));
-      if (path === "/workspaces/main") return response.writeHead(200).end(JSON.stringify({ workspaces: ["fs-comp", "fs-done", "fs-gone", "fs-moved", "fs-none", "fs-same"] }));
+      if (path === "/workspaces/main") return response.writeHead(200).end(JSON.stringify({ workspaces: ["fs-comp", "fs-corrupt", "fs-done", "fs-gone", "fs-link", "fs-moved", "fs-none", "fs-raced", "fs-same"] }));
       const workspace = /^\/workspaces\/main\/([^/]+)\/released$/u.exec(path)?.[1] ?? "";
       // As this release's agent: a record of the release before, of no manifest, is none it reads.
       if (request.method === "GET") {
@@ -278,17 +288,18 @@ test("once upgraded, the cut-over gives each record of a release its manifest, t
   try {
     const run = await at.cutOverAsync();
     assert.equal(run.code, 0, run.said);
-    assert.match(run.said, /records of releases given their manifests: 2; removed: 2; holding one already: 1\n/u);
+    assert.match(run.said, /records of releases given their manifests: 2; removed: 4; holding one already: 1; written meanwhile: 1\n/u);
     assert.deepEqual(records.all(), {
       "fs-same": { snapshot: S1, release: "r1", pod: "pool-0", manifest: manifestOf("fs-same", S1) },
       "fs-comp": { snapshot: S1, release: "r1", manifest: manifestOf("fs-comp", C1, S1) },
       "fs-done": done,
+      "fs-raced": raced,
     });
     // Run again, from what follows the upgrade: nothing given twice.
     asked.length = 0;
     const again = await at.cutOverAsync();
     assert.equal(again.code, 0, again.said);
-    assert.match(again.said, /records of releases given their manifests: 0; removed: 0; holding one already: 3\n/u);
+    assert.match(again.said, /records of releases given their manifests: 0; removed: 0; holding one already: 4; written meanwhile: 0\n/u);
     assert.ok(asked.every((each) => each.startsWith("GET ")), asked.join(", "));
     // One the agent refuses fails the cut-over, which goes on with it when run again.
     records.set("fs-same", { snapshot: S1, release: "r1" });

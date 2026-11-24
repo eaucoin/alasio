@@ -64,12 +64,22 @@ accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
 # own API refuses one without a manifest), reads the bucket, and writes the records through the
 # agent's API: the workspace's current snapshot, where it is the one the record names or one
 # compacted from it, as the release before restored; where it is neither, or there is none, the
-# record is removed, as the release before fell back from it. A bind meanwhile finds a record it
-# cannot read, and is deferred, to be tried again. Run again, it gives none a manifest twice.
+# record is removed, as the release before fell back from it; and so is one that is no record, which
+# no bind of the release before restored either. A bind meanwhile finds a record it cannot read, and
+# is deferred, to be tried again, for 15 minutes from its first (src/gateway/snapshots.ts
+# DEFER_FOR_MS), past which it falls back: within that, as the wait for the node agents' rollout
+# below takes 10 minutes at the most, and the records' rewrite a few seconds. The gateway writes a
+# record as a binding ends meanwhile, holding its Lease, which this does not: each record is read
+# again just before it is written, and left be where it has changed, as one the gateway wrote is.
+# Run again, it gives none a manifest twice.
 RECORDS_PROGRAM=$(
   cat <<'PROGRAM'
 const [root, agent, workspaces] = process.argv.slice(2);
 const { readFile } = await import("node:fs/promises");
+const { constants } = await import("node:fs");
+// As the agent reads it: a link is not followed.
+// A link is read as no record, which is removed.
+const readRecord = (file) => readFile(file, { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error) => (error.code === "ENOENT" ? null : error.code === "ELOOP" ? "" : Promise.reject(error)));
 const { makeS3Bucket } = await import(`${root}/src/node-agent/s3.ts`);
 const bucket = makeS3Bucket({ endpoint: process.env.S3_ENDPOINT, region: process.env.S3_REGION, bucket: process.env.S3_BUCKET, accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
 const { createRequire } = await import("node:module");
@@ -80,30 +90,44 @@ const ask = async (method, path, body) => {
   if (!response.ok && response.status !== 404) throw new Error(`${method} ${path} was answered ${response.status}: ${await response.text()}`);
   return response.status === 404 ? null : response.status === 204 ? true : response.json();
 };
-const counted = { given: 0, removed: 0, holding: 0 };
+const counted = { given: 0, removed: 0, holding: 0, changed: 0 };
 for (const environment of (await ask("GET", "/workspaces")).environments) {
   for (const workspace of (await ask("GET", `/workspaces/${encodeURIComponent(environment)}`)).workspaces) {
     const path = `/workspaces/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}/released`;
     // As it is beside the workspace's files: one written by the release before has no manifest, which this release's API refuses.
-    const text = await readFile(`${workspaces}/${environment}/${workspace}/released.json`, "utf8").catch((error) => (error.code === "ENOENT" ? null : Promise.reject(error)));
+    const file = `${workspaces}/${environment}/${workspace}/released.json`;
+    const text = await readRecord(file);
     if (text === null) continue;
-    const record = JSON.parse(text);
-    if (record.manifest !== undefined) {
+    const record = (() => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    })();
+    if (record?.manifest !== undefined) {
       counted.holding += 1;
       continue;
     }
-    const current = await Effect.runPromise(bucket.getJson(`${environment}/${workspace}/current.json`));
-    if (current !== null && (current.snapshot === record.snapshot || current.compactedFrom === record.snapshot) && current.release === record.release) {
+    const current = record === null ? null : await Effect.runPromise(bucket.getJson(`${environment}/${workspace}/current.json`));
+    // Written meanwhile, by the gateway as a binding ended: left as it is.
+    if ((await readRecord(file)) !== text) {
+      counted.changed += 1;
+      continue;
+    }
+    if (record !== null && current !== null && (current.snapshot === record.snapshot || current.compactedFrom === record.snapshot) && current.release === record.release) {
       await ask("PUT", path, { ...record, manifest: current });
       counted.given += 1;
     } else {
       await ask("DELETE", path);
       counted.removed += 1;
-      console.log(`${environment}/${workspace}'s record names ${record.snapshot}, which its current snapshot is not, nor was compacted from: removed, as the release before fell back from it`);
+      console.log(record === null
+        ? `${environment}/${workspace}'s record is no record: removed, as the release before fell back from it`
+        : `${environment}/${workspace}'s record names ${record.snapshot}, which its current snapshot is not, nor was compacted from: removed, as the release before fell back from it`);
     }
   }
 }
-console.log(`records of releases given their manifests: ${counted.given}; removed: ${counted.removed}; holding one already: ${counted.holding}`);
+console.log(`records of releases given their manifests: ${counted.given}; removed: ${counted.removed}; holding one already: ${counted.holding}; written meanwhile: ${counted.changed}`);
 PROGRAM
 )
 records_given_manifests() {

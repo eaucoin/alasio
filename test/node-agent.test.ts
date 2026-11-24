@@ -2178,6 +2178,56 @@ test("a checkpoint taken live leaves its sandbox running, records what bayma sai
     })
   ));
 
+test("a release's snapshot records the generation of bayma's state its save caught, read as its container's bundle said it before the save ended the container; a sandbox restored from it resumes only while bayma's state generation is that one", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+      const stateDir = stateDirIn(volume);
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(join(stateDir, "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      const mounted = [{ destination: "/attach", source: volume }];
+      const taker = yield* node("node-1");
+      taker.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, mounted);
+      const released = yield* taker.agent.checkpoint({ ...request("fs-abc"), stateDir: STATE_DIR });
+      assert.deepEqual([released.caught, released.live], [{ stateDir: STATE_DIR, ...CAUGHT }, undefined]);
+      // One whose request names no state directory records none, as before.
+      assert.equal((yield* taker.agent.checkpoint(request("fs-other"))).caught, undefined);
+      // Restored on another node: let run while bayma's state is at that generation, and refused once it has moved on, left paused.
+      const there = yield* node("node-2");
+      for (const id of [CONTAINER, OTHER_CONTAINER]) there.releases.runs(id, RELEASE, SESSIONS, POD, true, id === CONTAINER ? mounted : []);
+      yield* preparing(there.agent, workspace);
+      const resumes = () => there.releases.calls(RELEASE).filter((args) => args.includes("resume")).length;
+      writeFileSync(join(stateDir, "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation + 1 }));
+      const refused = yield* Effect.flip(there.agent.resume(resumeRequest(released.snapshot)));
+      assert.equal(refused.message, `the snapshot ${released.snapshot} of main/fs-abc holds the session no more: bayma's state generation is 6, and was 5 as it was saved; its sandbox is left paused`);
+      assert.equal(resumes(), 0);
+      writeFileSync(join(stateDir, "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
+      yield* there.agent.resume(resumeRequest(released.snapshot));
+      assert.equal(resumes(), 2);
+    })
+  ));
+
+test("a release's save whose last-save.json cannot be read once runsc's save has ended its sandbox is kept, its snapshot recording no generation of bayma's state, said and counted", () =>
+  added("alasio.node_agent.checkpoint.uncaught", () =>
+    withBucket(({ node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+        yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+        const stateDir = stateDirIn(volume);
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(join(stateDir, "last-save.json"), "{");
+        const taker = yield* node("node-1");
+        taker.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
+        const released = yield* taker.agent.checkpoint({ ...request("fs-abc"), stateDir: STATE_DIR });
+        assert.deepEqual([released.caught, released.live], [undefined, undefined]);
+        assert.equal((yield* taker.agent.current(workspace))?.snapshot, released.snapshot);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "": 1 })));
+
 test("a sandbox restored from a snapshot taken live resumes only while bayma's state generation is the one it caught, read on its volume as untrusted", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -2216,7 +2266,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
         Effect.gen(function*() {
           const before = resumes();
           const said = failure(yield* Effect.exit(agent.resume(resumeRequest(snapshot.snapshot)).pipe(Effect.timeout("5 seconds"))));
-          assert.match(said, new RegExp(`^the snapshot ${snapshot.snapshot} of main/fs-abc, taken live, holds the session no more: ${why.source}; its sandbox is left paused$`, "u"));
+          assert.match(said, new RegExp(`^the snapshot ${snapshot.snapshot} of main/fs-abc holds the session no more: ${why.source}; its sandbox is left paused$`, "u"));
           assert.equal(resumes(), before);
         });
 
@@ -2293,7 +2343,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       closeSync(writing);
       rmSync(spec);
       writeFileSync(spec, specified);
-      assert.equal(slow, `the snapshot ${snapshot.snapshot} of main/fs-abc, taken live, holds the session no more: ${STATE_DIR}/generation.json was not read within ${STATE_READ_TIMEOUT_MS / 1000} s; its sandbox is left paused`);
+      assert.equal(slow, `the snapshot ${snapshot.snapshot} of main/fs-abc holds the session no more: ${STATE_DIR}/generation.json was not read within ${STATE_READ_TIMEOUT_MS / 1000} s; its sandbox is left paused`);
       assert.equal(resumes(), resumed);
 
       // No volume of its pod holds bayma's state directory.
