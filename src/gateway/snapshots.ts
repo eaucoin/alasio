@@ -411,7 +411,10 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
   const kube = yield* KubeClient;
   const scope = yield* Effect.scope;
   /** The standby pods main's restores claim, where its sessions are snapshotted (./standbys.ts). */
-  const standbys = snapshots ? yield* makeStandbys(mainNamespace, standbyAfterMs === undefined ? {} : { afterMs: standbyAfterMs }) : null;
+  // Within each node's memory budget for what is held ahead, as its agent says it; a standby kept where it cannot be told.
+  const budgetOf = (node: string) =>
+    agents.memoryBudget(node).pipe(Effect.catch((error) => Effect.as(Effect.logWarning(`could not read ${node}'s memory budget: ${error.message}`), null)));
+  const standbys = snapshots ? yield* makeStandbys(mainNamespace, { budgetOf, ...(standbyAfterMs === undefined ? {} : { afterMs: standbyAfterMs }) }) : null;
   const ref = (pool: Pool, workspace: string) => ({ environment: pool.namespace, workspace });
 
   /** The pod `name` of `pool`, as the API server has it now. */

@@ -71,6 +71,10 @@ interface TaggedHoldings {
 const Prepared = Schema.Struct({ manifest: Manifest, imagePath: Schema.String, source: Schema.Literals(["cache", "bucket"]) });
 export type Prepared = typeof Prepared.Type;
 
+/** What a node's memory budget for what is held ahead of a session's need is, and what is held so, as its agent says (../node-agent/memory.ts nodeMemory). */
+const MemoryBudget = Schema.Struct({ budgetBytes: Schema.Number, budgetedBytes: Schema.Number });
+export type MemoryBudget = typeof MemoryBudget.Type;
+
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
@@ -155,6 +159,8 @@ export interface NodeAgents {
   readonly abandon: (node: string, request: AbandonRequest) => Effect.Effect<readonly Killed[], NodeAgentError | KubeApiError>;
   /** What `node` holds, as its agent says it now. */
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
+  /** What `node`'s memory budget for what is held ahead of a session's need is, and what is held so, as its agent says now. */
+  readonly memoryBudget: (node: string) => Effect.Effect<MemoryBudget, NodeAgentError | KubeApiError>;
   /**
    * What `node` holds, as its agent last said it: kept as it changes, by a request its agent
    * answers once it does (watchHoldings), so a restore's choice of its node asks no agent;
@@ -578,6 +584,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         Effect.map(({ killed }) => killed),
       ),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
+    memoryBudget: (node) => ask(node, "say what its node's memory holds", { method: "GET", path: "/memory", timeout: SHORT_CALL }, MemoryBudget),
     held: (node) =>
       Effect.suspend(() => {
         const known = kept.get(node);
