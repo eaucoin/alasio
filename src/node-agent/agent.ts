@@ -114,7 +114,7 @@ import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { currentTraceparent, meter, withAlasioSpan, withWaitSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
-import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, PAGES_METADATA_FILE, type SnapshotCache } from "./cache.ts";
+import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, PAGE_BYTES, PAGES_FILE, PAGES_METADATA_FILE, type PagesMarks, type SnapshotCache, type StagedPages } from "./cache.ts";
 import { Restores } from "./guard.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
@@ -128,6 +128,7 @@ import {
   RESTORE_RUNNING_WAIT_MS,
   restoresFromBucket,
   restoresWithETags,
+  restoresWithPagesCache,
   runscVersion,
   SAVE_HOOK_SECONDS,
   SAVE_LOAD_WAIT_SECONDS,
@@ -792,6 +793,8 @@ export interface NodeAgentOptions {
   readonly savesSummarySince: string;
   /** The first gVisor release that checks a restore's files in the bucket itself (restoresWithETags); none where empty. */
   readonly restoresWithETagsSince: string;
+  /** The first gVisor release that writes a restore's pages files through to the node's cache (restoresWithPagesCache); none where empty. */
+  readonly restoresWithPagesCacheSince: string;
   /**
    * How long a save of a release that bounds it waits for pages still loading, in seconds
    * (SAVE_LOAD_WAIT_SECONDS unless told), and how long a workspace's release saves may have been
@@ -1277,6 +1280,9 @@ function telling(cache: SnapshotCache, changed: Effect.Effect<void>): SnapshotCa
     discard: told(cache.discard),
     evict: told(cache.evict),
     room: told(cache.room),
+    stagePages: told(cache.stagePages),
+    unstagePages: told(cache.unstagePages),
+    commitPages: told(cache.commitPages),
   };
 }
 
@@ -1294,7 +1300,7 @@ interface ParentImage {
 }
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, restoresWithETagsSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, deltaAfterColdRestore = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, restoresWithETagsSince, restoresWithPagesCacheSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, deltaAfterColdRestore = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1311,6 +1317,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const bases = new Map<string, Manifest>();
   /** The snapshot each workspace's restore on this node was last prepared from, which its resume makes its sandbox's base. */
   const prepared = new Map<string, Manifest>();
+  /**
+   * Each workspace's restore from the bucket on this node, by its prefix, that writes its pages
+   * files through to the cache, until it is done (restoreEnded): what its fetch waits on before
+   * it looks at what the restore wrote (fetchLater).
+   */
+  const restoring = new Map<string, Deferred.Deferred<void>>();
   /**
    * Since when each workspace's release saves on this node have been deferred (SaveDeferred), by
    * its prefix, from the first that was, and the container whose sandbox they were of: in memory,
@@ -1405,15 +1417,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /** The object of the manifest of the workspace's snapshot `snapshot`. */
   const manifestKey = (ref: WorkspaceRef, snapshot: string): string => `${prefixOf(ref)}/${MANIFESTS_DIR}/${snapshot}.json`;
 
-  /** `effect`, the workspaces in flight while it runs, as the cache spares them. */
-  const inFlightWhile = <A, E>(workspaces: readonly WorkspaceRef[], effect: Effect.Effect<A, E>): Effect.Effect<A, E> => {
+  /** Holds the workspaces in flight, as the cache spares them, until the function it returns is called. */
+  const holdInFlight = (workspaces: readonly WorkspaceRef[]): (() => void) => {
     const names = [...new Set(workspaces.map(prefixOf))];
-    return Effect.acquireUseRelease(
-      Effect.sync(() => names.forEach((name) => inFlight.set(name, (inFlight.get(name) ?? 0) + 1))),
-      () => effect,
-      () => Effect.sync(() => names.forEach((name) => ((inFlight.get(name) ?? 1) > 1 ? inFlight.set(name, (inFlight.get(name) ?? 1) - 1) : inFlight.delete(name)))),
-    );
+    names.forEach((name) => inFlight.set(name, (inFlight.get(name) ?? 0) + 1));
+    return () => names.forEach((name) => ((inFlight.get(name) ?? 1) > 1 ? inFlight.set(name, (inFlight.get(name) ?? 1) - 1) : inFlight.delete(name)));
   };
+
+  /** `effect`, the workspaces in flight while it runs, as the cache spares them. */
+  const inFlightWhile = <A, E>(workspaces: readonly WorkspaceRef[], effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.acquireUseRelease(Effect.sync(() => holdInFlight(workspaces)), () => effect, (release) => Effect.sync(release));
 
   /** Whether the cache is to spare a workspace: one in flight. */
   const spared = (workspace: WorkspaceRef): boolean => inFlight.has(prefixOf(workspace));
@@ -1576,6 +1589,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     Effect.gen(function*() {
       const reason = `its image ${layer.digest} is not in the bucket as it was put`;
       if (!(yield* cache.holds(ref.environment, ref.workspace, layer.digest))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor in this node's cache` });
+      // One whose pages file a restore wrote holds only some of its pages: refused before its files are read.
+      if ((yield* cache.stamped(ref.environment, ref.workspace, layer.digest))?.pagesFor != null) {
+        return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, and this node's cache holds only the pages a restore read of it` });
+      }
       const files = yield* onDisk(() => imageFiles(cache.image(ref.environment, ref.workspace, layer.digest)));
       if (!sameFiles(files, layer)) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, and this node's cache holds other files of it` });
       yield* Effect.logWarning(`${reason}: it is put again from this node's cache`);
@@ -2299,10 +2316,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /** The image `layer` of the workspace's snapshot `snapshot`, from the bucket, staged in the cache, each file checked against the manifest's as it is received. */
   const received = (ref: WorkspaceRef, snapshot: string, layer: Layer): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
+    Effect.flatMap(cache.stage(ref.environment, ref.workspace, snapshot), (directory) => receivedInto(ref, directory, layer, layer.files));
+
+  /** `files` of the image `layer` of the workspace's, from the bucket, into `directory`, each checked against the manifest's as it is received. */
+  const receivedInto = (ref: WorkspaceRef, directory: string, layer: Layer, files: Layer["files"]): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const { environment, workspace } = ref;
-      const directory = yield* cache.stage(environment, workspace, snapshot);
-      for (const file of layer.files) {
+      for (const file of files) {
         const target = join(directory, file.path);
         yield* onDisk(() => mkdir(dirname(target), { recursive: true }));
         const got = yield* bucket.getFile(layerKey(ref, layer.digest, file.path), target, file.bytes);
@@ -2339,13 +2359,18 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * prepares it. What changes a file's bytes in place, its
    * size and modification time kept, as a disk that rots does, is not seen until the restore
    * reads those pages.
+   *
+   * A copy whose pages file a restore from the bucket wrote holds only the pages its image
+   * referred to (pagesFor): intact for a snapshot whose chain, `chain`, holds that image, as
+   * each image saved after it refers in it to those pages alone; not for another, as one of
+   * a branch the workspace left.
    */
-  const intact = (ref: WorkspaceRef, layer: Layer): Effect.Effect<boolean, CacheError> =>
+  const intact = (ref: WorkspaceRef, layer: Layer, chain: readonly string[]): Effect.Effect<boolean, CacheError> =>
     Effect.gen(function*() {
       const { environment, workspace } = ref;
       if (!(yield* cache.holds(environment, workspace, layer.digest))) return false;
       const stamped = yield* cache.stamped(environment, workspace, layer.digest);
-      if (stamped !== null && sameFiles(stamped, layer)) return true;
+      if (stamped !== null && sameFiles(stamped.files, layer) && (stamped.pagesFor === null || chain.includes(stamped.pagesFor))) return true;
       yield* Effect.logWarning(`the node's cached copy of the image ${layer.digest} of ${prefixOf(ref)} is not what its manifest says, or has changed since it was checked: it is read again from the bucket`);
       yield* cache.drop(environment, workspace, layer.digest);
       return false;
@@ -2453,21 +2478,27 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /**
    * Fetches into the cache, one at a time, each image of `manifest` it does not hold, once the
-   * restore from the bucket that reads by the token `reader` is done reading it through the
-   * proxy (./store-proxy.ts readsDone), in the agent's scope: the next checkpoint of the
-   * restored sandbox is a delta of the snapshot's image once the cache holds it. A fetch beside
-   * the restore would read the bucket again as the restore reads it, and slow it: the whole
-   * image a second time, the chain of a delta whole. Each is downloaded
-   * beside the workspace's images, which the cache spares meanwhile, holding the workspace
-   * only to look at what the cache holds of it and to commit it, so that a checkpoint of the
-   * sandbox, as its pod stops, waits on no download; one fetch of a workspace's runs at a time.
-   * What fails is said, and leaves that checkpoint whole. A trace of its own, linked to the
-   * prepare's it began in, which it outlives.
+   * restore from the bucket that reads by the token `reader` is done reading it, in the agent's
+   * scope: the next checkpoint of the restored sandbox is a delta of the snapshot's image once
+   * the cache holds it. Where the restore writes its images' pages files through to the cache as
+   * it reads them (`staged`, stagePagesOf), once it is done, as `ended` says, each of those it
+   * wrote whole is taken as it wrote it, its other files downloaded beside it (fetchWritten), the
+   * workspace spared from the prepare on; otherwise once it is done reading the bucket, as the
+   * proxy says (./store-proxy.ts readsDone), each downloaded whole (fetchNow): a fetch beside the
+   * restore would read the bucket again as the restore reads it, and slow it, the whole image a
+   * second time, the chain of a delta whole. Each is downloaded beside the workspace's images,
+   * which the cache spares meanwhile, holding the workspace only to look at what the cache holds
+   * of it and to commit it, so that a checkpoint of the sandbox, as its pod stops, waits on no
+   * download; one fetch of a workspace's runs at a time. What fails is said, and leaves that
+   * checkpoint whole. A trace of its own, linked to the prepare's it began in, which it outlives.
    */
-  const fetchLater = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
+  const fetchLater = (ref: WorkspaceRef, manifest: Manifest, reader: string, staged: ReadonlyMap<string, StagedPages>, ended: Deferred.Deferred<void> | null): Effect.Effect<void> =>
     Effect.suspend(() => {
       const begunIn = currentTraceparent();
-      return fetchNow(ref, manifest, reader).pipe(
+      // Spared from now on, before the fetch runs, what the restore writes in the cache with it.
+      const release = ended === null ? () => {} : holdInFlight([ref]);
+      return (ended === null ? fetchNow(ref, manifest, reader) : fetchWritten(ref, manifest, staged, ended)).pipe(
+        Effect.ensuring(Effect.sync(release)),
         withAlasioSpan("alasio.node_agent.fetch", { attributes: { ...spanAttributes(ref), "alasio.snapshot": manifest.snapshot }, parent: null, links: begunIn === null ? [] : [begunIn] }),
         withLogScope("node-agent"),
         Effect.forkIn(scope),
@@ -2521,26 +2552,132 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       );
     });
 
-  /** Fetches into the cache what fetchLater says, as it runs it in the background. */
-  const fetchNow = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
-    Effect.forEach(manifest.layers, (layer) =>
-      inFlightWhile([ref], Effect.gen(function*() {
-        // Held whole already: the pages metadata kept of it apart, as one an agent that stopped left, is of no use.
-        if (yield* exclusive([ref], intact(ref, layer))) return yield* cache.dropParent(ref.environment, ref.workspace, layer.digest);
-        yield* cache.room(bytesOf([layer]), spared).pipe(Effect.flatMap(logEvicted));
-        yield* received(ref, manifest.snapshot, layer);
-        yield* exclusive([ref], committed(ref, manifest.snapshot, layer));
-        yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "fetched" }));
-      })).pipe(
-        Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
-      ), { discard: true }).pipe(
-      (fetching) => Effect.scoped(RcMap.get(fetchLocks, prefixOf(ref)).pipe(Effect.flatMap((lock) => fetching.pipe(Semaphore.withPermit(lock))))),
-      (fetching) => storeProxy.readsDone(reader).pipe(Effect.andThen(fetching)),
+  /** The image `layer` of the workspace's, from the bucket into the cache, as fetchLater fetches one: the workspace in flight meanwhile, held to look at what the cache holds of it and to commit it. */
+  const fetchedWhole = (ref: WorkspaceRef, manifest: Manifest, layer: Layer): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
+    inFlightWhile([ref], Effect.gen(function*() {
+      yield* cache.room(bytesOf([layer]), spared).pipe(Effect.flatMap(logEvicted));
+      yield* received(ref, manifest.snapshot, layer);
+      yield* exclusive([ref], committed(ref, manifest.snapshot, layer));
+      yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "fetched" }));
+    }));
+
+  /** `fetching`, the fetch of the images of `manifest` of the workspace, one of its fetches at a time, said once done, the cache within its budget again then. */
+  const fetchingOnce = (ref: WorkspaceRef, manifest: Manifest, fetching: Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt>): Effect.Effect<void> =>
+    Effect.scoped(RcMap.get(fetchLocks, prefixOf(ref)).pipe(Effect.flatMap((lock) => fetching.pipe(Semaphore.withPermit(lock))))).pipe(
       Effect.tap(() => Effect.logInfo(`fetched the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, for its next delta`)),
       // Within its budget again, the least recently used workspace evicted.
       Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
       Effect.catch((error) => Effect.logWarning(`could not fetch the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, so its next checkpoint is whole: ${error.message}`)),
     );
+
+  /** Fetches into the cache what fetchLater says, once the restore is done reading the bucket, as it runs it in the background. */
+  const fetchNow = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
+    fetchingOnce(
+      ref,
+      manifest,
+      storeProxy.readsDone(reader).pipe(Effect.andThen(Effect.forEach(manifest.layers, (layer) =>
+        Effect.gen(function*() {
+          // Held whole already: the pages metadata kept of it apart, as one an agent that stopped left, is of no use.
+          if (yield* exclusive([ref], intact(ref, layer, chainOf(manifest)))) return yield* cache.dropParent(ref.environment, ref.workspace, layer.digest);
+          yield* fetchedWhole(ref, manifest, layer);
+        }).pipe(
+          Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
+        ), { discard: true }))),
+    );
+
+  /**
+   * Whether the checkpoint gofer's `marks` say it wrote the pages file of `layer` whole for the
+   * restore of `manifest`: in the marks' version 1, every page the snapshot's own image refers to
+   * checked against that image's page hashes, of as many pages as the file the manifest says;
+   * why not, where not.
+   */
+  const pagesWrittenWhole = (marks: PagesMarks | null, layer: Layer, manifest: Manifest): string | null => {
+    const bytes = layer.files.find(({ path }) => path === PAGES_FILE)?.bytes ?? 0;
+    if (marks === null) return "the restore left no marks of it, or of another file";
+    if (marks.version !== 1) return `its marks are of version ${marks.version}`;
+    if (!marks.complete) return "its marks say pages are missing";
+    if (marks.pages !== Math.ceil(bytes / PAGE_BYTES)) return `its marks are of ${marks.pages} pages, where its manifest's ${bytes} bytes are ${Math.ceil(bytes / PAGE_BYTES)}`;
+    if (marks.digest !== manifest.layers[0]?.digest) return `its marks were checked against the image ${marks.digest}`;
+    return null;
+  };
+
+  /**
+   * Fetches into the cache what fetchLater says, once the restore that wrote `staged` is done
+   * (`ended`), or backgroundReadMs after its prepare at the most, as a restore never resumed or
+   * whose sandbox died: each image whose pages file the restore wrote whole, as its marks say
+   * (pagesWrittenWhole), committed with its other files, downloaded beside it, and stamped as
+   * holding only the pages of the snapshot's own image, where the commit moved it in; any other
+   * downloaded whole, what was staged of it removed first, so that the room the download makes
+   * counts it out.
+   */
+  const fetchWritten = (ref: WorkspaceRef, manifest: Manifest, staged: ReadonlyMap<string, StagedPages>, ended: Deferred.Deferred<void>): Effect.Effect<void> =>
+    fetchingOnce(
+      ref,
+      manifest,
+      Deferred.await(ended).pipe(
+        Effect.timeoutOrElse({ duration: backgroundReadMs, orElse: () => Effect.logWarning(`the restore of ${prefixOf(ref)} from the bucket was not done within ${backgroundReadMs / 1000} s of its prepare: what it wrote of its images is not taken`) }),
+        Effect.andThen(Effect.forEach(manifest.layers, (layer) =>
+          Effect.gen(function*() {
+            const pages = staged.get(layer.digest);
+            if (yield* exclusive([ref], intact(ref, layer, chainOf(manifest)))) {
+              if (pages !== undefined) yield* exclusive([ref], cache.unstagePages(pages));
+              return yield* cache.dropParent(ref.environment, ref.workspace, layer.digest);
+            }
+            if (pages !== undefined) {
+              const why = pagesWrittenWhole(yield* cache.pagesMarks(pages), layer, manifest);
+              if (why === null) {
+                const others = layer.files.filter(({ path }) => path !== PAGES_FILE);
+                yield* cache.room(bytesOf([{ ...layer, files: others }]), spared).pipe(Effect.flatMap(logEvicted));
+                yield* receivedInto(ref, pages.directory, layer, others);
+                // A pages copy is stamped as such only where it is the one moved in: one held already keeps its own stamp.
+                yield* exclusive([ref], Effect.flatMap(cache.commitPages(pages), (moved) => (moved ? cache.stamp(ref.environment, ref.workspace, layer.digest, layer.files, manifest.layers[0]?.digest) : Effect.void)));
+                yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "cached" }));
+                return;
+              }
+              yield* Effect.logInfo(`the restore of ${prefixOf(ref)} did not write the pages of its image ${layer.digest} whole (${why}): it is downloaded whole`);
+              yield* exclusive([ref], cache.unstagePages(pages));
+              yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "cache_incomplete" }));
+            }
+            yield* fetchedWhole(ref, manifest, layer);
+          }).pipe(
+            Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
+          ), { discard: true })),
+        // What is left staged, as a fetch that failed leaves it, removed.
+        Effect.ensuring(Effect.forEach(staged.values(), (pages) => exclusive([ref], cache.unstagePages(pages)).pipe(Effect.ignore), { discard: true })),
+      ),
+    );
+
+  /**
+   * The pages files of the images of `manifest` that the cache does not hold intact, staged for
+   * its restore from the bucket to write as it reads them (cache.stagePages), as a release that
+   * does (restoresWithPagesCache) is given them, room made for each first: by their images'
+   * digests. One that cannot be staged, as the disk has no room for it, is not, said so: that
+   * image is downloaded whole after the restore.
+   */
+  const stagePagesOf = (ref: WorkspaceRef, manifest: Manifest): Effect.Effect<ReadonlyMap<string, StagedPages>, CacheError> =>
+    Effect.gen(function*() {
+      const staged = new Map<string, StagedPages>();
+      const nonce = randomBytes(8).toString("hex");
+      for (const [index, layer] of manifest.layers.entries()) {
+        const bytes = layer.files.find(({ path }) => path === PAGES_FILE)?.bytes;
+        if (bytes === undefined || (yield* intact(ref, layer, chainOf(manifest)))) continue;
+        yield* cache.room(bytes, spared).pipe(
+          Effect.flatMap(logEvicted),
+          Effect.andThen(cache.stagePages(ref.environment, ref.workspace, manifest.snapshot, nonce, layer.digest, bytes, index === 0)),
+          Effect.tap((pages) => Effect.sync(() => staged.set(layer.digest, pages))),
+          Effect.catch((error) => Effect.logWarning(`the pages of the image ${layer.digest} of ${prefixOf(ref)} are not written through to the node's cache as its restore reads them, so the image is downloaded whole after it: ${error.message}`)),
+        );
+      }
+      return staged;
+    });
+
+  /** Says the restore of the workspace `prefix` names that writes its pages files through to the cache is done, whether it succeeded (restoring). */
+  const restoreEnded = (prefix: string): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const ended = restoring.get(prefix);
+      restoring.delete(prefix);
+      return ended === undefined ? Effect.void : Deferred.succeed(ended, undefined).pipe(Effect.asVoid);
+    });
 
   /**
    * Tells the proxy how many bytes of pages the restore of the snapshot `snapshot` of the
@@ -2584,8 +2721,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     exclusive(
       [ref],
       Effect.gen(function*() {
-        // A restore of the workspace before this one is done with, its reads of the bucket with it.
+        // A restore of the workspace before this one is done with, its reads of the bucket with it, and its fetch looks at
+        // what it wrote of its images.
         storeProxy.revoke(prefixOf(ref));
+        yield* restoreEnded(prefixOf(ref));
         // Its compaction is stopped: the restore spends the snapshot, so the workspace moves on from what it would commit,
         // and it would read and write the node's disk as the restore reads its image there.
         yield* FiberMap.remove(compactionsRunning, prefixOf(ref));
@@ -2604,7 +2743,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         // it says so (verifiedStaged); one that does not verify has the images read from the
         // bucket instead.
         let imagePath: string | null = null;
-        const held = yield* Effect.forEach(manifest.layers, (layer) => intact(ref, layer)).pipe(
+        const held = yield* Effect.forEach(manifest.layers, (layer) => intact(ref, layer, chainOf(manifest))).pipe(
           Effect.map((intacts) => intacts.every(Boolean)),
           step("alasio.node_agent.prepare.intact", ref),
         );
@@ -2630,7 +2769,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const downloaded: Layer[] = [];
           const fetched = Effect.gen(function*() {
             const missing: Layer[] = [];
-            for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) missing.push(layer);
+            for (const layer of manifest.layers) if (!(yield* intact(ref, layer, chainOf(manifest)))) missing.push(layer);
             if (missing.length > 0) yield* cache.room(bytesOf(missing), spared).pipe(Effect.flatMap(logEvicted));
             yield* Effect.forEach(missing, (layer) => download(ref, snapshot, layer).pipe(Effect.tap(() => Effect.sync(() => downloaded.push(layer)))), { discard: true }).pipe(
               Effect.onError(() => cache.clear(environment, workspace).pipe(Effect.ignore)),
@@ -2659,8 +2798,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const [missing] = yield* notInBucket(ref, manifest.layers).pipe(step("alasio.node_agent.prepare.heads", ref));
           if (missing !== undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${missing.digest} is not in the bucket as it was put` });
         }
-        /** The token the restore reads the bucket by, where it does. */
+        /** The token the restore reads the bucket by, where it does; and the pages files it writes through to the cache as it reads them. */
         let reader: string | null = null;
+        let staged: ReadonlyMap<string, StagedPages> = new Map();
         if (imagePath === null) {
           // Through the socket where asked and the proxy serves one; over TCP otherwise.
           if (gofer?.transport === "socket" && storeProxy.socket === null) yield* Effect.logWarning(`the restore of ${prefixOf(ref)} asks to read the snapshots bucket through the node agent's socket, which it does not serve: it reads it over TCP`);
@@ -2673,10 +2813,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             step("alasio.node_agent.prepare.gofer", ref),
           );
           reader = token.accessKeyId;
+          // Under a release that writes them through to the cache, in the directory prepareRemote made anew.
+          if (restoresWithPagesCache(release, restoresWithPagesCacheSince)) staged = yield* stagePagesOf(ref, manifest).pipe(step("alasio.node_agent.prepare.pages", ref));
         }
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);
-        if (reader !== null) yield* fetchLater(ref, manifest, reader);
+        if (reader !== null) {
+          const ended = staged.size === 0 ? null : Deferred.makeUnsafe<void>();
+          if (ended !== null) restoring.set(prefixOf(ref), ended);
+          yield* fetchLater(ref, manifest, reader, staged, ended);
+        }
         if (reader !== null && deltaAfterColdRestore) yield* keepParentLater(ref, own);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
@@ -2954,6 +3100,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // outlives, saying how long the agent's background work yielded to restores meanwhile.
       const resumedIn = yield* Effect.sync(currentTraceparent);
       yield* Effect.forEach(running.containerIds, (id, index) => runsc.restored(containers[index]?.release ?? "", id), { discard: true }).pipe(
+        // Its fetch looks at what it wrote of its images then, however it ended.
+        Effect.ensuring(restoreEnded(prefixOf(request))),
         Effect.catch((error) => Effect.logWarning(`runsc did not say when the restore of ${prefixOf(request)} has read its image, so the agent's compactions yield to it no more: ${error.message}`)),
         Effect.andThen(loading.end(prefixOf(request))),
         Effect.tap(() => Effect.sync(() => restores.read(request.namespace, request.pod))),
@@ -2965,7 +3113,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return [waited, running] as const;
     }).pipe(
       // Not resumed, as it failed or its request went, it reads nothing more.
-      Effect.onError(() => Effect.andThen(Effect.sync(() => restores.read(request.namespace, request.pod)), loading.end(prefixOf(request)))),
+      Effect.onError(() => Effect.andThen(Effect.sync(() => restores.read(request.namespace, request.pod)), loading.end(prefixOf(request)).pipe(Effect.andThen(restoreEnded(prefixOf(request)))))),
       // Its gofer read its options as its pod's containers started, the restore's token among them.
       Effect.ensuring(goferOptionsGone(request)),
       // Ready as kubelet's probe would find it, before it is answered.

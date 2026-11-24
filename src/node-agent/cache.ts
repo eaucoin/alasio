@@ -24,7 +24,10 @@
  * Beside the images, in `<root>/<environment>/<workspace>/stamps/<digest>.json`, each
  * image's stamp: its files as they were checked as they were written, each by its SHA-256,
  * and its size, inode and modification time then. An image whose files are of those still
- * is taken as the one checked, without reading it again (stamped). A modification time is of
+ * is taken as the one checked, without reading it again (stamped). An image whose pages file
+ * a restore from the bucket wrote as it read it (stagePages) holds only the pages one image
+ * refers to, which its stamp names (pagesFor): its pages file was checked page by page, not
+ * by its SHA-256, and its other files are whole. A modification time is of
  * the filesystem's granularity, so a file put in its place of the same size, on an inode used
  * again, within one tick of it, is not seen: what holds the image whole there is runsc's
  * verify of it as it is staged or prepared and the SHA-256 of each file as it is downloaded.
@@ -38,8 +41,8 @@
  * than RESERVE_BYTES free: room is made first, workspaces evicted as they would be over the
  * budget, and what it cannot be made for is refused.
  */
-import { link, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, statfs, symlink, utimes, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { link, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, statfs, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 
 import { Clock, Effect, Schema, type Scope } from "effect";
 
@@ -79,10 +82,69 @@ export interface CheckedFile {
   readonly sha256: string;
 }
 
-/** An image's stamp, as the cache keeps it: each of its files as checked, and its inode and modification time then, in nanoseconds, in decimal. */
+/**
+ * An image's stamp, as the cache keeps it: each of its files as checked, and its inode and
+ * modification time then, in nanoseconds, in decimal; and, for an image whose pages file holds
+ * only the pages one image refers to, that image's digest.
+ */
 const Stamp = Schema.fromJsonString(Schema.Struct({
   files: Schema.Array(Schema.Struct({ path: Schema.String, bytes: Schema.Number, sha256: Schema.String, inode: Schema.String, modifiedNs: Schema.String })),
+  pagesFor: Schema.optional(Schema.String),
 }));
+
+/**
+ * An image as its stamp records it: its files as checked, each as its manifest says it, and,
+ * where its pages file holds only the pages the image `pagesFor` refers to, as a restore from
+ * the bucket wrote it, that image's digest; null for a whole copy.
+ */
+export interface StampedImage {
+  readonly files: readonly CheckedFile[];
+  readonly pagesFor: string | null;
+}
+
+/** The name of an image's pages file, as runsc names it. */
+export const PAGES_FILE = "pages.img";
+
+/** The bytes of a page of a pages file, as the checkpoint gofer's marks count them. */
+export const PAGE_BYTES = 4096;
+
+/** The directory, in a snapshot's directory, of the pages files a restore from the bucket writes as it reads them (stagePages). */
+export const PAGES_CACHE_DIR = "pages-cache";
+
+/** The suffix of the marks the checkpoint gofer writes beside a pages file it wrote (pagesMarks). */
+const MARKS_SUFFIX = ".marks";
+
+/** The marks' magic, and the bytes of their header: magic, version, flags, pages, digest. */
+const MARKS_MAGIC = "gvcmarks";
+const MARKS_HEADER_BYTES = MARKS_MAGIC.length + 4 + 4 + 8 + 32;
+
+/**
+ * What the checkpoint gofer says of a pages file it wrote as its restore read it, in its marks'
+ * header: their version, whether every page its image refers to is checked, how many pages
+ * the file holds, and the digest of the image whose page hashes they were checked against.
+ */
+export interface PagesMarks {
+  readonly version: number;
+  readonly complete: boolean;
+  readonly pages: number;
+  readonly digest: string;
+}
+
+/**
+ * A pages file staged for a restore from the bucket to write as it reads it (stagePages): its
+ * directory, of its own, which the image is committed from once whole, and the path, in the
+ * snapshot's PAGES_CACHE_DIR, linked to its pages file, where the checkpoint gofer writes it.
+ */
+export interface StagedPages {
+  readonly environment: string;
+  readonly workspace: string;
+  readonly digest: string;
+  readonly directory: string;
+  readonly link: string;
+}
+
+/** A restore's own name for what it stages (stagePages), as the agent makes one: 16 hex digits. */
+export const STAGING_NONCE = /^[0-9a-f]{16}$/u;
 
 /** An image's digest, as runsc names it: the SHA-256 of its pages metadata, in hex. */
 export const DIGEST = /^[0-9a-f]{64}$/u;
@@ -127,22 +189,23 @@ export interface SnapshotCache {
   /** Removes the image staged as `name`, as a save that failed left it. */
   readonly unstage: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
   /**
-   * Moves the image staged as `name` where an image of `digest` is, the workspace used now; one there already is kept, the
-   * staged one removed. The pages metadata kept of it apart (keepParent) is removed, as the image's own is there.
+   * Moves the image staged as `name` where an image of `digest` is, the workspace used now; one
+   * there already is kept, the staged one removed: whether it moved the staged one. The pages
+   * metadata kept of it apart (keepParent) is removed, as the image's own is there.
    */
-  readonly commit: (environment: string, workspace: string, name: string, digest: string) => Effect.Effect<void, CacheError>;
+  readonly commit: (environment: string, workspace: string, name: string, digest: string) => Effect.Effect<boolean, CacheError>;
   /**
    * Records the image `digest` of the workspace as `files`, its files as they were checked
-   * as they were written: each by its SHA-256, and its size, inode and modification time now.
+   * as they were written: each by its SHA-256, and its size, inode and modification time now;
+   * and, where given, `pagesFor`, the image whose referenced pages alone its pages file holds.
    */
-  readonly stamp: (environment: string, workspace: string, digest: string, files: readonly CheckedFile[]) => Effect.Effect<void, CacheError>;
+  readonly stamp: (environment: string, workspace: string, digest: string, files: readonly CheckedFile[], pagesFor?: string) => Effect.Effect<void, CacheError>;
   /**
-   * The files of the image `digest` of the workspace as its stamp records them, if they are
-   * the files it holds, each of the size, inode and modification time recorded; null where
-   * it has no stamp, or one of them has changed since, as what changes a file does. None of
-   * its files is read.
+   * The image `digest` of the workspace as its stamp records it, if its files are the files it
+   * holds, each of the size, inode and modification time recorded; null where it has no stamp,
+   * or one of them has changed since, as what changes a file does. None of its files is read.
    */
-  readonly stamped: (environment: string, workspace: string, digest: string) => Effect.Effect<readonly CheckedFile[] | null, CacheError>;
+  readonly stamped: (environment: string, workspace: string, digest: string) => Effect.Effect<StampedImage | null, CacheError>;
   /**
    * A directory of its own, made now, where the pages metadata of the image `digest` of the workspace is written until it is
    * kept (keepParent), `PAGES_METADATA_FILE` in it: one for each writer however many write it at once, none of them another's.
@@ -157,6 +220,28 @@ export interface SnapshotCache {
   readonly parent: (environment: string, workspace: string, digest: string) => Effect.Effect<string | null, CacheError>;
   /** Removes the pages metadata the cache keeps of the image `digest` of the workspace (keepParent), as one not what it was or of an image it holds whole. */
   readonly dropParent: (environment: string, workspace: string, digest: string) => Effect.Effect<void, CacheError>;
+  /**
+   * Stages the pages file of the image `digest` of the workspace, `bytes` long and sparse, for
+   * the restore of the snapshot prepared from the bucket (prepareRemote, which it follows), named
+   * `nonce` by it, to write as it reads it: in a directory of its own, whose name begins with
+   * ".", linked into the snapshot's PAGES_CACHE_DIR at the path its checkpoint gofer reads it
+   * at, the snapshot's own image's (`top`) or a layer's.
+   */
+  readonly stagePages: (environment: string, workspace: string, snapshot: string, nonce: string, digest: string, bytes: number, top: boolean) => Effect.Effect<StagedPages, CacheError>;
+  /**
+   * The marks the checkpoint gofer wrote of `staged`, their header, where the file it wrote them
+   * of is `staged`'s (of its inode): null where there are none, as a restore that did not end
+   * leaves, or of another file, as another restore of the snapshot prepared since stages.
+   */
+  readonly pagesMarks: (staged: StagedPages) => Effect.Effect<PagesMarks | null, CacheError>;
+  /** Removes `staged`, both its names: its link only where it is still `staged`'s. */
+  readonly unstagePages: (staged: StagedPages) => Effect.Effect<void, CacheError>;
+  /**
+   * Moves `staged`'s directory, the image it holds whole but its pages file, among the
+   * workspace's images, as commit does, once its link and marks are removed: whether it moved
+   * it, one there already kept.
+   */
+  readonly commitPages: (staged: StagedPages) => Effect.Effect<boolean, CacheError>;
   /** Whether the image `digest` of the workspace is whole in the cache. */
   readonly holds: (environment: string, workspace: string, digest: string) => Effect.Effect<boolean, CacheError>;
   /**
@@ -211,7 +296,7 @@ export interface SnapshotCache {
    * workspaces as `evict` does: those evicted. Fails, saying so, where it cannot.
    */
   readonly room: (bytes: number, spared: Spared) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
-  /** Removes what was left half written, the copies left (remoteCopy, chainCopy), and pages metadata kept of an image held whole. */
+  /** Removes what was left half written, the pages files staged for restores (stagePages), the copies left (remoteCopy, chainCopy), and pages metadata kept of an image held whole. */
   readonly clean: Effect.Effect<void, CacheError>;
 }
 
@@ -230,6 +315,9 @@ function checked(environment: string, workspace: string, snapshot: string | null
 
 /** The directory an image is written in until it is whole. */
 const staged = (name: string): string => `.${name}`;
+
+/** The directory a restore named `nonce` stages the pages file of the image `digest` of the snapshot in (stagePages). */
+const stagedPages = (snapshot: string, nonce: string, digest: string): string => `.pages-${snapshot}-${nonce}-${digest}`;
 
 /** The names of the directories in `directory`, but those being written; none when it is not there. */
 async function directories(directory: string): Promise<string[]> {
@@ -338,6 +426,31 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     for (const digest of layers) await symlink(relative(join(directory, LAYERS_DIR), image(environment, workspace, digest)), join(directory, LAYERS_DIR, digest));
   };
 
+  /**
+   * Moves the image written in `from` where an image of `digest` is, the workspace used now; one
+   * there already is kept, `from` removed, as is the pages metadata kept of it apart (keepParent):
+   * whether it moved it.
+   */
+  const moveIn = (environment: string, workspace: string, from: string, digest: string): Effect.Effect<boolean, CacheError> =>
+    holds(environment, workspace, digest).pipe(
+      Effect.flatMap((held) => attempt(async () => {
+        if (held) await rm(from, { recursive: true, force: true });
+        else await rename(from, image(environment, workspace, digest));
+        // Held now, its pages metadata kept apart (keepParent) is the image's own.
+        await rm(parentDir(environment, workspace, digest), { recursive: true, force: true });
+        return !held;
+      })),
+      Effect.tap(() => use(environment, workspace)),
+    );
+
+  /** Removes the link of `staged` and the marks beside it, where it is still `staged`'s, as another restore's may be in its place. */
+  const unlinkStaged = async ({ directory, link: linked }: StagedPages): Promise<void> => {
+    const [at, own] = await Promise.all([unlessGone(stat(linked)), unlessGone(stat(join(directory, PAGES_FILE)))]);
+    if (at === null || own === null || at.ino !== own.ino || at.dev !== own.dev) return;
+    await rm(linked, { force: true });
+    await rm(`${linked}${MARKS_SUFFIX}`, { force: true });
+  };
+
   /** Removes `cached` whole. */
   const remove = (cached: CachedWorkspace): Effect.Effect<void, CacheError> =>
     attempt(() => rm(workspaceDir(cached.environment, cached.workspace), { recursive: true, force: true }));
@@ -362,13 +475,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
 
     commit: (environment, workspace, name, digest) => {
       checked(environment, workspace, name, [digest]);
-      const from = join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name));
-      return holds(environment, workspace, digest).pipe(
-        Effect.flatMap((held) => attempt(() => (held ? rm(from, { recursive: true, force: true }) : rename(from, image(environment, workspace, digest))))),
-        // Whole now, its pages metadata kept apart is the image's own.
-        Effect.andThen(attempt(() => rm(parentDir(environment, workspace, digest), { recursive: true, force: true }))),
-        Effect.andThen(use(environment, workspace)),
-      );
+      return moveIn(environment, workspace, join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name)), digest);
     },
 
     stageParent: (environment, workspace, digest) => {
@@ -405,7 +512,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         Effect.map((digests) => (digests.includes(digest) ? parentDir(environment, workspace, digest) : null)),
       ),
 
-    stamp: (environment, workspace, digest, files) =>
+    stamp: (environment, workspace, digest, files, pagesFor) =>
       attempt(async () => {
         const directory = image(environment, workspace, digest);
         const stamped = await Promise.all(files.map(async (file) => {
@@ -416,7 +523,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         // Written beside it, then moved in, so a stamp is always whole.
         const writing = join(workspaceDir(environment, workspace), STAMPS_DIR, `.${digest}.json`);
         await mkdir(join(workspaceDir(environment, workspace), STAMPS_DIR), { recursive: true });
-        await writeFile(writing, JSON.stringify({ files: stamped }));
+        await writeFile(writing, JSON.stringify({ files: stamped, ...(pagesFor === undefined ? {} : { pagesFor }) }));
         await rename(writing, path);
       }),
 
@@ -425,7 +532,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         const text = await readFile(stampOf(environment, workspace, digest), "utf8").catch(() => null);
         const decoded = text === null ? null : Schema.decodeUnknownOption(Stamp)(text);
         if (decoded === null || decoded._tag === "None") return null;
-        const { files } = decoded.value;
+        const { files, pagesFor } = decoded.value;
         const directory = image(environment, workspace, digest);
         // The files it holds, every one of them the stamp's.
         const held = (await readdir(directory, { withFileTypes: true, recursive: true }).catch(() => []))
@@ -437,8 +544,47 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
           const found = await stat(join(directory, path), { bigint: true }).catch(() => null);
           if (found === null || found.size !== BigInt(bytes) || String(found.ino) !== inode || String(found.mtimeNs) !== modifiedNs) return null;
         }
-        return files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 }));
+        return { files: files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), pagesFor: pagesFor ?? null };
       }),
+
+    stagePages: (environment, workspace, snapshot, nonce, digest, bytes, top) => {
+      checked(environment, workspace, snapshot, [digest]);
+      if (!STAGING_NONCE.test(nonce)) throw new Error(`the snapshot cache stages no pages as ${JSON.stringify(nonce)}`);
+      const directory = join(workspaceDir(environment, workspace), LAYERS_DIR, stagedPages(snapshot, nonce, digest));
+      // Where the checkpoint gofer reads it, as runsc names a layer's files.
+      const servedAt = join(workspaceDir(environment, workspace), snapshot, PAGES_CACHE_DIR, ...(top ? [] : [LAYERS_DIR, digest]), PAGES_FILE);
+      return attempt(async () => {
+        await rm(directory, { recursive: true, force: true });
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, PAGES_FILE), "", { flag: "wx" });
+        await truncate(join(directory, PAGES_FILE), bytes);
+        await mkdir(dirname(servedAt), { recursive: true });
+        // A hard link: the gofer opens nothing through a symbolic one.
+        await link(join(directory, PAGES_FILE), servedAt);
+      }).pipe(Effect.andThen(use(environment, workspace)), Effect.as({ environment, workspace, digest, directory, link: servedAt }));
+    },
+
+    pagesMarks: ({ directory, link }) =>
+      attempt(async () => {
+        const [linked, own] = await Promise.all([unlessGone(stat(link, { bigint: true })), unlessGone(stat(join(directory, PAGES_FILE), { bigint: true }))]);
+        if (linked === null || own === null || linked.ino !== own.ino || linked.dev !== own.dev) return null;
+        const header = await unlessGone(readFile(`${link}${MARKS_SUFFIX}`));
+        if (header === null || header.length < MARKS_HEADER_BYTES || header.toString("latin1", 0, MARKS_MAGIC.length) !== MARKS_MAGIC) return null;
+        let at = MARKS_MAGIC.length;
+        const version = header.readUInt32LE(at);
+        const flags = header.readUInt32LE((at += 4));
+        const pages = Number(header.readBigUInt64LE((at += 4)));
+        const digest = header.toString("hex", (at += 8), at + 32);
+        return { version, complete: (flags & 1) === 1, pages, digest };
+      }),
+
+    unstagePages: (staged) =>
+      attempt(async () => {
+        await unlinkStaged(staged);
+        await rm(staged.directory, { recursive: true, force: true });
+      }),
+
+    commitPages: (staged) => attempt(() => unlinkStaged(staged)).pipe(Effect.andThen(moveIn(staged.environment, staged.workspace, staged.directory, staged.digest))),
 
     holds,
 
@@ -584,6 +730,10 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
           const held = await directories(join(workspaceDir(environment, workspace), LAYERS_DIR));
           for (const digest of (await directories(join(workspaceDir(environment, workspace), PARENTS_DIR))).filter((name) => held.includes(name))) {
             await rm(join(workspaceDir(environment, workspace), PARENTS_DIR, digest), { recursive: true, force: true });
+          }
+          // The pages files staged for restores (stagePages), which no fetch of this agent's will commit.
+          for (const snapshot of (await directories(workspaceDir(environment, workspace))).filter((name) => SNAPSHOT.test(name))) {
+            await rm(join(workspaceDir(environment, workspace), snapshot, PAGES_CACHE_DIR), { recursive: true, force: true });
           }
         }
       }

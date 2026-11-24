@@ -209,6 +209,7 @@ import {
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SAVES_SUMMARY_SINCE_VARIABLE,
   RESTORES_WITH_ETAGS_SINCE_VARIABLE,
+  RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE,
   SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
@@ -623,7 +624,9 @@ const CONDITIONS_TRIES = Schedule.min([Schedule.exponential("1 second"), Schedul
  * pages still loading (SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE; none unless given), the first that writes a checkpoint's
  * summary (SAVES_SUMMARY_SINCE_VARIABLE; none unless given), the first that checks a restore's files in the
  * bucket itself (RESTORES_WITH_ETAGS_SINCE_VARIABLE; none unless given, each file then looked at as the restore is
- * prepared), its pod's address (POD_IP_VARIABLE),
+ * prepared), the first that writes a restore's pages files through to the node's cache
+ * (RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE; none unless given, each image then downloaded whole after its restore),
+ * its pod's address (POD_IP_VARIABLE),
  * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
  * as on its socket on the node, beside its restores' tokens (NODE_AGENT_RUN_DIR, unless
  * NODE_AGENT_RUN_DIR_VARIABLE says), how long a resumed restore may read it there
@@ -648,6 +651,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const savesWithLoadWaitSince = yield* Config.String(SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE).pipe(Config.withDefault(""));
   const savesSummarySince = yield* Config.String(SAVES_SUMMARY_SINCE_VARIABLE).pipe(Config.withDefault(""));
   const restoresWithETagsSince = yield* Config.String(RESTORES_WITH_ETAGS_SINCE_VARIABLE).pipe(Config.withDefault(""));
+  const restoresWithPagesCacheSince = yield* Config.String(RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE).pipe(Config.withDefault(""));
   const current = yield* Config.String(GVISOR_RELEASE_VARIABLE);
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const loadingStallSeconds = yield* Config.Int(LOADING_STALL_SECONDS_VARIABLE);
@@ -688,6 +692,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     savesWithLoadWaitSince,
     savesSummarySince,
     restoresWithETagsSince,
+    restoresWithPagesCacheSince,
     backgroundReadMs: backgroundReadSeconds * 1000,
     loadingSave: { stallMs: loadingStallSeconds * 1000, ...loadingTimings },
     ...(loadWaitSeconds === undefined ? {} : { loadWait: { waitSeconds: loadWaitSeconds } }),
