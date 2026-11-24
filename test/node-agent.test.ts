@@ -240,6 +240,8 @@ interface Node {
   readonly restarted: Effect.Effect<NodeAgent, never, Scope.Scope>;
   /** The pod its restores are into, as the API server says it as a resume watches it: running, of these addresses and containers, unless gone. */
   readonly pod: { podIPs: readonly string[]; containerIds: readonly string[]; gone: boolean };
+  /** The compactions its agent recorded beside the workspaces' files, in order; and whether recording the next fails, as workspace storage away would. */
+  readonly compacted: { readonly recorded: { readonly ref: WorkspaceRef; readonly from: string; readonly manifest: Manifest }[]; fails: boolean };
 }
 
 /** What a node of the test's has: its releases, its cache's budget, and the runsc its agent runs, the node's as `runsc` changes it. */
@@ -290,7 +292,10 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
       const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) }).pipe(Effect.orDie);
       const pod = { podIPs: [POD_IP] as readonly string[], containerIds: [CONTAINER, OTHER_CONTAINER] as readonly string[], gone: false };
+      const compacted: Node["compacted"] = { recorded: [], fails: false };
       const restarted = makeNodeAgent({
+        compacted: (ref, { from, manifest }) =>
+          compacted.fails ? Effect.fail({ message: "workspace storage is not mounted on this node now" }) : Effect.sync(() => void compacted.recorded.push({ ref: { environment: ref.environment, workspace: ref.workspace }, from, manifest })),
         node: name,
         nodeRoot: "/",
         runsc,
@@ -307,7 +312,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
         ...(onePassSaves === undefined ? {} : { onePassSaves }),
       });
-      return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod };
+      return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod, compacted };
     });
   try {
     await Effect.runPromise(Effect.scoped(body({ s3, node })));
@@ -1035,6 +1040,9 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
         assert.ok(s3.objects.has(`main/fs-abc/manifests/${delta.snapshot}.json`));
         assert.deepEqual(JSON.parse(readFileSync(join(there.cacheDir, "main", "fs-abc", "manifest.json"), "utf8")), compacted);
         assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        // Then recorded beside the workspace's files, for the gateway's restore of the workspace released into the delta.
+        yield* Effect.sync(() => there.compacted.recorded.length).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count > 0 }), Effect.timeout("10 seconds"));
+        assert.deepEqual(there.compacted.recorded, [{ ref: workspace, from: delta.snapshot, manifest: compacted }]);
         // Restored elsewhere, it reads one image; the next delta of the sandbox restored is of that image.
         const third = yield* node("node-3");
         const prepared = yield* preparing(third.agent, workspace);
@@ -1047,6 +1055,35 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
         // Small, it is not compacted.
         yield* Effect.sleep("200 millis");
         assert.deepEqual(yield* there.agent.current(workspace), next);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=compacted": 1 })));
+
+test("a compaction whose record beside the workspace's files cannot be written, as one whose agent stops between its commit and its record leaves it, stands committed, the snapshot it was compacted from kept for the restore that reads it", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const taker = yield* node("node-1");
+        yield* taker.agent.checkpoint(request("fs-abc"));
+        const there = yield* node("node-2");
+        const { manifest } = yield* preparing(there.agent, workspace);
+        yield* there.agent.spend(workspace, manifest.snapshot);
+        yield* there.agent.resume(resumeRequest(manifest.snapshot));
+        yield* fetched(there, manifest);
+        there.compacted.fails = true;
+        writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
+        const delta = yield* there.agent.checkpoint(request("fs-abc"));
+        const compacted = yield* compactedFrom(there.agent, delta.snapshot);
+        assert.ok(compacted);
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(there.compacted.recorded, []);
+        // What the workspace was released into is kept by a collection as long as the compacted one is its latest, and
+        // restores: the same sandbox at the same moment, in two images.
+        const kept = yield* there.agent.collect(workspace);
+        assert.ok(delta.layers.every(({ digest }) => kept.includes(digest)), `${kept.join(", ")} keeps not every image of ${delta.snapshot}`);
+        const third = yield* node("node-3");
+        assert.equal((yield* third.agent.prepare({ ...workspace, manifest: delta })).source, "bucket");
       })
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=compacted": 1 })));
@@ -1121,7 +1158,7 @@ test("a restore's prepare and resume are traced step by step, from the node's ca
     }).pipe(Effect.provide(TracingLayer))
   ));
 
-test("a compaction is a trace of its own, linked to the checkpoint's it runs after, traced step by step: runsc's compaction, its image's inspection, its upload, file by file, and its commit", () =>
+test("a compaction is a trace of its own, linked to the checkpoint's it runs after, traced step by step: runsc's compaction, its image's inspection, its upload, file by file, its commit, and its record for the gateway", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
@@ -1141,7 +1178,7 @@ test("a compaction is a trace of its own, linked to the checkpoint's it runs aft
       const compaction = yield* Effect.promise(() => endedLater("alasio.node_agent.compaction", since));
       assert.deepEqual([compaction.parentSpanContext, compaction.links.map(({ context }) => context.spanId)], [undefined, [checkpoint.spanContext().spanId]]);
       const steps = childrenOf(compaction);
-      assert.deepEqual(namesOf(steps), ["compact", "inspect", "upload", "commit"].map((name) => `alasio.node_agent.compaction.${name}`));
+      assert.deepEqual(namesOf(steps), ["compact", "inspect", "upload", "commit", "record"].map((name) => `alasio.node_agent.compaction.${name}`));
       const upload = steps[2];
       assert.ok(upload && childrenOf(upload).length > 0 && childrenOf(upload).every(({ name }) => name === "alasio.node_agent.compaction.upload.put"));
     }).pipe(Effect.provide(TracingLayer))
@@ -1277,6 +1314,8 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
         yield* Effect.sleep("200 millis");
         assert.equal(compactions(), 2);
         assert.deepEqual(yield* here.agent.current(workspace), second);
+        // None committed, none recorded.
+        assert.deepEqual(here.compacted.recorded, []);
       })
     )
   ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
@@ -3883,6 +3922,7 @@ const unusedWorkspaces: Workspaces = {
   sync: () => Effect.die("no sandbox is told to write its files through"),
   released: () => Effect.die("no workspace's release is read"),
   setReleased: () => Effect.die("no workspace's release is recorded"),
+  setCompacted: () => Effect.die("no workspace's compaction is recorded"),
 };
 
 test("the agent's API answers what the node's memory holds where it reads it, and says it reads none where it does not", () =>
@@ -4968,14 +5008,18 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       assert.deepEqual(yield* agents.listEnvironments, ["main"]);
       yield* agents.removeWorkspace(fork);
       assert.equal(yield* agents.quota(fork), null);
-      // The snapshot one was released into, recorded and read back through any agent, and cleared.
-      const into = { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" };
+      // The snapshot one was released into, with its manifest, recorded and read back through any agent, and cleared.
+      const snapshot = "20261017T120000000Z-0000000a";
+      const into = { snapshot, release: RELEASE, manifest: { ...RELEASED_MANIFEST, workspace: "fs-made", snapshot } };
       assert.equal(yield* agents.released(made), null);
       yield* agents.setReleased(made, into);
       assert.deepEqual(yield* agents.released(made), into);
       yield* agents.setReleased(made, null);
       assert.equal(yield* agents.released(made), null);
-      const unrecorded = yield* Effect.flip(agents.setReleased(fork, into));
+      const unrecorded = yield* Effect.flip(agents.setReleased(fork, { ...into, manifest: { ...into.manifest, workspace: "fs-fork" } }));
       assert.equal(unrecorded._tag === "NodeAgentError" && unrecorded.status, 404);
+      // Nor into another workspace's snapshot.
+      const another = yield* Effect.flip(agents.setReleased(made, { ...into, manifest: { ...into.manifest, workspace: "fs-abc123" } }));
+      assert.equal(another._tag === "NodeAgentError" && another.status, 400);
     })
   ));

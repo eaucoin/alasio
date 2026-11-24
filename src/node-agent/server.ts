@@ -104,11 +104,12 @@
  *   (204), as it does one that is not there.
  * - `GET /workspaces`: `{ environments }`, the names of the environments any workspace is of.
  * - `GET /workspaces/<environment>`: `{ workspaces }`, the names of the environment's workspaces.
- * - `GET /workspaces/<environment>/<workspace>/released`: `{ snapshot, release }`, the snapshot
- *   it was last released into, as its record beside its files says (./workspaces.ts) (200);
- *   404 where none is recorded.
- * - `PUT /workspaces/<environment>/<workspace>/released`, `{ snapshot, release }`: records the
- *   snapshot it is released into (204); 404 where there is no such workspace.
+ * - `GET /workspaces/<environment>/<workspace>/released`: `{ snapshot, release, manifest }`, the
+ *   snapshot it was last released into and the manifest a restore of it restores, as its records
+ *   beside its files say (./workspaces.ts) (200); 404 where none is recorded.
+ * - `PUT /workspaces/<environment>/<workspace>/released`, `{ snapshot, release, manifest }`:
+ *   records the snapshot it is released into (204); 400 where the manifest is another
+ *   workspace's, 404 where there is no such workspace.
  * - `DELETE /workspaces/<environment>/<workspace>/released`: records none (204).
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
@@ -628,6 +629,12 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const host = makeHostCommands();
   const kube = yield* Effect.provide(Effect.service(KubeClient), KubeClient.layer);
   const store = makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) });
+  // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
+  const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));
+  const juicefs = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeJuicefs({ metaUrl: Redacted.value(url) }) });
+  // What workspace storage holds, as the node's mount counts it, where the agent works with it.
+  if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
+  const workspaces = yield* makeWorkspaces({ host, runsc, juicefs });
   const agent = yield* makeNodeAgent({
     node,
     nodeRoot: NODE_ROOT,
@@ -643,13 +650,8 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     ...(loadWaitSeconds === undefined ? {} : { loadWait: { waitSeconds: loadWaitSeconds } }),
     pods: podChanges(kube),
     onePassSaves,
+    compacted: workspaces.setCompacted,
   });
-  // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
-  const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));
-  const juicefs = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeJuicefs({ metaUrl: Redacted.value(url) }) });
-  // What workspace storage holds, as the node's mount counts it, where the agent works with it.
-  if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
-  const workspaces = yield* makeWorkspaces({ host, runsc, juicefs });
   // What the node's memory holds, its sandboxes' and the budget of what is held ahead, as gauges and as its API answers it.
   const memory = { runsc, nodeRoot: NODE_ROOT, attachRoot: ATTACH_ROOT };
   yield* observeNodeMemory(memory);

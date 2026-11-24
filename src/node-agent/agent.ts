@@ -39,7 +39,9 @@
  * the node at its lowest priority, yielding to the restores on the node that read their
  * images (./loading.ts): its images into one, the image of a new snapshot
  * `compactedFrom` it, committed as the current one only if the workspace has not moved on
- * from it meanwhile; a restore of the workspace on this node stops it, as the workspace moves on
+ * from it meanwhile, then recorded beside the workspace's files (NodeAgentOptions compacted),
+ * as the gateway restores a workspace released into the one from that record, reading nothing
+ * of the bucket; a restore of the workspace on this node stops it, as the workspace moves on
  * from it with the restore, its runsc killed and what it wrote of its image removed from the
  * cache and the bucket. It is the same sandbox at the same moment, so a workspace released into
  * the one is restored from the other, which is the next delta's base. A snapshot taken live
@@ -796,6 +798,13 @@ export interface NodeAgentOptions {
    * bucket, then writes its manifest and its commit one after the other: no unless told.
    */
   readonly onePassSaves?: boolean;
+  /**
+   * Records, beside the workspace's files, the compaction of its snapshot `from` this agent
+   * committed, `manifest` (./workspaces.ts setCompacted): what a restore of a workspace released
+   * into `from` restores instead. One that fails leaves that restore to the snapshot compacted
+   * from, which collection keeps while the compaction's manifest is the workspace's latest.
+   */
+  readonly compacted: (ref: WorkspaceRef, compacted: { readonly from: string; readonly manifest: Manifest }) => Effect.Effect<void, { readonly message: string }>;
 }
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
@@ -1127,7 +1136,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1721,6 +1730,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           return null;
         }
         yield* ended("compacted");
+        // Recorded for the gateway, which restores the workspace from it as it binds it, reading nothing of the bucket.
+        yield* recordCompacted(committed, { from: committed.snapshot, manifest }).pipe(
+          step("alasio.node_agent.compaction.record", committed),
+          Effect.catch((error) => Effect.logWarning(`could not record the compaction of ${committed.snapshot} of ${prefixOf(committed)} into ${snapshot}, so it is restored from ${committed.snapshot}, of its ${committed.layers.length} images: ${error.message}`)),
+        );
         yield* Effect.logInfo(
           `compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}: its ${committed.layers.length} images, ${committed.bytes} bytes, are the image of its snapshot ${snapshot}, ${manifest.bytes} bytes, in ${compactMs} ms, uploaded in ${uploadMs} ms`,
         );

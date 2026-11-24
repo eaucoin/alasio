@@ -77,10 +77,15 @@
  * the mount has.
  *
  * Beside its files, which its sandbox sees, and so out of its sandbox's reach, a workspace
- * keeps the snapshot it was last released into (`released.json`, a Released), which its
- * gateway records as it releases it and reads as it binds it, holding its binding's Lease
- * meanwhile, the one writer at a time: written whole or not at all, a file of its own synced
- * then renamed over it, the directory synced after.
+ * keeps the snapshot it was last released into (`released.json`, a Released), with its
+ * manifest, which its gateway records as it releases it and reads as it binds it, holding its
+ * binding's Lease meanwhile, the one writer at a time; and the last compaction its node's agent
+ * committed (`compacted.json`, a Compacted), which that agent alone writes, once its commit is
+ * through, and which a record of the snapshot it was compacted from is read with, its manifest
+ * the compaction's: a restore of it then reads the one image. One written late, of a snapshot
+ * the workspace was released into before, is of none it is released into now, and read with
+ * none. Each written whole or not at all, a file of its own synced then renamed over it, the
+ * directory synced after.
  */
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -88,13 +93,14 @@ import { constants, type StatsFs } from "node:fs";
 import { chmod, chown, link, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { Clock, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
+import { Clock, Effect, Option, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
+import { Manifest } from "./agent.ts";
 import { ATTACH_ROOT, BINDING_FILE, RESTORE_POD, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
@@ -152,23 +158,44 @@ export function mountPoints(mountinfo: string): string[] {
   });
 }
 
+/** A snapshot's id, as SNAPSHOT_ID says. */
+const SnapshotId = Schema.String.check(Schema.isPattern(new RegExp(`^${SNAPSHOT_ID}$`, "u")));
+
 /**
  * The snapshot a workspace was last released into: its id, and the gVisor release that took
- * it; where its sandbox was stopped as it ran out of its memory, the limit it ran out of, a
- * Kubernetes quantity, which its restore tells its bayma (../gateway/snapshots.ts); and, where
- * a release's own save took it, the pod it was taken of, by which a release of that pod asked
- * again finds it was saved already.
+ * it; its manifest, as the checkpoint that took it answered it, or as the snapshot taken live it
+ * is was committed, which its restore restores, reading nothing of the bucket first; where its
+ * sandbox was stopped as it ran out of its memory, the limit it ran out of, a Kubernetes
+ * quantity, which its restore tells its bayma (../gateway/snapshots.ts); and, where a release's
+ * own save took it, the pod it was taken of, by which a release of that pod asked again finds it
+ * was saved already. Its manifest is of that snapshot, or, as `released` reads it, of the one a
+ * compaction made of it since (Compacted), which is the same.
  */
 export const Released = Schema.Struct({
-  snapshot: Schema.String.check(Schema.isPattern(new RegExp(`^${SNAPSHOT_ID}$`, "u"))),
+  snapshot: SnapshotId,
   release: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u)),
+  manifest: Manifest,
   memoryLimit: Schema.optional(Schema.String.check(Schema.isPattern(/^[0-9]+(\.[0-9]+)?[A-Za-z]{0,2}$/u))),
   pod: Schema.optional(Schema.String.check(Schema.isPattern(POD))),
-});
+}).check(Schema.makeFilter(({ snapshot, release, manifest }) =>
+  (manifest.release === release && (manifest.snapshot === snapshot || manifest.compactedFrom === snapshot)) || "its manifest must be of its snapshot, or of one compacted from it, under its release"
+));
 export type Released = typeof Released.Type;
+
+/**
+ * What a compaction of a workspace's snapshot `from` committed: the manifest of the snapshot
+ * compacted from it (../node-agent/agent.ts compactNow), which a restore of a workspace
+ * released into `from` restores instead, the same sandbox at the same moment in one image.
+ */
+export const Compacted = Schema.Struct({ from: SnapshotId, manifest: Manifest }).check(
+  Schema.makeFilter(({ from, manifest }) => manifest.compactedFrom === from || "its manifest must be of a snapshot compacted from it"),
+);
+export type Compacted = typeof Compacted.Type;
 
 /** The name of a workspace's record of the snapshot it was released into, beside its files. */
 const RELEASED_FILE = "released.json";
+/** The name of a workspace's record of the last compaction its node's agent committed, beside its files. */
+const COMPACTED_FILE = "compacted.json";
 
 /** When a workspace's quota was last set, on the agent's clock, in ms since the epoch. */
 const QuotaSet = Schema.Struct({ setAtMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) });
@@ -250,11 +277,24 @@ export interface Workspaces {
   readonly stop: (request: StopRequest) => Effect.Effect<void, WorkspaceRefused>;
   /** Has the sandbox of a bound pod's bayma write what it holds of its files through, as the module says. */
   readonly sync: (request: SyncRequest) => Effect.Effect<void, WorkspaceRefused>;
-  /** The snapshot `ref` was last released into, as the module says; null where none is recorded. */
+  /**
+   * The snapshot `ref` was last released into, as the module says; null where none is recorded. Its manifest is the one a
+   * compaction of it committed since, where its record of that (setCompacted) is of that snapshot; the record's otherwise.
+   */
   readonly released: (ref: WorkspaceRef) => Effect.Effect<Released | null, WorkspaceRefused>;
   /** Records the snapshot `ref` is released into, or none, as the module says; refused where there is no such workspace. */
   readonly setReleased: (ref: WorkspaceRef, released: Released | null) => Effect.Effect<void, WorkspaceRefused>;
+  /**
+   * Records the compaction of `ref`'s snapshot `from` that its node's agent committed, as the module says: what a record of
+   * a release into `from` is read with (released), and one into any other leaves be; refused where there is no such
+   * workspace.
+   */
+  readonly setCompacted: (ref: WorkspaceRef, compacted: Compacted) => Effect.Effect<void, WorkspaceRefused>;
 }
+
+/** The text of the record at `file`, beside a workspace's files, or null where there is none; one that is a link is not read. */
+const readRecord = (file: string): Promise<string | null> =>
+  readFile(file, { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? null : Promise.reject(error)));
 
 /** How long a file of a workspace may take to read or write: the workspace's storage may not answer. */
 const FILE_TIMEOUT = "30 seconds";
@@ -859,19 +899,26 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
     released: (ref) =>
       Effect.gen(function*() {
         const directory = join(yield* filesOf(ref), "..");
-        const text = yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be read`, () =>
-          readFile(join(directory, RELEASED_FILE), { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error: NodeJS.ErrnoException) =>
-            error.code === "ENOENT" ? null : Promise.reject(error)
-          ));
+        const what = `${ref.environment}/${ref.workspace}'s release could not be read`;
+        // Read at once, the record and the compaction's.
+        const [text, compactedText] = yield* Effect.all([onMount(what, () => readRecord(join(directory, RELEASED_FILE))), onMount(what, () => readRecord(join(directory, COMPACTED_FILE)))], { concurrency: 2 });
         if (text === null) return null;
-        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Released))(text).pipe(
+        const released = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Released))(text).pipe(
           Effect.mapError(() => refused(500, `${ref.environment}/${ref.workspace}'s record of its release is not one`)),
         );
+        // One that is not of the workspace, or not of a compaction, is of none it was released into.
+        const compacted = compactedText === null ? null : Option.getOrNull(Schema.decodeUnknownOption(Schema.fromJsonString(Compacted))(compactedText));
+        const of = compacted !== null && compacted.from === released.snapshot && compacted.manifest.release === released.release &&
+          compacted.manifest.environment === ref.environment && compacted.manifest.workspace === ref.workspace;
+        return of ? { ...released, manifest: compacted.manifest } : released;
       }),
 
     setReleased: (ref, released) =>
       Effect.gen(function*() {
         const directory = join(yield* filesOf(ref), "..");
+        if (released !== null && (released.manifest.environment !== ref.environment || released.manifest.workspace !== ref.workspace)) {
+          return yield* refused(400, `${ref.environment}/${ref.workspace} cannot be recorded released into a snapshot of ${released.manifest.environment}/${released.manifest.workspace}`);
+        }
         if (!(yield* there(directory))) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
         const file = join(directory, RELEASED_FILE);
         yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be recorded`, async () => {
@@ -882,6 +929,16 @@ export const makeWorkspaces = Effect.fnUntraced(function*(
             await writeRecord(file, JSON.stringify(released));
           }
         });
+      }),
+
+    setCompacted: (ref, compacted) =>
+      Effect.gen(function*() {
+        const directory = join(yield* filesOf(ref), "..");
+        if (compacted.manifest.environment !== ref.environment || compacted.manifest.workspace !== ref.workspace) {
+          return yield* refused(400, `${ref.environment}/${ref.workspace} cannot be recorded compacted into a snapshot of ${compacted.manifest.environment}/${compacted.manifest.workspace}`);
+        }
+        if (!(yield* there(directory))) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
+        yield* onMount(`${ref.environment}/${ref.workspace}'s compaction could not be recorded`, () => writeRecord(join(directory, COMPACTED_FILE), JSON.stringify(compacted)));
       }),
   };
 });
