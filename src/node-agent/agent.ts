@@ -99,6 +99,7 @@ import { mkdir, open, readdir, readFile, rm, stat, writeFile } from "node:fs/pro
 import { isIP, isIPv6 } from "node:net";
 import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { Worker } from "node:worker_threads";
 
 import type { V1Pod } from "@kubernetes/client-node";
 import type { BatchObservableResult } from "@opentelemetry/api";
@@ -1029,11 +1030,41 @@ async function imageFiles(directory: string, ready?: () => Promise<void>): Promi
 }
 
 /**
+ * What hashAhead runs in a thread of its own: the file `workerData.path` read once from its
+ * start, its SHA-256 updated as it is, how far it has read posted every HASH_PROGRESS_BYTES,
+ * and at its end the SHA-256, in hex; or why it failed.
+ */
+const HASH_WORKER = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { createHash } = require("node:crypto");
+const { createReadStream } = require("node:fs");
+const hash = createHash("sha256");
+let read = 0;
+let told = 0;
+createReadStream(workerData.path, { highWaterMark: 1 << 20 })
+  .on("data", (chunk) => {
+    hash.update(chunk);
+    read += chunk.length;
+    if (read - told >= workerData.progressBytes) {
+      told = read;
+      parentPort.postMessage({ read });
+    }
+  })
+  .on("end", () => parentPort.postMessage({ read, sha256: hash.digest("hex") }))
+  .on("error", (error) => parentPort.postMessage({ error: error.message }));
+`;
+
+/** How often a hash ahead of an upload says how far it has read: 8 MiB, a quarter of a part (./names.ts SNAPSHOT_PART_BYTES). */
+const HASH_PROGRESS_BYTES = 8 * 1024 ** 2;
+
+/**
  * The SHA-256 of the file at `path`, in hex, as it is read once from its start, and what
  * resolves once that read has passed the byte `end`, or fails as it does: what each part of an
  * upload of the file waits for (hashedAndPut), so that the file is read from the disk once, by
  * the hash, its upload reading the same bytes after it, from the page cache, as runsc writes an
- * image past it (`--direct`). Its failure is told by both, and by neither left unhandled.
+ * image past it (`--direct`). Read and hashed in a thread of its own (HASH_WORKER), as a hash in
+ * the agent's own would hold the thread its uploads send from. Its failure is told by both, and
+ * by neither left unhandled.
  */
 export function hashAhead(path: string): { readonly sha256: Promise<string>; readonly through: (end: number) => Promise<void> } {
   let read = 0;
@@ -1047,20 +1078,24 @@ export function hashAhead(path: string): { readonly sha256: Promise<string>; rea
       else reject(failed.cause);
     }
   };
-  const sha256 = (async () => {
-    const hash = createHash("sha256");
-    for await (const chunk of createReadStream(path) as AsyncIterable<Buffer>) {
-      hash.update(chunk);
-      read += chunk.length;
+  const sha256 = new Promise<string>((resolve, reject) => {
+    const worker = new Worker(HASH_WORKER, { eval: true, workerData: { path, progressBytes: HASH_PROGRESS_BYTES } });
+    const fail = (cause: unknown) => {
+      failed = { cause };
       settle();
-    }
-    read = Number.POSITIVE_INFINITY;
-    settle();
-    return hash.digest("hex");
-  })().catch((cause: unknown) => {
-    failed = { cause };
-    settle();
-    throw cause;
+      reject(cause);
+      void worker.terminate();
+    };
+    worker.on("message", (said: { readonly read: number; readonly sha256?: string; readonly error?: string }) => {
+      if (said.error !== undefined) return fail(new Error(said.error));
+      read = said.sha256 === undefined ? said.read : Number.POSITIVE_INFINITY;
+      settle();
+      if (said.sha256 !== undefined) {
+        resolve(said.sha256);
+        void worker.terminate();
+      }
+    });
+    worker.on("error", fail);
   });
   sha256.catch(() => {});
   return {

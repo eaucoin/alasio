@@ -432,23 +432,25 @@ const preparing = (agent: NodeAgent, { gofer, ...ref }: WorkspaceRef & { readonl
     ),
   );
 
-test("a file hashed ahead of its upload is read once, from its start, each part let go once the hash has read past its end, and the SHA-256 is the file's; a file that cannot be read fails both", async () => {
+test("a file hashed ahead of its upload is read once, from its start, in a thread of its own, not the agent's, each part let go once the hash has read past its end, and the SHA-256 is the file's; a file that cannot be read fails both", async () => {
   const directory = mkdtempSync(join(tmpdir(), "alasio-hash-ahead-"));
   try {
-    // Larger than a read stream's chunk, so the hash reads it in several.
-    const data = Buffer.from(Array.from({ length: 300 * 1024 }, (_, index) => index % 253));
+    // Larger than two of the hash's reports of how far it has read, 8 MiB each.
+    const data = Buffer.alloc(20 * 1024 ** 2);
+    for (let at = 0; at < data.length; at += 4096) data.writeUInt32LE(at, at);
     const path = join(directory, "pages.img");
     writeFileSync(path, data);
     const reads = await Effect.runPromise(readsUnder(directory, Effect.promise(async () => {
       const ahead = hashAhead(path);
-      // Each end resolves only once the hash has read so far, which it has once it has the whole file.
+      // Each end resolves only once the hash has read so far, which it has of every one once it has the whole file.
       const order: string[] = [];
-      const ends = [data.length, 1, 200 * 1024, data.length + 1].map((end) => ahead.through(end).then(() => order.push(String(end))));
+      const ends = [data.length, 1, 9 * 1024 ** 2, data.length + 1].map((end) => ahead.through(end).then(() => order.push(String(end))));
       assert.equal(await ahead.sha256, sha256(data));
       await Promise.all(ends);
-      assert.deepEqual(order.slice(0, 2), ["1", String(200 * 1024)]);
+      assert.deepEqual(order.slice(0, 2), ["1", String(9 * 1024 ** 2)]);
     })));
-    assert.deepEqual(reads, [path]);
+    // None of it on the agent's own thread.
+    assert.deepEqual(reads, []);
     const gone = hashAhead(join(directory, "gone.img"));
     await assert.rejects(gone.through(1), /ENOENT/u);
     await assert.rejects(gone.sha256, /ENOENT/u);
