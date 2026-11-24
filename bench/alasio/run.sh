@@ -13,7 +13,7 @@ mkdir -p "$BENCH_DIR/logs"
 # place what a cold restore waits on.
 (while sleep 1; do
   t=$(date -u +%T.%N)
-  sudo cat /proc/[0-9]*/stat 2>/dev/null | awk -v t="$t" '{ cpu[$2] += $14 + $15 } END { for (c in cpu) if (cpu[c] > 0) print t, c, cpu[c] }'
+  { sudo cat /proc/[0-9]*/stat 2>/dev/null || true; } | awk -v t="$t" '{ cpu[$2] += $14 + $15 } END { for (c in cpu) if (cpu[c] > 0) print t, c, cpu[c] }' || true
 done) >"$BENCH_DIR/logs/cpu.log" &
 # The runner's writeback held to 256 MiB dirty, 64 MiB before it starts: a save of 3 GiB left gigabytes dirty on the
 # disk the store and the node's cache share with k3s, and the stall of the fsyncs behind them ended k3s ("Transaction
