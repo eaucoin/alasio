@@ -326,6 +326,21 @@ export const restoresWithETags = (release: string, since: string): boolean => re
 export const RESTORES_WITH_ETAGS_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_WITH_ETAGS_SINCE";
 
 /**
+ * Whether gVisor's `release` writes the pages files a restore from the bucket reads through to
+ * the node's cache as it reads them, where the image path holds them staged (pages-cache): its
+ * checkpoint gofer checks each page the restored image refers to against its hash, reads those
+ * the restore did not, and marks the file complete before the restore counts as done (runsc
+ * wait --restore), so that the node need not download the image again for the next delta
+ * (./agent.ts fetchLater). One at or past `since`, the first release that does, as
+ * cluster/node/pins.json says it (gvisor.restoresWithPagesCacheSince) and the installation gives
+ * the node agent it (RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE); none where `since` names none.
+ */
+export const restoresWithPagesCache = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that writes a restore's pages files through to the node's cache (restoresWithPagesCache). */
+export const RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE";
+
+/**
  * Whether gVisor's `release` records a sandbox's working set as a live checkpoint resumes it,
  * where the sandbox holds none (runsc's working-set-after-save "if-none"): the pages it touches
  * first after the save, which a restore of that image then reads first, as it does those touched

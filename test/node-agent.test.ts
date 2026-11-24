@@ -260,6 +260,8 @@ interface NodeOptions {
   readonly loadWait?: NodeAgentOptions["loadWait"];
   /** The first release that checks a restore's files in the bucket itself, none unless given (NodeAgentOptions restoresWithETagsSince). */
   readonly restoresWithETagsSince?: string;
+  /** The first release that writes a restore's pages files through to the cache, none unless given (NodeAgentOptions restoresWithPagesCacheSince). */
+  readonly restoresWithPagesCacheSince?: string;
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
   /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
@@ -273,7 +275,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, restoresWithETagsSince = "", backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, restoresWithETagsSince = "", restoresWithPagesCacheSince = "", backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -299,6 +301,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
         savesWithLoadWaitSince,
         restoresWithETagsSince,
+        restoresWithPagesCacheSince,
         ...(loadWait === undefined ? {} : { loadWait }),
         backgroundReadMs,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
@@ -2407,6 +2410,259 @@ test("a restore from the bucket's images are fetched into the cache once it is d
     })
   ));
 
+/** The bytes of a page of a pages file, as the checkpoint gofer's marks count them. */
+const PAGE = 4096;
+
+/**
+ * Writes what the checkpoint gofer of a restore writes of the pages file at `link`, as it
+ * reads it: `pages`, in place, and the marks beside it, complete unless told, of `pages`'s
+ * pages unless told, checked against the image `digest`, of version 1 unless told.
+ */
+const writtenByGofer = (link: string, pages: Buffer, digest: string, { complete = true, count = Math.ceil(pages.length / PAGE), version = 1 } = {}): void => {
+  writeFileSync(link, pages);
+  const header = Buffer.alloc(8 + 4 + 4 + 8 + 32);
+  header.write("gvcmarks", 0, "latin1");
+  header.writeUInt32LE(version, 8);
+  header.writeUInt32LE(complete ? 1 : 0, 12);
+  header.writeBigUInt64LE(BigInt(count), 16);
+  Buffer.from(digest, "hex").copy(header, 24);
+  writeFileSync(`${link}.marks`, Buffer.concat([header, Buffer.alloc(8 * Math.ceil(count / 64), complete ? 0xff : 0)]));
+};
+
+/** The stamp of the image `digest` of fs-abc in a node's cache. */
+const stampOf = (node: Node, digest: string) => JSON.parse(readFileSync(join(node.cacheDir, "main", "fs-abc", "stamps", `${digest}.json`), "utf8")) as { readonly pagesFor?: string };
+
+/** The pages files staged in a node's cache for fs-abc's restores, by their directories' names. */
+const stagedOf = (node: Node): string[] => {
+  const directory = join(node.cacheDir, "main", "fs-abc", "layers");
+  return existsSync(directory) ? readdirSync(directory).filter((name) => name.startsWith(".pages-")).sort() : [];
+};
+
+test("a restore from the bucket under a release that writes its pages files through to the cache has them staged, sparse and of their manifest's sizes, linked where its gofer writes them; once done, the image whose pages it wrote whole is taken, its other files downloaded beside it, stamped as holding its image's pages, and the next release a delta of it that is restored from the cache, no pages file read from the bucket", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const [image] = base.layers;
+      assert.ok(image);
+      const there = yield* node("node-2", { restoresWithPagesCacheSince: RELEASE });
+      const runscDir = there.releases.dirOf(RELEASE);
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      const asked = s3.requests.length;
+      const prepared = yield* preparing(there.agent, workspace);
+      assert.equal(prepared.source, "bucket");
+      const link = join(prepared.imagePath, "pages-cache", "pages.img");
+      const pagesBytes = image.files.find(({ path }) => path === "pages.img")?.bytes;
+      assert.equal(statSync(link).size, pagesBytes);
+      assert.equal(statSync(link).blocks, 0);
+      const [staged] = stagedOf(there);
+      assert.ok(staged !== undefined && statSync(join(there.cacheDir, "main", "fs-abc", "layers", staged, "pages.img")).ino === statSync(link).ino);
+      // Its gofer writes the pages whole as the restore reads them; resumed, it is done once runsc says so.
+      writtenByGofer(link, s3.objects.get(`main/fs-abc/layers/${image.digest}/pages.img`)!, image.digest);
+      yield* there.agent.resume(resumeRequest(base.snapshot));
+      yield* Effect.sleep("300 millis");
+      assert.deepEqual(imagesOf(there, "fs-abc").filter((name) => !name.startsWith(".")), []);
+      rmSync(join(runscDir, "hold-wait"));
+      yield* cached(there, base);
+      assert.equal(stampOf(there, image.digest).pagesFor, image.digest);
+      assert.deepEqual(filesOf(join(there.cacheDir, "main", "fs-abc", "layers", image.digest)), image.files);
+      assert.deepEqual(stagedOf(there), []);
+      assert.ok(!existsSync(link) && !existsSync(`${link}.marks`));
+      // Its next release, a delta of it, restored from the cache, verified there.
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      assert.deepEqual(delta.layers.slice(1), base.layers);
+      yield* cached(there, delta);
+      assert.equal((yield* preparing(there.agent, workspace)).source, "cache");
+      assert.deepEqual(s3.requests.slice(asked).filter((each) => each.startsWith("GET ") && each.endsWith("/pages.img")), []);
+      assert.deepEqual(
+        s3.requests.slice(asked).filter((each) => each.startsWith(`GET main/fs-abc/layers/${image.digest}/`)),
+        ["checkpoint.img", "pages_meta.img"].map((path) => `GET main/fs-abc/layers/${image.digest}/${path}`),
+      );
+    })
+  ));
+
+test("a pages file a restore did not write whole, as its marks say, or of another restore's, is downloaded whole after it, what was staged of it removed before room is made for the download: marks incomplete, missing, of another image, of another number of pages, of another version, or of a file not the one staged", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const [image] = base.layers;
+      assert.ok(image);
+      const pages = s3.objects.get(`main/fs-abc/layers/${image.digest}/pages.img`)!;
+      /** Whether anything was staged for fs-abc as each room was made, in order. */
+      const stagedAtRoom: boolean[] = [];
+      let there: Node | null = null;
+      there = yield* node("node-2", {
+        restoresWithPagesCacheSince: RELEASE,
+        cache: (cache) => ({ ...cache, room: (bytes, spared) => Effect.sync(() => stagedAtRoom.push(there !== null && stagedOf(there).length > 0)).pipe(Effect.andThen(cache.room(bytes, spared))) }),
+      });
+      const here = there;
+      const cases: readonly [string, (link: string) => void][] = [
+        ["incomplete", (link) => writtenByGofer(link, pages, image.digest, { complete: false })],
+        ["missing", (link) => writeFileSync(link, pages)],
+        ["of another image", (link) => writtenByGofer(link, pages, "c".repeat(64))],
+        ["of another number of pages", (link) => writtenByGofer(link, pages, image.digest, { count: Math.ceil(pages.length / PAGE) + 1 })],
+        ["of another version", (link) => writtenByGofer(link, pages, image.digest, { version: 2 })],
+        ["of another file", (link) => {
+          writtenByGofer(`${link}.other`, pages, image.digest);
+          renameSync(`${link}.other`, link);
+          renameSync(`${link}.other.marks`, `${link}.marks`);
+        }],
+      ];
+      for (const [name, written] of cases) {
+        yield* here.cache.clear("main", "fs-abc");
+        const asked = s3.requests.length;
+        const prepared = yield* preparing(here.agent, workspace);
+        written(join(prepared.imagePath, "pages-cache", "pages.img"));
+        stagedAtRoom.length = 0;
+        yield* here.agent.resume(resumeRequest(base.snapshot));
+        yield* cached(here, base);
+        assert.equal(stampOf(here, image.digest).pagesFor, undefined, name);
+        assert.ok(s3.requests.slice(asked).includes(`GET main/fs-abc/layers/${image.digest}/pages.img`), name);
+        assert.deepEqual(stagedAtRoom, [false], name);
+        assert.deepEqual(stagedOf(here), [], name);
+      }
+    })
+  ));
+
+test("a pages copy is stamped as such only where its commit moved it in: one committed whole meanwhile keeps its own stamp", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const [image] = base.layers;
+      assert.ok(image);
+      // As the fetch commits what the restore wrote, the image whole is committed first, as another fetch of it would.
+      const there: Node = yield* node("node-2", {
+        restoresWithPagesCacheSince: RELEASE,
+        cache: (cache) => ({
+          ...cache,
+          commitPages: (staged) =>
+            Effect.gen(function*() {
+              const directory = yield* cache.stage("main", "fs-abc", base.snapshot);
+              for (const { path } of image.files) writeFileSync(join(directory, path), s3.objects.get(`main/fs-abc/layers/${image.digest}/${path}`)!);
+              yield* cache.commit("main", "fs-abc", base.snapshot, image.digest);
+              yield* cache.stamp("main", "fs-abc", image.digest, image.files);
+              return yield* cache.commitPages(staged);
+            }),
+        }),
+      });
+      const prepared = yield* preparing(there.agent, workspace);
+      writtenByGofer(join(prepared.imagePath, "pages-cache", "pages.img"), s3.objects.get(`main/fs-abc/layers/${image.digest}/pages.img`)!, image.digest);
+      yield* there.agent.resume(resumeRequest(base.snapshot));
+      yield* cached(there, base);
+      yield* Effect.sleep("200 millis");
+      assert.equal(stampOf(there, image.digest).pagesFor, undefined);
+      assert.deepEqual(stagedOf(there), []);
+    })
+  ));
+
+test("a copy whose pages file a restore wrote is intact for a snapshot whose chain holds the image whose pages it holds, and dropped for another; and is not put again in the bucket, refused before its files are read", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const [image] = base.layers;
+      assert.ok(image);
+      const there = yield* node("node-2", { restoresWithPagesCacheSince: RELEASE });
+      const prepared = yield* preparing(there.agent, workspace);
+      writtenByGofer(join(prepared.imagePath, "pages-cache", "pages.img"), s3.objects.get(`main/fs-abc/layers/${image.digest}/pages.img`)!, image.digest);
+      yield* there.agent.resume(resumeRequest(base.snapshot));
+      yield* cached(there, base);
+      assert.equal(stampOf(there, image.digest).pagesFor, image.digest);
+      // Its snapshot's chain holds the image whose pages it holds: from the cache.
+      const cachedImage = join(there.cacheDir, "main", "fs-abc", "layers", image.digest);
+      assert.equal((yield* preparing(there.agent, workspace)).source, "cache");
+      // Stamped for an image its snapshot's chain does not hold, as one of a branch the workspace left: dropped, and read from the bucket.
+      yield* there.cache.stamp("main", "fs-abc", image.digest, image.files, "d".repeat(64));
+      assert.equal((yield* preparing(there.agent, workspace)).source, "bucket");
+      assert.ok(!existsSync(cachedImage));
+      yield* there.agent.spend(workspace, base.snapshot);
+      yield* there.agent.resume(resumeRequest(base.snapshot));
+      yield* cached(there, base);
+      // The bucket loses the image, which the next snapshot, a delta of it, refers to: a pages copy is not put again from
+      // the cache, as it holds only some of it, refused before its files are read.
+      yield* there.cache.stamp("main", "fs-abc", image.digest, image.files, image.digest);
+      for (const { path } of image.files) s3.objects.delete(`main/fs-abc/layers/${image.digest}/${path}`);
+      let refused = "";
+      assert.deepEqual(yield* readsUnder(cachedImage, Effect.exit(there.agent.checkpoint(request("fs-abc"))).pipe(Effect.tap((exit) => Effect.sync(() => (refused = failure(exit)))))), []);
+      assert.match(refused, new RegExp(`its image ${image.digest} is not in the bucket as it was put, and this node's cache holds only the pages a restore read of it`, "u"));
+    })
+  ));
+
+test("a restore that writes its pages files through to the cache has its workspace spared from its prepare until its fetch ends; the fetch looks once the restore is done, or once its resume failed, or, never resumed, backgroundReadMs after its prepare, then downloads whole", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const [image] = base.layers;
+      assert.ok(image);
+      // Every workspace over its budget, none within its grace: evicted unless spared.
+      const there = yield* node("node-2", { restoresWithPagesCacheSince: RELEASE, budget: 1, backgroundReadMs: 3000 });
+      const runscDir = there.releases.dirOf(RELEASE);
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* preparing(there.agent, workspace);
+      yield* there.agent.resume(resumeRequest(base.snapshot));
+      // Another workspace checkpointed meanwhile, evicting: fs-abc spared, what its restore writes kept.
+      yield* there.agent.checkpoint(request("fs-other", OTHER_CONTAINER));
+      assert.equal(stagedOf(there).length, 1);
+      rmSync(join(runscDir, "hold-wait"));
+      yield* cached(there, base);
+      assert.equal(stampOf(there, image.digest).pagesFor, undefined);
+      // Never resumed, as a standby is not: downloaded whole once backgroundReadMs has passed from its prepare, not before.
+      yield* there.cache.clear("main", "fs-abc");
+      yield* preparing(there.agent, workspace);
+      yield* Effect.sleep("1500 millis");
+      assert.deepEqual(imagesOf(there, "fs-abc").filter((name) => !name.startsWith(".")), []);
+      yield* cached(there, base);
+      assert.deepEqual(stagedOf(there), []);
+      // Resumed into a pod that is gone: its fetch looks at once.
+      const quick = yield* node("node-3", { restoresWithPagesCacheSince: RELEASE });
+      yield* preparing(quick.agent, workspace);
+      quick.pod.gone = true;
+      yield* Effect.exit(quick.agent.resume(resumeRequest(base.snapshot)));
+      yield* cached(quick, base);
+    })
+  ));
+
+test("a second prepare of a snapshot while the fetch of the first's restore runs stages its own, and never has the first commit the second's pages file", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const [image] = base.layers;
+      assert.ok(image);
+      const pages = s3.objects.get(`main/fs-abc/layers/${image.digest}/pages.img`)!;
+      // The first fetch's look at its marks held until the second restore has written its own.
+      const looking = Deferred.makeUnsafe<void>();
+      const written = Deferred.makeUnsafe<void>();
+      let looks = 0;
+      const there = yield* node("node-2", {
+        restoresWithPagesCacheSince: RELEASE,
+        cache: (cache) => ({
+          ...cache,
+          pagesMarks: (staged) => (looks++ === 0 ? Deferred.succeed(looking, undefined).pipe(Effect.andThen(Deferred.await(written)), Effect.andThen(cache.pagesMarks(staged))) : cache.pagesMarks(staged)),
+        }),
+      });
+      const runscDir = there.releases.dirOf(RELEASE);
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* preparing(there.agent, workspace);
+      const [first] = stagedOf(there);
+      // The second prepare, staged of its own, ends the first restore, whose fetch looks.
+      const second = yield* preparing(there.agent, workspace);
+      assert.equal(stagedOf(there).filter((name) => name !== first).length, 1);
+      yield* Deferred.await(looking);
+      const link = join(second.imagePath, "pages-cache", "pages.img");
+      writtenByGofer(link, pages, image.digest);
+      yield* Deferred.succeed(written, undefined);
+      // The first fetches the image whole; the second's file, linked still, it leaves.
+      yield* cached(there, base);
+      assert.equal(stampOf(there, image.digest).pagesFor, undefined);
+      assert.ok(existsSync(link) && existsSync(`${link}.marks`));
+      rmSync(join(runscDir, "hold-wait"));
+    })
+  ));
+
 test("whether a release's save of a sandbox still loading has its restore's token revoked: not before its floor, from as it started; then on a stall, or a rate whose bytes left end past the latest it may wait, both since the save started and of its recent window; and at that latest whatever", () => {
   const timings = { floorMs: 60_000, stallMs: 90_000, latestMs: 600_000 };
   const save = { askedAt: 0, startedAt: 10_000, now: 10_000, movedAt: 10_000, servedAtStart: 0, served: 0, expected: 1_000_000 as number | null, recentFrom: 10_000, servedAtRecentFrom: 0 };
@@ -3467,6 +3723,60 @@ test("the node's cache makes room on its disk for what it writes, its reserve ke
       assert.equal(refused.message, `the node's snapshot cache failed: its disk has ${RESERVE_BYTES + 1500} bytes free, and 2000 more would leave less than the ${RESERVE_BYTES} it keeps free`);
       assert.deepEqual(names(yield* cache.list), ["fs-a", "fs-c"]);
       assert.deepEqual(names(yield* cache.room(2000, spares("fs-d"))), ["fs-a"]);
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the node's cache stamps an image whose pages file holds only the pages one image refers to as such, and one stamped without it is a whole copy; a commit that keeps the image already held says it moved none in", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-pages-stamp-"));
+  try {
+    const cache = makeSnapshotCache({ root, budget: 1024 ** 3, graceMs: 0 });
+    await Effect.runPromise(Effect.gen(function*() {
+      const directory = yield* cache.stage("main", "fs-a", S1);
+      writeFileSync(join(directory, "pages.img"), Buffer.alloc(1000));
+      assert.equal(yield* cache.commit("main", "fs-a", S1, D1), true);
+      const files = [{ path: "pages.img", bytes: 1000, sha256: "0".repeat(64) }];
+      yield* cache.stamp("main", "fs-a", D1, files);
+      assert.deepEqual(yield* cache.stamped("main", "fs-a", D1), { files, pagesFor: null });
+      yield* cache.stamp("main", "fs-a", D1, files, D2);
+      assert.deepEqual(yield* cache.stamped("main", "fs-a", D1), { files, pagesFor: D2 });
+      // Staged again, of the same digest: the one held kept.
+      writeFileSync(join(yield* cache.stage("main", "fs-a", S1), "pages.img"), Buffer.alloc(1000, 1));
+      assert.equal(yield* cache.commit("main", "fs-a", S1, D1), false);
+      const staged = yield* cache.stagePages("main", "fs-a", S1, "0123456789abcdef", D1, 1000, true);
+      assert.equal(yield* cache.commitPages(staged), false);
+      assert.deepEqual(readFileSync(join(cache.image("main", "fs-a", D1), "pages.img")), Buffer.alloc(1000));
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the node's cache stages a restore's pages file sparse, linked where its gofer writes it, reads the gofer's marks only of that file, removes its link only where it is its own, and removes all it staged as it starts again", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-pages-stage-"));
+  try {
+    const cache = makeSnapshotCache({ root, budget: 1024 ** 3, graceMs: 0 });
+    await Effect.runPromise(Effect.gen(function*() {
+      yield* cache.prepareRemote("main", "fs-a", S1, "s3_opts.json", "{}");
+      const top = yield* cache.stagePages("main", "fs-a", S1, "0123456789abcdef", D1, 3 * PAGE, true);
+      const layer = yield* cache.stagePages("main", "fs-a", S1, "0123456789abcdef", D2, PAGE, false);
+      assert.deepEqual([top.link, layer.link], [join(root, "main", "fs-a", S1, "pages-cache", "pages.img"), join(root, "main", "fs-a", S1, "pages-cache", "layers", D2, "pages.img")]);
+      assert.deepEqual([statSync(top.link).size, statSync(top.link).blocks, statSync(top.link).ino], [3 * PAGE, 0, statSync(join(top.directory, "pages.img")).ino]);
+      assert.equal(yield* cache.pagesMarks(top), null);
+      writtenByGofer(top.link, Buffer.alloc(3 * PAGE, 1), D1, { complete: false });
+      assert.deepEqual(yield* cache.pagesMarks(top), { version: 1, complete: false, pages: 3, digest: D1 });
+      // Another file in its place, as another restore's: its marks are none of this one's, and its link is left.
+      rmSync(layer.link);
+      writtenByGofer(layer.link, Buffer.alloc(PAGE), D1);
+      assert.equal(yield* cache.pagesMarks(layer), null);
+      yield* cache.unstagePages(layer);
+      assert.ok(existsSync(layer.link) && !existsSync(layer.directory));
+      // Started again: what it staged removed, both names.
+      yield* cache.clean;
+      assert.ok(!existsSync(top.directory) && !existsSync(join(root, "main", "fs-a", S1, "pages-cache")));
+      assert.ok(existsSync(join(root, "main", "fs-a", S1, "s3_opts.json")));
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });
