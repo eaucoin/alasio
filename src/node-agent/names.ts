@@ -301,6 +301,19 @@ export const ONE_PASS_SAVES_VARIABLE = "ALASIO_ONE_PASS_SAVES";
 export const LOADING_SAVE_TEST_TIMINGS_VARIABLE = "ALASIO_LOADING_SAVE_TEST_TIMINGS";
 
 /**
+ * Whether gVisor's `release` writes a checkpoint's summary as JSON (runsc checkpoint
+ * --summary-file), which describes its image as `runsc image inspect` and `runsc image layers`
+ * do, the CPU features it was saved with among it, so that the agent runs neither after a
+ * checkpoint. One at or past `since`, the first release that does, as cluster/node/pins.json says
+ * it (gvisor.savesSummarySince) and the installation gives the node agent it
+ * (SAVES_SUMMARY_SINCE_VARIABLE); none where `since` names none.
+ */
+export const savesSummary = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that writes a checkpoint's summary (savesSummary). */
+export const SAVES_SUMMARY_SINCE_VARIABLE = "ALASIO_GVISOR_SAVES_SUMMARY_SINCE";
+
+/**
  * Whether gVisor's `release` bounds a save's waits for the pages that its sandbox's restore has
  * not loaded yet (runsc checkpoint --load-wait): for those it saves, and bayma's hook's for those
  * it touches, past which runsc kills the hook. Past it, the save fails, what it wrote

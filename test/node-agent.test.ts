@@ -261,6 +261,8 @@ interface NodeOptions {
   readonly loadingSave?: NodeAgentOptions["loadingSave"];
   /** The first release that bounds a save's wait for pages still loading, none unless given, and how its agent waits (NodeAgentOptions loadWait). */
   readonly savesWithLoadWaitSince?: string;
+  /** The first release that writes a checkpoint's summary, none unless given (NodeAgentOptions savesSummarySince). */
+  readonly savesSummarySince?: string;
   readonly loadWait?: NodeAgentOptions["loadWait"];
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
@@ -277,7 +279,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -305,6 +307,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         host: host.host,
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
         savesWithLoadWaitSince,
+        savesSummarySince,
         ...(loadWait === undefined ? {} : { loadWait }),
         backgroundReadMs,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
@@ -1126,6 +1129,43 @@ test("a checkpoint is traced step by step: its wait for the workspace, runsc's s
         taken.layers[0]?.files.map(({ path, bytes }) => ["alasio.node_agent.checkpoint.upload.put", path, bytes]).toSorted(),
       );
     }).pipe(Effect.provide(TracingLayer))
+  ));
+
+test("a checkpoint under a release that writes its summary reads its image's description and layers from it, running neither runsc image inspect nor runsc image layers, and removes it; one whose summary is not there fails, as one runsc did not describe", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const there = yield* node("node-2", { savesSummarySince: RELEASE });
+      const { manifest } = yield* preparing(there.agent, workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* fetched(there, base);
+      // The CPU features it was saved with, as its summary alone says them.
+      writeFileSync(join(there.releases.dirOf(RELEASE), "summary-cpu-features"), "sse,avx,avx512f");
+      const since = there.releases.calls(RELEASE).length;
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      const calls = there.releases.calls(RELEASE).slice(since);
+      const [checkpointed] = calls.filter((args) => args.includes("checkpoint"));
+      const summary = checkpointed?.find((arg) => arg.startsWith("--summary-file="))?.slice("--summary-file=".length);
+      assert.ok(summary?.startsWith(join(there.cacheDir, "main", "fs-abc", "layers", ".")) && summary.endsWith(".summary.json"), checkpointed?.join(" "));
+      assert.deepEqual(calls.filter((args) => args.includes("image")).map((args) => args.slice(2, 4).join(" ")), ["image verify"]);
+      assert.deepEqual(delta.cpuFeatures, ["sse", "avx", "avx512f"]);
+      assert.deepEqual(delta.layers.slice(1), base.layers);
+      assert.equal(existsSync(summary ?? ""), false);
+      // One under a release before the first that writes one is described by runsc as before.
+      const before = yield* node("node-3", { savesSummarySince: "20261102.0-eaucoin.11" });
+      const asked = before.releases.calls(RELEASE).length;
+      yield* before.agent.checkpoint(request("fs-other"));
+      const described = before.releases.calls(RELEASE).slice(asked);
+      assert.ok(!described.find((args) => args.includes("checkpoint"))?.some((arg) => arg.startsWith("--summary-file=")));
+      assert.deepEqual(described.filter((args) => args.includes("inspect") || args.includes("layers")).map((args) => args.slice(2, 4).join(" ")), ["image inspect", "image layers"]);
+      // Its summary not written: the checkpoint fails, what it staged gone, its snapshot forgotten as a failed release's is.
+      writeFileSync(join(there.releases.dirOf(RELEASE), "no-summary"), "");
+      there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD);
+      assert.match(failure(yield* Effect.exit(there.agent.checkpoint(request("fs-abc")))), /checkpoint --summary-file of 20260921\.0-eaucoin\.8 failed: its summary is not one: .*ENOENT/u);
+      assert.equal(cachesAny(there, "fs-abc"), false);
+    })
   ));
 
 test("a restore's prepare and resume are traced step by step, from the node's cache or from the bucket; the load its resume leaves under way, and the fetch into the cache its prepare leaves for after it, each a trace of its own linked to theirs", () =>

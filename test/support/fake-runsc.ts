@@ -10,7 +10,10 @@
  *   which here names the images it holds pages of besides its own, its layers: none, or
  *   PARENT's digest and PARENT's layers, failing as runsc does without PARENT's pages
  *   metadata, its pages 4096 bytes, or a delta's 512 unless a file `delta-pages-bytes`
- *   beside it says how many. Or it fails, saying so, or what the file says where it says anything, while
+ *   beside it says how many; and, of `--summary-file=PATH`, its summary at PATH, describing
+ *   the image as `image inspect` and `image layers` do, the CPU features those of
+ *   `summary-cpu-features` where there is one, none while a file `no-summary` is beside it.
+ *   Or it fails, saying so, or what the file says where it says anything, while
  *   a file `fail-checkpoint` is beside it, or takes a
  *   minute while one `hang-checkpoint` is, or waits while one `hold-checkpoint` is;
  * - `image inspect --json DIR`: describes the image, as saved by the release's runsc, whose
@@ -98,6 +101,18 @@ const checkpoint = () => {
   writeFileSync(join(image, "pages_meta.img"), JSON.stringify({ state: sha256(state), layers }));
   // A delta holds what the sandbox wrote since its parent: an eighth of its memory, or what a file delta-pages-bytes says.
   writeFileSync(join(image, "pages.img"), Buffer.alloc(parent === undefined ? 4096 : Number(read("delta-pages-bytes", "512")), id));
+  // Its summary, where asked, as image inspect and image layers describe the image, unless a file no-summary is beside it.
+  const summary = flag("summary-file");
+  if (summary !== undefined && !existsSync(join(here, "no-summary"))) {
+    const meta = readFileSync(join(image, "pages_meta.img"));
+    writeFileSync(summary, JSON.stringify({
+      schema: 1,
+      image: { digest: sha256(meta), version: read("saved-by", "release-" + basename(here)), cpu_features: read("summary-cpu-features", read("image-cpu-features", "sse,avx")), layers, memory_files: [{ layer_bytes: [4096] }], files: [] },
+      save: { pause_ms: 1.5 },
+      precopy: null,
+      pages: null,
+    }));
+  }
 };
 if (rest[0] === "checkpoint") {
   if (existsSync(join(here, "fail-checkpoint"))) { process.stderr.write((readFileSync(join(here, "fail-checkpoint"), "utf8") || "checkpoint failed: the sandbox is gone") + "\\n"); process.exit(128); }

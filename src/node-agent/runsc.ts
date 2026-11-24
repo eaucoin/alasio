@@ -183,7 +183,54 @@ export interface CheckpointOptions {
    * as LOAD_WAIT_EXPIRED says, and the sandbox runs on as it was. Unbounded where not given.
    */
   readonly loadWaitSeconds?: number;
+  /**
+   * Where runsc writes the checkpoint's summary once its image is complete, of a release that
+   * writes one (./names.ts savesSummary), outside the image's directory: what summaryOf reads.
+   */
+  readonly summaryFile?: string;
 }
+
+/**
+ * What runsc says of a checkpoint in its summary (runsc checkpoint --summary-file, schema 1), as
+ * far as the agent reads it: its image, as `runsc image inspect` and `runsc image layers` describe
+ * it. Keys the agent does not read are left be, as later releases may add keys.
+ */
+const CheckpointSummary = Schema.Struct({
+  schema: Schema.Literal(1),
+  image: Schema.Struct({
+    digest: Schema.NonEmptyString,
+    version: Schema.String,
+    // Comma-separated, as `runsc image inspect --json`'s .state.metadata.cpu_features.
+    cpu_features: Schema.String,
+    layers: Schema.Array(Schema.NonEmptyString),
+    memory_files: Schema.Array(Schema.Struct({ layer_bytes: Schema.Array(Schema.Number) })),
+  }),
+});
+
+/** The image a checkpoint wrote and the images it holds pages of besides its own, its layers, as its summary says them. */
+export interface SummarizedImage {
+  readonly image: InspectedImage;
+  readonly layers: readonly string[];
+}
+
+/**
+ * The image the checkpoint under `release` whose summary runsc wrote at `path` (CheckpointOptions
+ * summaryFile) wrote, and its layers, as `runsc image inspect` and `runsc image layers` would say
+ * them; failing as runsc does where the summary is not there, or not one.
+ */
+export const summaryOf = (release: string, path: string): Effect.Effect<SummarizedImage, RunscError> =>
+  Effect.tryPromise({
+    try: async () => Schema.decodeUnknownSync(CheckpointSummary)(JSON.parse(await readFile(path, "utf8"))),
+    catch: (cause) => new RunscError({ release, command: "checkpoint --summary-file", reason: `its summary is not one: ${cause instanceof Error ? cause.message : String(cause)}` }),
+  }).pipe(Effect.map(({ image: { digest, version, cpu_features, layers, memory_files } }) => ({
+    image: {
+      digest,
+      version,
+      cpuFeatures: cpu_features.split(",").filter(Boolean),
+      pageBytes: memory_files.reduce((sum, { layer_bytes }) => sum + layer_bytes.reduce((each, bytes) => each + bytes, 0), 0),
+    },
+    layers,
+  })));
 
 /**
  * How an image is compacted: which image, where runsc finds its layers, and into which
@@ -420,12 +467,13 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
     releases,
     current,
 
-    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds }) =>
+    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds, summaryFile }) =>
       run(release, ["checkpoint"], [
         `--image-path=${imagePath}`,
         "--compression=none",
         ...(parentImagePath === undefined ? [] : [`--parent-image-path=${parentImagePath}`]),
         ...(loadWaitSeconds === undefined ? [] : [`--load-wait=${loadWaitSeconds}s`]),
+        ...(summaryFile === undefined ? [] : [`--summary-file=${summaryFile}`]),
         // Its pages written as the sandbox runs, past the page cache, which the pause then waits on.
         ...(live ? ["--leave-running", "--precopy=auto", "--precopy-throttle=on", "--direct"] : []),
         // The hook told a live save from one that ends the sandbox, as gVisor tells it neither, and

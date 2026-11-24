@@ -125,10 +125,11 @@ import {
   SAVE_HOOK_SECONDS,
   SAVE_LOAD_WAIT_SECONDS,
   SAVES_DEFERRED_FOR_SECONDS,
+  savesSummary,
   savesWithLoadWait,
   STORE_SOCKET_ENDPOINT,
 } from "./names.ts";
-import { type ListedContainer, type ReleaseNotInstalled, type Runsc, RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
+import { type ListedContainer, type ReleaseNotInstalled, type Runsc, RunscError, type RunningContainer, summaryOf, VERIFY_STATUSES } from "./runsc.ts";
 import { type S3Bucket, S3Error } from "./s3.ts";
 import type { StoreProxy, StoreToken, Transport } from "./store-proxy.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
@@ -758,6 +759,8 @@ export interface NodeAgentOptions {
   readonly restoresFromBucketSince: string;
   /** The first gVisor release that bounds a save's wait for pages still loading (savesWithLoadWait); none where empty. */
   readonly savesWithLoadWaitSince: string;
+  /** The first gVisor release that writes a checkpoint's summary (savesSummary), which describes its image; none where empty. */
+  readonly savesSummarySince: string;
   /**
    * How long a save of a release that bounds it waits for pages still loading, in seconds
    * (SAVE_LOAD_WAIT_SECONDS unless told), and how long a workspace's release saves may have been
@@ -1136,7 +1139,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1514,6 +1517,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const [own] = parent?.layers ?? [];
       const hookSeconds = restoreHookSeconds(backgroundReadMs);
       const waits = yield* loadWaitOf(request, release, askedAt);
+      // Its summary, of a release that writes one, beside what it staged, which goes with it.
+      const summaryFile = savesSummary(release, savesSummarySince) ? `${staged}.summary.json` : null;
       const saved = runsc.checkpoint(release, {
         containerId,
         imagePath: staged,
@@ -1522,6 +1527,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
         live: live !== undefined,
         ...(waits === null ? {} : { loadWaitSeconds: waits }),
+        ...(summaryFile === null ? {} : { summaryFile }),
       });
       const watchdogMs = waits === null ? 0 : loadWait.watchdogMs ?? loadWaitWatchdogMs(waits);
       const [pauseMs] = yield* timed(askedAt === null ? saved : boundWhileLoading(request, askedAt, saved, watchdogMs)).pipe(
@@ -1530,17 +1536,24 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       );
       // What the save caught, as bayma's hook wrote it as the sandbox was saved.
       const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
-      const image = yield* runsc.inspect(release, staged).pipe(step("alasio.node_agent.checkpoint.inspect", request));
+      // Its image and the images it holds pages of, as its summary says them; or as runsc's inspect and layers say them, each
+      // a process of its own, of a release that writes none.
+      const described = summaryFile === null
+        ? Effect.all([
+          runsc.inspect(release, staged).pipe(step("alasio.node_agent.checkpoint.inspect", request)),
+          runsc.layers(release, staged).pipe(step("alasio.node_agent.checkpoint.layers", request)),
+        ]).pipe(Effect.map(([inspected, digests]) => ({ image: inspected, layers: digests })))
+        : summaryOf(release, summaryFile).pipe(step("alasio.node_agent.checkpoint.summary", request));
+      const { image, layers: digests } = yield* described;
       if (image.version !== runscVersion(release)) {
         return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image says runsc ${image.version} saved it, not ${runscVersion(release)}` });
       }
       // Each image it holds pages of is one of its parent's, whose files its manifest says.
       const known = new Map((parent?.layers ?? []).map((layer) => [layer.digest, layer]));
-      const referred = yield* Effect.flatMap(runsc.layers(release, staged), (digests) =>
-        Effect.forEach(digests, (digest) => {
-          const layer = known.get(digest);
-          return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
-        })).pipe(step("alasio.node_agent.checkpoint.layers", request));
+      const referred = yield* Effect.forEach(digests, (digest) => {
+        const layer = known.get(digest);
+        return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
+      });
       yield* cache.commit(environment, workspace, snapshot, image.digest).pipe(step("alasio.node_agent.checkpoint.cache", request));
       const directory = cache.image(environment, workspace, image.digest);
       const put = "alasio.node_agent.checkpoint.upload.put";
@@ -1600,7 +1613,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }).pipe(step("alasio.node_agent.checkpoint.commit", request));
       if (onePassSaves) yield* checkLater(manifest, referred);
       return manifest;
-    }).pipe(Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)));
+    }).pipe(
+      Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)),
+      // Its summary, once read, or where it failed, as nothing reads it after.
+      Effect.ensuring(onDisk(() => rm(`${staged}.summary.json`, { force: true })).pipe(Effect.ignore)),
+    );
 
   /**
    * Compacts the chain of images of `committed`, the snapshot a release's checkpoint has just
