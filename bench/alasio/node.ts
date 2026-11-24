@@ -42,20 +42,22 @@ export async function bootLog(node: string, sandboxId: string): Promise<string[]
   return (await onNode(node, `cat ${RUNSC_LOGS}/${sandboxId}/runsc.log.*.boot.txt 2>/dev/null || true`)).split("\n");
 }
 
-/** The memory of the pod of uid `uid` on `node`, as its cgroup says: its peak and what it holds now. */
-export async function podMemory(node: string, uid: string): Promise<{ readonly peak: number | null; readonly current: number | null; readonly stat: Record<string, number> }> {
+/** The memory of the pod of uid `uid` on `node`, as its cgroup says: its peak and what it holds now; and of each of its cgroups holding processes, its limit and how often it was reached. */
+export async function podMemory(node: string, uid: string): Promise<{ readonly peak: number | null; readonly current: number | null; readonly stat: Record<string, number>; readonly scopes: string[] }> {
   const printed = await onNode(node, [
     `dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${uid}*' -o -name '*pod${uid.replaceAll("-", "_")}*' \\) | head -n 1)`,
     `[ -n "$dir" ] || exit 0`,
     `echo "peak $(cat "$dir/memory.peak")"`,
     `echo "current $(cat "$dir/memory.current")"`,
     `grep -E '^(anon|file) ' "$dir/memory.stat"`,
+    `for scope in "$dir"/*/; do [ -n "$(cat "$scope/cgroup.procs")" ] && echo "scope $(basename "$scope") max=$(cat "$scope/memory.max") group=$(cat "$scope/memory.oom.group") $(grep -E '^(max|oom|oom_kill) ' "$scope/memory.events" | tr '\\n' ' ')"; done; true`,
   ].join("; "));
   const field = (name: string) => {
     const value = printed.split("\n").find((line) => line.startsWith(`${name} `))?.split(" ")[1];
     return value === undefined ? null : Number(value);
   };
-  return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 } };
+  const scopes = printed.split("\n").filter((line) => line.startsWith("scope ")).map((line) => line.slice("scope ".length).trim());
+  return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 }, scopes };
 }
 
 /**
