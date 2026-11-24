@@ -46,7 +46,10 @@
  * cache and the bucket. It is the same sandbox at the same moment, so a workspace released into
  * the one is restored from the other, which is the next delta's base. A snapshot taken live
  * is never compacted, its sandbox running on from it: one whose parent's chain would be due
- * with it is taken whole instead, which cuts the chain the sandbox goes on extending.
+ * with it is taken whole instead, which cuts the chain the sandbox goes on extending. Its
+ * upload, as the gateway gives it a budget (LiveSave yieldForMs), yields to those restores too,
+ * holding the workspace's lock meanwhile, until its budget is spent; and not at all while a
+ * release of the workspace waits for the lock, which it then hands over as soon as it can.
  *
  * What no snapshot needs any more is collected, by one caller (alasio's collection): the
  * images and manifests that neither the current snapshot, nor the latest, which a sandbox
@@ -164,7 +167,15 @@ const AbsolutePath = Schema.String.check(
 );
 
 /** How a checkpoint saves a sandbox live: the state directory, in the container, of the bayma it runs. */
-export const LiveSave = Schema.Struct({ stateDir: AbsolutePath });
+export const LiveSave = Schema.Struct({
+  stateDir: AbsolutePath,
+  /**
+   * How long, from as the save is taken, its upload may yield to the restores on its node that
+   * read their images, at the most: its producer's budget, the live-save interval. Not
+   * given, it yields not at all.
+   */
+  yieldForMs: Schema.optional(Count),
+});
 export type LiveSave = typeof LiveSave.Type;
 
 /** The execs a save caught running, each by its session's and its own ID, as bayma names them. */
@@ -1225,6 +1236,45 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const loading = yield* makeLoading;
   /** Resolves once no restore on this node reads its image. */
   const quietly = (): Promise<void> => Effect.runPromise(loading.quiet);
+  /**
+   * How many releases of each workspace, by its prefix, wait for its lock or hold it; and the parts of live saves' uploads of
+   * it yielding meanwhile, each woken as one comes: a live save's upload, which holds the workspace's lock, yields to the
+   * node's restores no more while a release waits for it.
+   */
+  const releasesWaiting = new Map<string, number>();
+  const yielding = new Map<string, Set<() => void>>();
+  /** `effect`, a release's save of the workspace `prefix`, said waiting from its start to its end. */
+  const releaseWaiting = <A, E>(prefix: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        releasesWaiting.set(prefix, (releasesWaiting.get(prefix) ?? 0) + 1);
+        for (const wake of yielding.get(prefix) ?? []) wake();
+      }),
+      () => effect,
+      () => Effect.sync(() => ((releasesWaiting.get(prefix) ?? 1) > 1 ? releasesWaiting.set(prefix, (releasesWaiting.get(prefix) ?? 1) - 1) : releasesWaiting.delete(prefix))),
+    );
+  /**
+   * What each part of a live save's upload of the workspace `prefix` waits for, yielding: until no restore on the
+   * node reads its image, until `deadline`, its budget's end, by the agent's clock, or until a release of the workspace
+   * waits for the lock the save holds, whichever comes first; at once past its budget or while a release waits.
+   */
+  const yieldingUntil = (prefix: string, deadline: number) => async (): Promise<void> => {
+    const left = deadline - Date.now();
+    if (releasesWaiting.has(prefix) || left <= 0) return;
+    const waiters = yielding.get(prefix) ?? new Set<() => void>();
+    yielding.set(prefix, waiters);
+    let wake = (): void => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const woken = new Promise<void>((resolve) => (wake = resolve));
+    waiters.add(wake);
+    try {
+      await Promise.race([quietly(), new Promise<void>((resolve) => (timer = setTimeout(resolve, left))), woken]);
+    } finally {
+      clearTimeout(timer);
+      waiters.delete(wake);
+      if (waiters.size === 0) yielding.delete(prefix);
+    }
+  };
 
   /** How many workspaces the cache holds the images of under each release, as the manifests beside them say. */
   const cachedByRelease: Effect.Effect<ReadonlyMap<string, number>, CacheError | Schema.SchemaError> = Effect.gen(function*() {
@@ -1385,9 +1435,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /**
    * The files of the image `digest` the cache holds of the workspace, each hashed and uploaded in one read of it (hashAhead),
    * all at once: its layer, each file with its size, its SHA-256, and the ETag its upload was answered with, in a span of
-   * its own, `put`, of its bytes.
+   * its own, `put`, of its bytes. Each part sent once `ready` has resolved too, where given, as work that yields waits.
    */
-  const hashedAndPut = (ref: WorkspaceRef, digest: string, put: string): Effect.Effect<Layer, S3Error | CacheError> =>
+  const hashedAndPut = (ref: WorkspaceRef, digest: string, put: string, ready?: () => Promise<void>): Effect.Effect<Layer, S3Error | CacheError> =>
     Effect.gen(function*() {
       const directory = cache.image(ref.environment, ref.workspace, digest);
       const paths = yield* onDisk(() => imagePaths(directory));
@@ -1397,7 +1447,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           const { size: bytes } = yield* onDisk(() => stat(file));
           yield* Effect.annotateCurrentSpan({ "alasio.snapshot.bytes": bytes });
           const ahead = hashAhead(file);
-          const [etag, sha256] = yield* Effect.all([bucket.putFile(layerKey(ref, digest, path), file, ahead.through), onDisk(() => ahead.sha256)], { concurrency: 2 });
+          const through = ready === undefined ? ahead.through : (end: number) => ahead.through(end).then(ready);
+          const [etag, sha256] = yield* Effect.all([bucket.putFile(layerKey(ref, digest, path), file, through), onDisk(() => ahead.sha256)], { concurrency: 2 });
           return { path, bytes, sha256, etag };
         }).pipe(withAlasioSpan(put, { attributes: { ...spanAttributes(ref), "alasio.snapshot.file": path } })), { concurrency: "unbounded" });
       return { digest, files };
@@ -1629,22 +1680,24 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* cache.commit(environment, workspace, snapshot, image.digest).pipe(step("alasio.node_agent.checkpoint.cache", request));
       const directory = cache.image(environment, workspace, image.digest);
       const put = "alasio.node_agent.checkpoint.upload.put";
+      // A live save's reads and uploads yield to the node's restores within its budget, as long as no release waits for it.
+      const yieldFor = live?.yieldForMs === undefined ? undefined : yieldingUntil(prefixOf(request), takenAt + live.yieldForMs);
       // In one pass: each of its files hashed as it is uploaded, all at once, and what it refers to taken to be in the bucket
       // as its parent's manifest says, looked at once it is committed (checkLater). Or its files' SHA-256 first, then each
       // uploaded in turn, then its own image and those it refers to looked at together, as the prepare of a restore looks at
       // its chain's. Its files' SHA-256 are what its manifest records, and the cache's stamp of them as checked so.
-      const hashedFirst = onePassSaves ? null : yield* onDisk(() => imageFiles(directory)).pipe(
+      const hashedFirst = onePassSaves ? null : yield* onDisk(() => imageFiles(directory, yieldFor)).pipe(
         Effect.tap((hashed) => cache.stamp(environment, workspace, image.digest, hashed)),
         step("alasio.node_agent.checkpoint.digest", request),
       );
       const uploaded: Effect.Effect<readonly Layer[], S3Error | CacheError | SnapshotCorrupt> = hashedFirst === null
-        ? hashedAndPut(request, image.digest, put).pipe(
+        ? hashedAndPut(request, image.digest, put, yieldFor).pipe(
           Effect.tap(({ files }) => cache.stamp(environment, workspace, image.digest, files.map(({ etag: _, ...file }) => file))),
           Effect.map((own) => [own, ...referred]),
           step("alasio.node_agent.checkpoint.upload", request),
         )
         : Effect.gen(function*() {
-          const own = yield* upload(request, image.digest, hashedFirst, put).pipe(step("alasio.node_agent.checkpoint.upload", request));
+          const own = yield* upload(request, image.digest, hashedFirst, put, yieldFor).pipe(step("alasio.node_agent.checkpoint.upload", request));
           return yield* Effect.gen(function*() {
             const missing = yield* notInBucket(request, [own, ...referred]);
             if (missing.includes(own)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
@@ -2060,7 +2113,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
     return deferred.pipe(
       Effect.andThen(asked),
-      Effect.flatMap((at) => exclusive([request], committed(at).pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message))))), "alasio.node_agent.checkpoint.lock")),
+      Effect.flatMap((at) => {
+        const held = exclusive([request], committed(at).pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message))))), "alasio.node_agent.checkpoint.lock");
+        // A release's: a live save's upload that holds the lock yields no more while it waits.
+        return request.live === undefined ? releaseWaiting(prefixOf(request), held) : held;
+      }),
       // A release's: compacted once it no longer holds the workspace, where its chain is due.
       Effect.tap((manifest) => (request.live === undefined ? compactLater(manifest) : Effect.void)),
       Effect.tap((manifest) =>

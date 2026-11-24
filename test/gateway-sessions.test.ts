@@ -2068,7 +2068,8 @@ test("a bound pod whose execs run is saved live every liveEvery, its sandbox run
       await new Promise((resolve) => setTimeout(resolve, 1_100));
       await look();
       for (const deadline = Date.now() + 5_000; !recorded.asked.includes(`checkpoint node-a ${bound.pod} live`); await new Promise((resolve) => setTimeout(resolve, 50))) assert.ok(Date.now() < deadline);
-      assert.deepEqual(recorded.saved.at(-1)?.live, { stateDir: "/attach/ws/home/.bayma" });
+      // Its upload yielding to the node's restores for as long as the interval it is saved every, at the most.
+      assert.deepEqual(recorded.saved.at(-1)?.live, { stateDir: "/attach/ws/home/.bayma", yieldForMs: 1_000 });
       // bayma moved on from the generation it caught: spent.
       stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now(), generation: 2 };
       await look();
