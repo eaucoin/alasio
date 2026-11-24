@@ -5,7 +5,7 @@
  * and holds the cgroup of the node's Burstable pods, theirs, to what it holds then and HEADROOM
  * more, so that the kernel's OOM is of that cgroup, above both sandboxes, and not of a pod's own
  * nor of the node, which a runner's memory filled whole starves before the kernel kills: B holds
- * 1.5 GiB and charges and frees 4 MiB every 20 ms beside it; A grows by 64 MiB every 80 ms until it
+ * 1.5 GiB and charges and frees 4 MiB every 20 ms beside it; A grows by BENCH_OOM_GROWTH_MIB (64) every 80 ms until it
  * is killed. The cgroup's limit is given back after. Then whether B's pod runs on, the same pod, its
  * process alive; what the kernel killed, the node agent ended and kubelet evicted meanwhile; what the
  * agent's guard set on each sandbox's cgroup; and whether A's session falls back, bound anew on its
@@ -45,7 +45,9 @@ const HOLDER = [
  * would end the job.
  */
 const GROWER_MOST_BYTES = 3 * HEADROOM_BYTES;
-const GROWER = `const held = []; const grow = setInterval(() => (held.length * 64 * 1024 * 1024 >= ${GROWER_MOST_BYTES} ? clearInterval(grow) : held.push(Buffer.alloc(64 << 20, 7))), 80);`;
+/** What A grows by every 80 ms, in MiB: BENCH_OOM_GROWTH_MIB, 64 unless said. */
+const GROWTH_MIB = Number(process.env["BENCH_OOM_GROWTH_MIB"] || 64);
+const GROWER = `const held = []; const grow = setInterval(() => (held.length * ${GROWTH_MIB} * 1024 * 1024 >= ${GROWER_MOST_BYTES} ? clearInterval(grow) : held.push(Buffer.alloc(${GROWTH_MIB} << 20, 7))), 80);`;
 
 /** A new session's workspace, bound: its name, and its pod's. */
 async function boundWorkspace(): Promise<{ readonly workspace: string; readonly pod: string; readonly uid: string; readonly node: string }> {
@@ -79,7 +81,7 @@ async function podCgroupsOf(node: string, uid: string): Promise<string[]> {
     `pod=$(ls -d /sys/fs/cgroup/kubepods.slice/*/kubepods-*-pod${uid.replaceAll("-", "_")}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid.replaceAll("-", "_")}.slice 2>/dev/null | head -n 1)`,
     `[ -n "$pod" ] || { echo gone; exit 0; }`,
     `echo "pod $(tr '\n' ' ' < "$pod/memory.events")"`,
-    `for scope in "$pod"/*/; do [ -s "$scope/cgroup.procs" ] && echo "$(basename "$scope") max=$(cat "$scope/memory.max") group=$(cat "$scope/memory.oom.group") current=$(cat "$scope/memory.current") $(tr '\n' ' ' < "$scope/memory.events")"; done; true`,
+    `for scope in "$pod"/*/; do [ -n "$(cat "$scope/cgroup.procs")" ] && echo "$(basename "$scope") max=$(cat "$scope/memory.max") group=$(cat "$scope/memory.oom.group") current=$(cat "$scope/memory.current") $(tr '\n' ' ' < "$scope/memory.events")"; done; true`,
   ].join("; ")).catch((error: unknown) => `unread: ${errorText(error)}`);
   return said.trim().split("\n").filter(Boolean);
 }
