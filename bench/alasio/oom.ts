@@ -7,8 +7,9 @@
  * nor of the node, which a runner's memory filled whole starves before the kernel kills: B holds
  * 1.5 GiB and charges and frees 4 MiB every 20 ms beside it; A grows by 64 MiB every 80 ms until it
  * is killed. The cgroup's limit is given back after. Then whether B's pod runs on, the same pod, its
- * process alive, and what the kernel killed and kubelet evicted meanwhile, a line of
- * logs/oom.jsonl a trial. Both sessions are forgotten after.
+ * process alive; what the kernel killed, the node agent ended and kubelet evicted meanwhile; what the
+ * agent's guard set on each sandbox's cgroup; and whether A's session falls back, bound anew on its
+ * workspace: a line of logs/oom.jsonl a trial. Both sessions are forgotten after.
  */
 import { appendFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -17,7 +18,7 @@ import { join } from "node:path";
 import type { CoreV1Event, V1Pod } from "@kubernetes/client-node";
 
 import { NAMESPACE } from "../../cli/src/manifests/common.ts";
-import { bindSession, boundPodOf, gatewayCall, kube, mainToken, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
+import { bindSession, boundPodOf, gatewayCall, kube, mainToken, nodeAgents, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
 import { errorText, forgetWorkspace, loggedOf } from "./alasio.ts";
 import { BENCH_DIR, RUNS } from "./settings.ts";
 
@@ -72,6 +73,24 @@ const victimOf = (line: string, a: { readonly uid: string }, b: { readonly uid: 
   return cgroup.includes(a.uid.replaceAll("-", "_")) || cgroup.includes(a.uid) ? `A ${task}` : cgroup.includes(b.uid.replaceAll("-", "_")) || cgroup.includes(b.uid) ? `B ${task}` : `other ${task} ${cgroup}`;
 };
 
+/** What the node's cgroups of the pod `uid` say: the pod's memory.events, and each of its scopes holding processes, its memory.max, memory.oom.group and memory.events. */
+async function podCgroupsOf(node: string, uid: string): Promise<string[]> {
+  const said = await onNode(node, [
+    `pod=$(ls -d /sys/fs/cgroup/kubepods.slice/*/kubepods-*-pod${uid.replaceAll("-", "_")}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid.replaceAll("-", "_")}.slice 2>/dev/null | head -n 1)`,
+    `[ -n "$pod" ] || { echo gone; exit 0; }`,
+    `echo "pod $(tr '\n' ' ' < "$pod/memory.events")"`,
+    `for scope in "$pod"/*/; do [ -s "$scope/cgroup.procs" ] && echo "$(basename "$scope") max=$(cat "$scope/memory.max") group=$(cat "$scope/memory.oom.group") current=$(cat "$scope/memory.current") $(tr '\n' ' ' < "$scope/memory.events")"; done; true`,
+  ].join("; ")).catch((error: unknown) => `unread: ${errorText(error)}`);
+  return said.trim().split("\n").filter(Boolean);
+}
+
+/** What the agent of `node` logged of ending a sandbox since `since` (ms): its lines. */
+async function agentEnded(node: string, since: number): Promise<string[]> {
+  const pod = (await nodeAgents()).get(node) ?? "";
+  const logs = await kube.logs(NAMESPACE, pod, "node-agent", { timestamps: true }).catch(() => "");
+  return logs.split("\n").filter((line) => /ended the sandbox|could not end the sandbox|could not be guarded/u.test(line) && new Date(line.split(" ")[0] ?? "").getTime() >= since - 1_000).map((line) => line.slice(0, 500));
+}
+
 /** One trial, as the module says: its line. */
 async function trial(number: number): Promise<Record<string, unknown>> {
   const started = Date.now();
@@ -80,6 +99,8 @@ async function trial(number: number): Promise<Record<string, unknown>> {
   const a = await boundWorkspace();
   try {
     await kube.execOk(SESSIONS, b.pod, ["sh", "-c", `nohup node -e "${HOLDER}" > /tmp/holder.log 2>&1 & sleep 3`], { container: "bayma" });
+    // A's workspace marked, for its session's fallback to be told by.
+    await kube.execOk(SESSIONS, a.pod, ["sh", "-c", 'echo kept > "$HOME/oom-marker"'], { container: "bayma" });
     // The Burstable pods' cgroup held to what it holds now and HEADROOM_BYTES more: its limit before, to give back.
     const limited = (await onNode(b.node, `dir=${BURSTABLE}; before=$(cat "$dir/memory.max"); echo $(( $(cat "$dir/memory.current") + ${HEADROOM_BYTES} )) > "$dir/memory.max"; echo "$dir $before $(cat "$dir/memory.max")"`)).trim();
     const [cgroup = "", limitBefore = "max", limit = ""] = limited.split(" ");
@@ -89,6 +110,8 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       new Promise<null>((resolve) => setTimeout(() => resolve(null), GROWTH_BOUND_MS)),
     ]);
     const aEndedMs = Date.now() - grown;
+    // As A ended: what the guard set on each sandbox's scope, and the OOMs each cgroup had.
+    const cgroupsAtEnd = { a: await podCgroupsOf(a.node, a.uid), b: await podCgroupsOf(b.node, b.uid) };
     // One not killed in time ended first, so that it grows no further once the limit is given back.
     if (ran === null) await kube.kill(SESSIONS, a.pod);
     await onNode(b.node, `echo ${limitBefore} > ${cgroup}/memory.max`);
@@ -114,6 +137,18 @@ async function trial(number: number): Promise<Record<string, unknown>> {
     // A's session after: its pod gone and its binding let go, as a broken sandbox's is, and what the gateway said of it.
     const aBound = await boundPodOf(a.workspace);
     const aGateway = (await loggedOf(b.node, a.workspace)).gateway.filter((line) => /releas|broken|oom|memory/iu.test(line)).slice(-6);
+    const ended = await agentEnded(b.node, started);
+    // A's session falls back: bound anew, of a fresh sandbox (it was never saved) on its workspace, which its marker is still in.
+    const fallback = await (async () => {
+      const t0 = Date.now();
+      try {
+        const { name } = await bindSession(a.workspace, 180_000);
+        const marker = await kube.exec(SESSIONS, name, ["sh", "-c", 'cat "$HOME/oom-marker"'], { container: "bayma" });
+        return { pod: name, anew: name !== a.pod, marker: marker.stdout.trim(), code: marker.code, ms: Date.now() - t0 };
+      } catch (error) {
+        return { failure: errorText(error).slice(0, 400), ms: Date.now() - t0 };
+      }
+    })();
     const evicted = (await kube.list<CoreV1Event>("Event", { namespace: SESSIONS }))
       .filter(({ reason, lastTimestamp, eventTime }) => reason === "Evicted" && new Date(String(lastTimestamp ?? eventTime ?? 0)).getTime() >= started)
       .map(({ involvedObject, message }) => `${involvedObject?.name ?? ""}: ${message ?? ""}`);
@@ -125,6 +160,10 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       victims,
       platform_restarted: platformRestarted,
       a_after: { bound: aBound?.name ?? null, gateway: aGateway },
+      platform_killed: victims.filter((victim) => victim.startsWith("other")).length,
+      agent_ended: ended,
+      cgroups_at_end: cgroupsAtEnd,
+      fallback,
       report,
       cgroup: { path: cgroup, limit_before: limitBefore, limit: Number(limit), events },
       kernel,
