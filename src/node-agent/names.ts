@@ -317,6 +317,17 @@ export const restoresWithETags = (release: string, since: string): boolean => re
 export const RESTORES_WITH_ETAGS_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_WITH_ETAGS_SINCE";
 
 /**
+ * Whether gVisor's `release` records a sandbox's working set as a live checkpoint resumes it,
+ * where the sandbox holds none (runsc's working-set-after-save "if-none"): the pages it touches
+ * first after the save, which a restore of that image then reads first, as it does those touched
+ * first after a restore. So a session never restored yet is restored from its images as quickly
+ * as one restored before. One at or past `since`, the first release that does, as
+ * cluster/node/pins.json says it (gvisor.recordsWorkingSetAfterSaveSince); none where `since`
+ * names none.
+ */
+export const recordsWorkingSetAfterSave = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/**
  * How long a save, of a release that bounds it (savesWithLoadWait), waits for the pages that its
  * sandbox's restore from the bucket has not loaded yet (./agent.ts SaveDeferred): those it saves,
  * and those bayma's hook touches, the hook's own time aside. 5 minutes, well within the
