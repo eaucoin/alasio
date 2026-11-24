@@ -167,12 +167,14 @@ export const BINDING_FILE = "binding.json";
 
 /**
  * What of a node's memory kubelet keeps from its pods (kube-reserved and system-reserved), and
- * how little it lets be available before it evicts them softly (eviction-soft), as alasio's nodes
- * run it (cli/src/cluster/k3s.ts KUBELET_ARGS): what the agent's memory budget leaves aside
- * (./memory.ts).
+ * how little it lets be available before it evicts them softly (eviction-soft) and at once
+ * (eviction-hard), as alasio's nodes run it (cli/src/cluster/k3s.ts KUBELET_ARGS): what the
+ * agent's memory budget leaves aside (./memory.ts), and what its guard keeps sandboxes from
+ * (./guard.ts).
  */
 export const NODE_MEMORY_RESERVED_BYTES = (1024 + 512) * 1024 ** 2;
 export const NODE_MEMORY_SOFT_EVICTION_BYTES = 1536 * 1024 ** 2;
+export const NODE_MEMORY_HARD_EVICTION_BYTES = 1024 ** 3;
 
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */
 export const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
