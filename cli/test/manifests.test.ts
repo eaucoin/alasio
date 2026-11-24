@@ -62,7 +62,7 @@ import { carriedPools, recordedCpuBaseline, workspaceMountReady, workspaceMountS
 import { STOP_GRACE_SECONDS } from "../../src/binder/names.ts";
 import { STOP_CALLS_MS, STOP_LINGER_MS } from "../../src/binder/server.ts";
 import { folderStateDir, POOLS, restorePodName, templateHash } from "../../src/gateway/names.ts";
-import { BAYMA_CONTAINER, SOCKET_PATH_MAX, standbyContainerSocket, standbySocket } from "../../src/kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, SOCKET_PATH_MAX, standbyContainerSocket, standbySocket, WARMED_FILE } from "../../src/kube/sandbox-shape.ts";
 import { hookOf, stateDirOf } from "../../src/gateway/snapshots.ts";
 import { VERSION } from "../src/release.ts";
 
@@ -3514,11 +3514,14 @@ describe("admission", () => {
 });
 
 describe("the sandbox service", () => {
-  test("has a pool's pods open the binaries a restore reads as they start where the nodes serve the image through passthrough, and none elsewhere", () => {
-    const warm = (objects: readonly KubernetesObject[]) =>
-      ["sandboxes-none", "sandboxes-full"].map((name) => container(one<V1Deployment>(objects, "Deployment", name)).env?.find(({ name }) => name === "ALASIO_WARM"));
-    assert.deepEqual(warm(install()), [undefined, undefined]);
-    assert.deepEqual(warm(install({ sessions: { imagePassthrough: true } })), Array(2).fill({ name: "ALASIO_WARM", value: "1" }));
+  test("has a pool's pods open the binaries a restore reads as they start where the nodes serve the image through passthrough, started only once they have, and none elsewhere", () => {
+    const pools = (objects: readonly KubernetesObject[]) => ["sandboxes-none", "sandboxes-full"].map((name) => container(one<V1Deployment>(objects, "Deployment", name)));
+    const warm = (objects: readonly KubernetesObject[]) => pools(objects).map(({ env, startupProbe }) => [env?.find(({ name }) => name === "ALASIO_WARM"), startupProbe]);
+    assert.deepEqual(warm(install()), Array(2).fill([undefined, undefined]));
+    assert.deepEqual(
+      warm(install({ sessions: { imagePassthrough: true } })),
+      Array(2).fill([{ name: "ALASIO_WARM", value: "1" }, { exec: { command: ["test", "-e", WARMED_FILE] }, periodSeconds: 1, failureThreshold: 300 }]),
+    );
   });
 
   test("makes folder conversations' instances of the host profile, which the gateway alone makes and reaches, each on its conversation's state directory, released after an hour idle", () => {

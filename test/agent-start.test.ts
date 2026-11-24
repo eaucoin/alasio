@@ -4,11 +4,12 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { WARMED_FILE } from "../src/kube/sandbox-shape.ts";
 import { SAVE_HOOK_SECONDS } from "../src/node-agent/names.ts";
 
 const START = new URL("../sandbox/agent/start.sh", import.meta.url).pathname;
@@ -86,7 +87,7 @@ test("bayma's hook is killed past its bound as it readies the sandbox for a save
   }
 });
 
-test("bayma's server, as a pool's pod starts where the image is served through passthrough, opens the binaries a restore reads before it waits for its binding; elsewhere, and a hook, none", async () => {
+test("bayma's server, as a pool's pod starts where the image is served through passthrough, opens the binaries a restore reads before it waits for its binding, then writes the file its startup probe waits for; elsewhere, and a hook, none", async () => {
   // bayma's hook, which takes a second.
   const { root, env: podEnv } = pod("sleep 1");
   try {
@@ -101,7 +102,8 @@ test("bayma's server, as a pool's pod starts where the image is served through p
         const timer = setTimeout(() => (writer.kill(), resolve(false)), ms);
         writer.once("exit", (code) => (clearTimeout(timer), resolve(code === 0)));
       });
-    const env = { ...podEnv, ALASIO_WARM_FILES: binary };
+    const warmed = join(root, "warmed");
+    const env = { ...podEnv, ALASIO_WARM_FILES: binary, ALASIO_WARMED: warmed };
     /** bayma's server under `variables`, its binding not yet given: whether it opens the binary within `ms` as it waits for it. */
     const serve = async (variables: Record<string, string>, ms: number) => {
       rmSync(join(attach, "token"), { force: true });
@@ -113,10 +115,14 @@ test("bayma's server, as a pool's pod starts where the image is served through p
       assert.equal(await ended, 0);
       return did;
     };
-    // Where the image is not served through passthrough, it opens none.
+    // Where the image is not served through passthrough, it opens none, and says nothing warmed.
     assert.equal(await serve(env, 500), false);
-    // Where it is, it opens the binary.
+    assert.equal(existsSync(warmed), false);
+    // Where it is, it opens the binary, then says so.
     assert.equal(await serve({ ...env, ALASIO_WARM: "1" }, 5_000), true);
+    assert.equal(existsSync(warmed), true);
+    // The file it writes but for tests, the one its startup probe waits for.
+    assert.equal(/ALASIO_WARMED:-([^}]+)\}/u.exec(readFileSync(START, "utf8"))?.[1], WARMED_FILE);
     // A hook opens none.
     const hook = spawn("sh", [START, "node", "/opt/bayma/bayma.js", "sandbox-hook"], { env: { ...env, ALASIO_WARM: "1" } });
     const hookEnded = new Promise<number | null>((resolve) => hook.once("exit", resolve));
