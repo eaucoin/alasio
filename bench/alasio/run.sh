@@ -9,6 +9,12 @@ set -euo pipefail
 # The runner's memory every 10 s, the stack and the sessions on it together, to tell a run that ran out of it.
 mkdir -p "$BENCH_DIR/logs"
 (while sleep 10; do echo "$(date -u +%T) $(free -m | sed -n 2p)"; done) >"$BENCH_DIR/logs/memory.log" &
+# Spike: the CPU time of each command on the runner, in clock ticks, summed over its processes, every second, to
+# place what a cold restore waits on.
+(while sleep 1; do
+  t=$(date -u +%T.%N)
+  sudo cat /proc/[0-9]*/stat 2>/dev/null | awk -v t="$t" '{ cpu[$2] += $14 + $15 } END { for (c in cpu) if (cpu[c] > 0) print t, c, cpu[c] }'
+done) >"$BENCH_DIR/logs/cpu.log" &
 # The runner's writeback held to 256 MiB dirty, 64 MiB before it starts: a save of 3 GiB left gigabytes dirty on the
 # disk the store and the node's cache share with k3s, and the stall of the fsyncs behind them ended k3s ("Transaction
 # commit failed"). Said in logs/writeback.txt.
