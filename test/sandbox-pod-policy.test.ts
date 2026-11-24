@@ -29,8 +29,10 @@ import { startKubeApiServer } from "./support/kube-apiserver.ts";
 const run = <A, E>(effect: Effect.Effect<A, E, KubeClient>): Promise<A> => Effect.runPromise(Effect.provide(effect, Layer.fresh(KubeClient.layer)));
 const withKube = <A, E>(use: (kube: KubeClient["Service"]) => Effect.Effect<A, E>) => run(Effect.flatMap(KubeClient, use));
 
-const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } } });
-const earlier = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { resources: { requests: { cpu: "101m" } } } });
+// Its nodes serving the session image through passthrough, so its pool's pods have a startup probe, which a restore's pod and
+// a standby have not (ownDirectory).
+const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { imagePassthrough: true } });
+const earlier = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { resources: { requests: { cpu: "101m" } }, imagePassthrough: true } });
 if (Result.isFailure(decoded) || Result.isFailure(earlier)) throw new Error("the configuration does not decode");
 // Main's sessions snapshotted, as the nodes' CPU baseline is recorded: the gateway restores them, onto each pool's
 // template and the one before it, of an installation whose sessions asked for other CPU, carried as alasio up carries it.
@@ -148,7 +150,8 @@ async function evidence(policy: string, last: unknown, output: string): Promise<
   ].join("\n");
 }
 
-test("a pool's pod, as its ReplicaSet makes it from its template, is made, VPA's resources its own", async () => {
+test("a pool's pod, as its ReplicaSet makes it from its template, its startup probe among it, is made, VPA's resources its own", async () => {
+  assert.ok(template?.spec?.containers[0]?.startupProbe, "the pool's template has no startup probe");
   const pod = await made(poolPod());
   assert.ok("name" in pod, JSON.stringify(pod));
   // As VPA sizes it as it is made, unlike its template's.

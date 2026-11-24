@@ -47,6 +47,12 @@ export const CPU_FEATURES_ANNOTATION = "dev.gvisor.internal.cpufeatures";
 export const RESTORE_ANNOTATION = "dev.gvisor.internal.restore.host-image-path";
 /** The fork's annotation that leaves a restored sandbox paused, running nothing, until it is resumed. */
 export const RESTORE_PAUSED_ANNOTATION = "dev.gvisor.internal.restore.paused";
+/**
+ * The file a pool's pod's start.sh (sandbox/agent/start.sh) writes once it has opened the binaries
+ * a restore reads, where the image is served through passthrough; its startup probe's, so that the
+ * pod counts as started, and a bind claims it, only once it has.
+ */
+export const WARMED_FILE = "/tmp/alasio-warmed";
 /** The condition of a restored pod's readiness gate, which alasio sets once its sandbox is resumed. */
 export const RESUMED_CONDITION = "alasio.dev/resumed";
 /**

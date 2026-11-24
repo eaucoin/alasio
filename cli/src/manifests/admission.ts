@@ -347,6 +347,7 @@ const poolContainer = (container: V1Container): Pinned => templateContainer(cont
 function templateContainer(container: V1Container, resources: Pinned): Pinned {
   const each = container as unknown as PinnedMap;
   const probe = each["readinessProbe"] as PinnedMap | undefined;
+  const startup = each["startupProbe"] as PinnedMap | undefined;
   return defaulted({
     ...each,
     resources,
@@ -361,6 +362,7 @@ function templateContainer(container: V1Container, resources: Pinned): Pinned {
       }
       : {}),
     ...(probe ? { readinessProbe: defaulted(probe, POOL_POD_DEFAULTS.probe) } : {}),
+    ...(startup ? { startupProbe: defaulted(startup, POOL_POD_DEFAULTS.probe) } : {}),
   }, POOL_POD_DEFAULTS.container);
 }
 
