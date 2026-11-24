@@ -11,7 +11,7 @@ import { test } from "node:test";
 import { KubeConfig } from "@kubernetes/client-node";
 
 import pins from "../../cluster/node/pins.json" with { type: "json" };
-import { NODE_MEMORY_RESERVED_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES } from "../../src/node-agent/names.ts";
+import { NODE_MEMORY_HARD_EVICTION_BYTES, NODE_MEMORY_RESERVED_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES } from "../../src/node-agent/names.ts";
 import { runscFlags } from "../../src/node-agent/runsc.ts";
 import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, KUBELET_ARGS, nodeHostsWith, normalizedReference, readySince, registriesYaml, SANDBOX_IMAGE, staleRuntimeClasses, unservedPods } from "../src/cluster/k3s.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "../src/cluster/stargz.ts";
@@ -190,7 +190,7 @@ test("clusterKubeconfig names k3s's kubeconfig after the cluster, at the server 
   assert.equal(clusterKubeconfig("apiVersion: v1\nclusters: [", "dev"), null);
 });
 
-test("the node agent's memory budget leaves aside what kubelet reserves and its soft eviction threshold, as alasio's nodes run kubelet", () => {
+test("the node agent's memory budget and guard leave aside what kubelet reserves and its eviction thresholds, as alasio's nodes run kubelet", () => {
   // The memory quantity kubelet's argument `name` gives right after `key`: `memory=1Gi`, `memory.available<1536Mi`.
   const memoryOf = (name: string, key: string): number => {
     const argument = KUBELET_ARGS.find((each) => each.startsWith(`${name}=`)) ?? "";
@@ -200,4 +200,5 @@ test("the node agent's memory budget leaves aside what kubelet reserves and its 
   };
   assert.equal(NODE_MEMORY_RESERVED_BYTES, memoryOf("kube-reserved", "memory=") + memoryOf("system-reserved", "memory="));
   assert.equal(NODE_MEMORY_SOFT_EVICTION_BYTES, memoryOf("eviction-soft", "memory.available<"));
+  assert.equal(NODE_MEMORY_HARD_EVICTION_BYTES, memoryOf("eviction-hard", "memory.available<"));
 });

@@ -89,7 +89,7 @@ const POD_UID = "io.kubernetes.cri.sandbox-uid";
 const text = (path: string): Promise<string | null> => readFile(path, "utf8").catch(() => null);
 
 /** A cgroup's file of one number, or null. */
-const numberIn = async (path: string): Promise<number | null> => {
+export const numberIn = async (path: string): Promise<number | null> => {
   const read = (await text(path))?.trim();
   return read !== undefined && /^[0-9]+$/u.test(read) ? Number(read) : null;
 };
@@ -135,8 +135,13 @@ export async function ownMemory(proc: string, cgroups: string): Promise<number |
   return (path === undefined ? null : await numberIn(join(cgroups, path, "memory.current"))) ?? (await numberIn(join(cgroups, "memory.current")));
 }
 
-/** The node's memory and its sandboxes', as the module says. */
-export const nodeMemory = ({ runsc, nodeRoot, attachRoot, ownProc = OWN_PROC, ownCgroups = OWN_CGROUPS }: MemoryOptions): Effect.Effect<NodeMemory> =>
+/** A sandbox's memory, as the module says, with its pod's cgroup, under the node's cgroup root as the agent sees it; null where it was not found. */
+export interface SandboxCgroup extends SandboxMemory {
+  readonly cgroup: string | null;
+}
+
+/** The node's sandboxes' memory, and their pods' cgroups, as the module says. */
+export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions, "runsc" | "nodeRoot" | "attachRoot">): Effect.Effect<readonly SandboxCgroup[]> =>
   Effect.gen(function*() {
     const cgroups = join(nodeRoot, "sys", "fs", "cgroup");
     const listed = yield* runsc.containers.pipe(
@@ -169,8 +174,16 @@ export const nodeMemory = ({ runsc, nodeRoot, attachRoot, ownProc = OWN_PROC, ow
           shmemBytes: statOf(stat, "shmem"),
           // A kernel without zswap's accounting counts none.
           zswapBytes: cgroup === null ? null : (yield* Effect.promise(() => numberIn(join(cgroup, "memory.zswap.current")))) ?? 0,
-        } satisfies SandboxMemory;
+          cgroup,
+        } satisfies SandboxCgroup;
       }), { concurrency: 4 });
+    return sandboxes.toSorted((a, b) => `${a.namespace}/${a.pod}`.localeCompare(`${b.namespace}/${b.pod}`));
+  });
+
+/** The node's memory and its sandboxes', as the module says. */
+export const nodeMemory = ({ runsc, nodeRoot, attachRoot, ownProc = OWN_PROC, ownCgroups = OWN_CGROUPS }: MemoryOptions): Effect.Effect<NodeMemory> =>
+  Effect.gen(function*() {
+    const sandboxes = (yield* sandboxesOf({ runsc, nodeRoot, attachRoot })).map(({ cgroup: _cgroup, ...memory }) => memory);
     const meminfo = yield* Effect.promise(() => text(join(nodeRoot, "proc", "meminfo")));
     const totalBytes = meminfoOf(meminfo, "MemTotal") ?? 0;
     const sum = (state: SandboxState | readonly SandboxState[]) =>
@@ -181,7 +194,7 @@ export const nodeMemory = ({ runsc, nodeRoot, attachRoot, ownProc = OWN_PROC, ow
       agentBytes: yield* Effect.promise(() => ownMemory(ownProc, ownCgroups)),
       budgetBytes: Math.max(0, Math.floor((totalBytes - NODE_MEMORY_RESERVED_BYTES - NODE_MEMORY_SOFT_EVICTION_BYTES - sum("bound")) / 2)),
       budgetedBytes: sum(["standby", "free"]),
-      sandboxes: sandboxes.toSorted((a, b) => `${a.namespace}/${a.pod}`.localeCompare(`${b.namespace}/${b.pod}`)),
+      sandboxes,
     };
   });
 

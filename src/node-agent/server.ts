@@ -181,6 +181,7 @@ import {
 } from "./agent.ts";
 import { convergeAttachments } from "./attachments.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
+import { guardNodeMemory } from "./guard.ts";
 import { makeHostCommands } from "./host.ts";
 import { makeJuicefs } from "./juicefs.ts";
 import { makeWorkspaces, Released, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
@@ -649,6 +650,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   // What the node's memory holds, its sandboxes' and the budget of what is held ahead, as gauges and as its API answers it.
   const memory = { runsc, nodeRoot: NODE_ROOT, attachRoot: ATTACH_ROOT };
   yield* observeNodeMemory(memory);
+  yield* guardNodeMemory(memory);
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, memory: nodeMemory(memory) });
   // What is attached on the node, kept to the pods the cluster has on it.
   yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
