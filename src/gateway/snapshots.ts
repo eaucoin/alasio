@@ -1183,7 +1183,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const node = pod.spec?.nodeName;
       if (!node || !containerId || pod.spec?.runtimeClassName === undefined || !hook || !stateDir) return null;
       const name = pod.metadata?.name ?? "";
-      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...templateOfPod(pod) }, live: { stateDir } }).pipe(Effect.result);
+      const taken = yield* agents.checkpoint(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, containerId, hook, podTemplate: { ...templateOfPod(pod) }, live: { stateDir, yieldForMs: liveEveryMs } }).pipe(Effect.result);
       if (taken._tag === "Failure" && unsaveable(taken.failure)) {
         yield* counted("unsaveable");
         return "unsaveable" as const;

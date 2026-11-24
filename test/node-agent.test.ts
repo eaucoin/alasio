@@ -1866,6 +1866,48 @@ test("an agent that starts again removes what each compaction the one before it 
     })
   ));
 
+test("a live save's reads and upload yield to a restore on its node reading its image, holding the workspace's lock, for as long as its budget at the most; not at all where it has none; and no more once a release of the workspace waits for the lock", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { runscDir, prepareOther } = yield* yieldingTo(here);
+      const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+      mkdirSync(stateDirIn(volume), { recursive: true });
+      writeFileSync(join(stateDirIn(volume), "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
+      const liveFor = (yieldForMs?: number): CheckpointRequest => ({ ...live("fs-abc"), live: { stateDir: STATE_DIR, ...(yieldForMs === undefined ? {} : { yieldForMs }) } });
+      const puts = () => s3.requests.filter((asked) => asked.startsWith("PUT main/fs-abc/layers/")).length;
+      const timedTake = (asked: CheckpointRequest) => Effect.gen(function*() {
+        const started = Date.now();
+        yield* here.agent.checkpoint(asked);
+        return Date.now() - started;
+      });
+      // No restore reads: no wait, with a budget or none.
+      assert.ok((yield* timedTake(liveFor(5_000))) < 3_000);
+      // fs-other prepared, and so read from now on, never resumed: it reads on.
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* prepareOther;
+      // With none, it does not yield.
+      assert.ok((yield* timedTake(liveFor())) < 3_000);
+      // With a budget, it waits that long, then goes on all the same, as a restore that never ends reading would starve it.
+      const spent = yield* timedTake(liveFor(1_500));
+      assert.ok(spent >= 1_500 && spent < 6_000, `it took ${spent} ms`);
+      // With a long one, it waits, its parts unsent, until a release of the workspace waits for the lock it holds: then it
+      // goes on at once, and the release after it.
+      const before = puts();
+      const saving = yield* Effect.forkChild(timedTake(liveFor(120_000)));
+      yield* Effect.sleep("1 second");
+      assert.equal(puts(), before);
+      const asked = Date.now();
+      const released = yield* here.agent.checkpoint(request("fs-abc"));
+      const liveTook = yield* Fiber.join(saving);
+      assert.ok(Date.now() - asked < 10_000 && liveTook < 15_000, `the live save took ${liveTook} ms`);
+      assert.ok(puts() > before);
+      assert.equal(released.layers.length >= 1, true);
+    })
+  ));
+
 test("a compaction's hashes and its upload wait while a restore on its node reads its image", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
