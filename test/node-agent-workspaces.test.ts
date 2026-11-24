@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { Effect } from "effect";
 
+import type { Manifest } from "../src/node-agent/agent.ts";
 import { holdsQuota, lookOnNode, mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
 import { TracingLayer } from "../src/telemetry/index.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
@@ -530,27 +531,87 @@ test("a FIFO in a workspace is neither read nor written, nor waited on", async (
   }
 });
 
-test("a workspace records the snapshot it was released into beside its files, out of its sandbox's reach, replaced whole, with the memory limit its sandbox ran out of where it did, and none once cleared", async () => {
+const RELEASE = "20260921.0-eaucoin.8";
+const FIRST = "20261017T120000000Z-0000000a";
+const SECOND = "20261017T130000000Z-0000000b";
+
+/** The manifest of the snapshot `snapshot` of fs-released, compacted from `compactedFrom` where given, of one image of `digit`. */
+const manifestOf = (snapshot: string, digit: string, compactedFrom?: string): Manifest => ({
+  environment: "main",
+  workspace: "fs-released",
+  snapshot,
+  release: RELEASE,
+  cpuFeatures: [],
+  podTemplate: {},
+  layers: [{ digest: digit.repeat(64), files: [] }],
+  bytes: 0,
+  takenAt: "2026-10-17T12:00:00.000Z",
+  pauseMs: 0,
+  uploadMs: 0,
+  ...(compactedFrom === undefined ? {} : { compactedFrom }),
+});
+
+test("a workspace records the snapshot it was released into beside its files, with its manifest, out of its sandbox's reach, replaced whole, with the memory limit its sandbox ran out of where it did, and none once cleared", async () => {
   const at = workspacesNode();
   try {
     const ref = { environment: "main", workspace: "fs-released" };
     const files = at.files("fs-released");
+    const first = { snapshot: FIRST, release: RELEASE, manifest: manifestOf(FIRST, "a") };
     assert.equal(await Effect.runPromise(at.workspaces.released(ref)), null);
-    await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" }));
-    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" });
-    await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8", memoryLimit: "4Gi" }));
-    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8", memoryLimit: "4Gi" });
+    await Effect.runPromise(at.workspaces.setReleased(ref, first));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), first);
+    const second = { snapshot: SECOND, release: RELEASE, manifest: manifestOf(SECOND, "b"), memoryLimit: "4Gi" };
+    await Effect.runPromise(at.workspaces.setReleased(ref, second));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), second);
     // Beside its files, which its sandbox sees, not among them; nothing staged left beside it.
     assert.deepEqual(readdirSync(join(files, "..")).sort(), ["files", "released.json"]);
     assert.deepEqual(readdirSync(files).sort(), ["home", "workspace"]);
     await Effect.runPromise(at.workspaces.setReleased(ref, null));
     assert.equal(await Effect.runPromise(at.workspaces.released(ref)), null);
     await Effect.runPromise(at.workspaces.setReleased(ref, null));
-    // Of a workspace there is not, or by names that are none, refused; one whose record is none, refused too.
-    assert.equal(await refusal(at.workspaces.setReleased({ environment: "main", workspace: "fs-never" }, { snapshot: "20261017T120000000Z-0000000a", release: "r" })), 404);
+    // Of a workspace there is not, or by names that are none, refused; one whose record is none, or whose manifest is of
+    // another snapshot or another workspace's, refused too.
+    assert.equal(await refusal(at.workspaces.setReleased({ environment: "main", workspace: "fs-never" }, { ...first, manifest: { ...first.manifest, workspace: "fs-never" } })), 404);
+    assert.equal(await refusal(at.workspaces.setReleased(ref, { ...first, manifest: { ...first.manifest, workspace: "fs-other" } })), 400);
     assert.equal(await refusal(at.workspaces.released({ environment: "main", workspace: "../etc" })), 400);
     writeFileSync(join(files, "..", "released.json"), "{\"snapshot\":\"../../x\"}");
     assert.equal(await refusal(at.workspaces.released(ref)), 500);
+    writeFileSync(join(files, "..", "released.json"), JSON.stringify({ ...first, manifest: manifestOf(SECOND, "b") }));
+    assert.equal(await refusal(at.workspaces.released(ref)), 500);
+  } finally {
+    at.done();
+  }
+});
+
+test("a workspace's record of its release is read with the compaction its node's agent recorded of that snapshot, whose manifest it restores; one of another snapshot, as a compaction of one it was released into before written late is, of another release or workspace, or no record of one, is read with none", async () => {
+  const at = workspacesNode();
+  try {
+    const ref = { environment: "main", workspace: "fs-released" };
+    const files = at.files("fs-released");
+    const released = { snapshot: SECOND, release: RELEASE, manifest: manifestOf(SECOND, "b"), pod: "pool-0" };
+    await Effect.runPromise(at.workspaces.setReleased(ref, released));
+    // A compaction of the snapshot it was released into before, recorded after this release's record: of none it is released into.
+    const late = { from: FIRST, manifest: manifestOf("20261017T123000000Z-0000000c", "c", FIRST) };
+    await Effect.runPromise(at.workspaces.setCompacted(ref, late));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), released);
+    // A compaction of this one: its manifest the compaction's, the rest the record's.
+    const compacted = { from: SECOND, manifest: manifestOf("20261017T133000000Z-0000000d", "d", SECOND) };
+    await Effect.runPromise(at.workspaces.setCompacted(ref, compacted));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { ...released, manifest: compacted.manifest });
+    assert.deepEqual(readdirSync(join(files, "..")).sort(), ["compacted.json", "files", "released.json"]);
+    // Released into another since, the compaction is of none it is released into.
+    const third = { snapshot: "20261017T140000000Z-0000000e", release: RELEASE, manifest: manifestOf("20261017T140000000Z-0000000e", "e") };
+    await Effect.runPromise(at.workspaces.setReleased(ref, third));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), third);
+    // One of another release, or another workspace's, or that is none, is read with none.
+    await Effect.runPromise(at.workspaces.setReleased(ref, released));
+    for (const written of [{ ...compacted, manifest: { ...compacted.manifest, release: "20260921.0-eaucoin.9" } }, { ...compacted, manifest: { ...compacted.manifest, workspace: "fs-other" } }, { from: SECOND }]) {
+      writeFileSync(join(files, "..", "compacted.json"), JSON.stringify(written));
+      assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), released);
+    }
+    // Recorded of another workspace's compaction, or of one that is not compacted from the snapshot it names, refused.
+    assert.equal(await refusal(at.workspaces.setCompacted(ref, { ...compacted, manifest: { ...compacted.manifest, workspace: "fs-other" } })), 400);
+    assert.equal(await refusal(at.workspaces.setCompacted({ environment: "main", workspace: "fs-never" }, { ...compacted, manifest: { ...compacted.manifest, workspace: "fs-never" } })), 404);
   } finally {
     at.done();
   }
@@ -568,7 +629,10 @@ test("nothing is made, cloned, attached or recorded where workspace storage is n
     assert.equal(await refusal(at.workspaces.clone({ environment: "main", workspace: "fs-there" }, ref, 1024 ** 3)), 503);
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-there" }, "pool-0", "token", {})), 503);
     assert.deepEqual(at.mounts, []);
-    assert.equal(await refusal(at.workspaces.setReleased({ environment: "main", workspace: "fs-there" }, { snapshot: "20261017T120000000Z-0000000a", release: "r" })), 503);
+    const snapshot = "20261017T120000000Z-0000000a";
+    const manifest = { environment: "main", workspace: "fs-there", snapshot, release: "r", cpuFeatures: [], podTemplate: {}, layers: [{ digest: "a".repeat(64), files: [] }], bytes: 0, takenAt: "2026-10-17T12:00:00.000Z", pauseMs: 0, uploadMs: 0 };
+    assert.equal(await refusal(at.workspaces.setReleased({ environment: "main", workspace: "fs-there" }, { snapshot, release: "r", manifest })), 503);
+    assert.equal(await refusal(at.workspaces.setCompacted({ environment: "main", workspace: "fs-there" }, { from: "20261017T110000000Z-00000009", manifest: { ...manifest, compactedFrom: "20261017T110000000Z-00000009" } })), 503);
     assert.deepEqual(at.juicefsCalls(), []);
     // Mounted again: made.
     at.storage.mounted = true;

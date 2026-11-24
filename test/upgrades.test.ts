@@ -5,22 +5,36 @@
  * an installation of that release (test/e2e/alasio.test.ts).
  */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { NODE_AGENT_PORT, WORKSPACES_ROOT } from "../src/node-agent/names.ts";
+import { startFakeS3 } from "./support/fake-s3.ts";
+
 const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.25.sh", import.meta.url));
+/** The repository, as the node agent's image holds it at /opt/alasio. */
+const REPOSITORY = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/u, "");
 
 /** The PATH the cut-over runs with: `bin`'s, and the system's. */
 const pathOf = (bin: string) => [bin, "/usr/bin", "/bin"].join(delimiter);
 
+/** The node agent's pod the stand-in kubectl lists. */
+const AGENT_POD = "alasio-node-agent-x1y2z";
+
 /**
  * A machine for the cut-over: a kubectl that reaches its cluster and lists the namespaces
- * `namespaces` names, `<name>\t<branch label>` each; and an UPGRADE and an UPGRADE_CHECK,
- * each saying it ran, UPGRADE failing while `upgradeFails` is there.
+ * `namespaces` names, `<name>\t<branch label>` each, says the node agents rolled out, lists
+ * AGENT_POD running, and runs what is run in that pod's node agent as `agentExec` says, which
+ * reads what is run on its input: by default nothing, saying it gave no record its manifest; and
+ * an UPGRADE and an UPGRADE_CHECK, each saying it ran, UPGRADE failing while `upgradeFails` is
+ * there.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -29,34 +43,46 @@ function machine() {
   const namespaces = join(root, "namespaces");
   const upgradeFails = join(root, "upgrade-fails");
   const config = join(root, "config.json");
+  const agentExec = join(root, "agent-exec");
   mkdirSync(bin);
+  writeFileSync(agentExec, "cat >/dev/null\necho 'records of releases given their manifests: 0; removed: 0; holding one already: 0'\n");
   writeFileSync(namespaces, "");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
   writeFileSync(join(bin, "kubectl"), `#!/bin/sh
 case "$*" in
   "get --raw=/readyz") exit 0 ;;
   "get namespace -l alasio.dev/branch -o jsonpath="*) cat '${namespaces}' ;;
+  "-n alasio rollout status daemonset/alasio-node-agent --timeout=10m") exit 0 ;;
+  "-n alasio get pods -l app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent --field-selector=status.phase=Running -o jsonpath={.items[0].metadata.name}") printf '%s' '${AGENT_POD}' ;;
+  "-n alasio exec -i ${AGENT_POD} -c node-agent -- node --input-type=module - /opt/alasio http://127.0.0.1:${NODE_AGENT_PORT} ${WORKSPACES_ROOT}") . '${agentExec}' ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
 `, { mode: 0o755 });
   const out = join(root, "out");
   /** The cut-over, failing at `failAt` if given: what it came to. */
+  const envOf = (failAt?: string) => ({
+    PATH: pathOf(bin),
+    OUT: out,
+    CONFIG: config,
+    UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ]`,
+    UPGRADE_CHECK: `echo check >>'${ran}'`,
+    ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
+  });
   const cutOver = (failAt?: string) => {
-    const run = spawnSync("bash", [SCRIPT], {
-      encoding: "utf8",
-      env: {
-        PATH: pathOf(bin),
-        OUT: out,
-        CONFIG: config,
-        UPGRADE: `echo upgrade >>'${ran}' && [ ! -e '${upgradeFails}' ]`,
-        UPGRADE_CHECK: `echo check >>'${ran}'`,
-        ...(failAt === undefined ? {} : { FAIL_AT: failAt }),
-      },
-    });
+    const run = spawnSync("bash", [SCRIPT], { encoding: "utf8", env: envOf(failAt) });
     return { code: run.status, said: run.stderr };
+  };
+  /** The cut-over, as cutOver runs it, beside what the test serves meanwhile, as the node agent's pod reaches it. */
+  const cutOverAsync = async (failAt?: string) => {
+    const child = spawn("bash", [SCRIPT], { env: envOf(failAt), stdio: ["ignore", "ignore", "pipe"] });
+    let said = "";
+    child.stderr.on("data", (chunk: Buffer) => (said += chunk.toString()));
+    const [code] = (await once(child, "close")) as [number | null];
+    return { code, said };
   };
   return {
     cutOver,
+    cutOverAsync,
     /** What UPGRADE and UPGRADE_CHECK ran, in order, since the last time it was asked. */
     ran: () => {
       const read = existsSync(ran) ? readFileSync(ran, "utf8").split("\n").filter(Boolean) : [];
@@ -66,6 +92,8 @@ esac
     /** The cut-over's markers, of what it recorded. */
     marks: () => (existsSync(out) ? readdirSync(out).filter((name) => ["point-of-no-return", "upgraded"].includes(name)).sort() : []),
     namespaces: (listed: string) => writeFileSync(namespaces, listed),
+    /** Runs what is run in the node agent's pod as the shell commands `commands` say, its input theirs. */
+    agentRuns: (commands: string) => writeFileSync(agentExec, commands),
     upgradeFails: (fails: boolean) => (fails ? writeFileSync(upgradeFails, "") : rmSync(upgradeFails, { force: true })),
     remove: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -78,7 +106,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
-    assert.match(run.said, /cutting over from 10\.0\.25[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 10\.0\.25[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* waiting for this release's node agents[^\n]*\n[^\n]* giving each record of a release its manifest, through the node agent alasio-node-agent-x1y2z \(records\.log\)\n[^\n]* records of releases given their manifests: 0; removed: 0; holding one already: 0\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
   } finally {
     at.remove();
   }
@@ -148,7 +176,7 @@ test("the cut-over failing once its upgrade is through goes on with what follows
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.doesNotMatch(again.said, /checking that|upgrading, from the cut-over/u);
-    assert.match(again.said, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(again.said, /^[^\n]* waiting for this release's node agents[^\n]*\n[^\n]* giving each record[^\n]*\n[^\n]* records of releases given[^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
     assert.deepEqual(at.ran(), []);
   } finally {
     at.remove();
@@ -181,5 +209,98 @@ test("the cut-over refuses to run without what it needs, or a cluster to reach, 
     assert.ok(!existsSync(join(root, "out", "point-of-no-return")));
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** The manifest of the snapshot `snapshot` of main's `workspace`, taken under r1, compacted from `compactedFrom` where given. */
+const manifestOf = (workspace: string, snapshot: string, compactedFrom?: string) => ({
+  environment: "main",
+  workspace,
+  snapshot,
+  release: "r1",
+  cpuFeatures: [],
+  podTemplate: {},
+  layers: [{ digest: "a".repeat(64), files: [] }],
+  bytes: 0,
+  takenAt: "2026-10-17T12:00:00.000Z",
+  pauseMs: 0,
+  uploadMs: 0,
+  ...(compactedFrom === undefined ? {} : { compactedFrom }),
+});
+
+test("once upgraded, the cut-over gives each record of a release its manifest, through a node agent of this release: the workspace's current snapshot where it is the one the record names or one compacted from it, the record removed where it is neither or there is none, one that holds a manifest left as it is; run again, it gives none twice", async () => {
+  const at = machine();
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", accessKeyId: "AKID", secretAccessKey: "secret" });
+  const [S1, S2, C1] = ["20261017T120000000Z-0000000a", "20261017T130000000Z-0000000b", "20261017T123000000Z-0000000c"];
+  const done = { snapshot: S1, release: "r1", manifest: manifestOf("fs-done", S1) };
+  // Each workspace's record, as its agent keeps it beside its files, on workspace storage, and what was asked of the agent.
+  const workspaces = mkdtempSync(join(tmpdir(), "alasio-cut-over-workspaces-"));
+  const recordPath = (workspace: string) => join(workspaces, "main", workspace, "released.json");
+  const records = {
+    set: (workspace: string, record: unknown) => (mkdirSync(join(workspaces, "main", workspace), { recursive: true }), writeFileSync(recordPath(workspace), JSON.stringify(record))),
+    delete: (workspace: string) => rmSync(recordPath(workspace), { force: true }),
+    all: () => Object.fromEntries(readdirSync(join(workspaces, "main")).filter((each) => existsSync(recordPath(each))).map((each) => [each, JSON.parse(readFileSync(recordPath(each), "utf8")) as unknown])),
+  };
+  for (const [workspace, record] of [["fs-same", { snapshot: S1, release: "r1", pod: "pool-0" }], ["fs-comp", { snapshot: S1, release: "r1" }], ["fs-moved", { snapshot: S1, release: "r1" }], ["fs-gone", { snapshot: S1, release: "r1" }], ["fs-done", done]] as const) records.set(workspace, record);
+  mkdirSync(join(workspaces, "main", "fs-none"), { recursive: true });
+  const asked: string[] = [];
+  for (const [workspace, current] of [["fs-same", manifestOf("fs-same", S1)], ["fs-comp", manifestOf("fs-comp", C1, S1)], ["fs-moved", manifestOf("fs-moved", S2)], ["fs-done", manifestOf("fs-done", S1)]] as const) {
+    s3.objects.set(`main/${workspace}/current.json`, Buffer.from(JSON.stringify(current)));
+  }
+  const agent = createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(chunk as Buffer);
+      if (request.headers.authorization !== "Bearer agent-token") return response.writeHead(401).end();
+      const path = request.url ?? "";
+      asked.push(`${request.method} ${path}`);
+      if (path === "/workspaces") return response.writeHead(200).end(JSON.stringify({ environments: ["main"] }));
+      if (path === "/workspaces/main") return response.writeHead(200).end(JSON.stringify({ workspaces: ["fs-comp", "fs-done", "fs-gone", "fs-moved", "fs-none", "fs-same"] }));
+      const workspace = /^\/workspaces\/main\/([^/]+)\/released$/u.exec(path)?.[1] ?? "";
+      // As this release's agent: a record of the release before, of no manifest, is none it reads.
+      if (request.method === "GET") {
+        if (!existsSync(recordPath(workspace))) return response.writeHead(404).end();
+        const record = JSON.parse(readFileSync(recordPath(workspace), "utf8")) as { readonly manifest?: unknown };
+        return record.manifest === undefined ? response.writeHead(500).end("its record of its release is not one") : response.writeHead(200).end(JSON.stringify(record));
+      }
+      if (request.method === "PUT") records.set(workspace, JSON.parse(Buffer.concat(chunks).toString()));
+      if (request.method === "DELETE") records.delete(workspace);
+      return response.writeHead(204).end();
+    })();
+  });
+  agent.listen(0, "127.0.0.1");
+  await once(agent, "listening");
+  const url = `http://127.0.0.1:${(agent.address() as AddressInfo).port}`;
+  at.agentRuns([
+    `export S3_ENDPOINT='${s3.endpoint}' S3_REGION=us-east-1 S3_BUCKET=snapshots AWS_ACCESS_KEY_ID=AKID AWS_SECRET_ACCESS_KEY=secret ALASIO_NODE_AGENT_TOKEN=agent-token`,
+    `exec '${process.execPath}' --input-type=module - '${REPOSITORY}' '${url}' '${workspaces}'`,
+  ].join("\n"));
+  try {
+    const run = await at.cutOverAsync();
+    assert.equal(run.code, 0, run.said);
+    assert.match(run.said, /records of releases given their manifests: 2; removed: 2; holding one already: 1\n/u);
+    assert.deepEqual(records.all(), {
+      "fs-same": { snapshot: S1, release: "r1", pod: "pool-0", manifest: manifestOf("fs-same", S1) },
+      "fs-comp": { snapshot: S1, release: "r1", manifest: manifestOf("fs-comp", C1, S1) },
+      "fs-done": done,
+    });
+    // Run again, from what follows the upgrade: nothing given twice.
+    asked.length = 0;
+    const again = await at.cutOverAsync();
+    assert.equal(again.code, 0, again.said);
+    assert.match(again.said, /records of releases given their manifests: 0; removed: 0; holding one already: 3\n/u);
+    assert.ok(asked.every((each) => each.startsWith("GET ")), asked.join(", "));
+    // One the agent refuses fails the cut-over, which goes on with it when run again.
+    records.set("fs-same", { snapshot: S1, release: "r1" });
+    agent.removeAllListeners("request");
+    agent.on("request", (_request, response) => response.writeHead(503).end("workspace storage is not mounted"));
+    const refused = await at.cutOverAsync();
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.said, /FAILED: the records of releases could not all be given their manifests \(records\.log\)/u);
+  } finally {
+    agent.close();
+    await s3.close();
+    rmSync(workspaces, { recursive: true, force: true });
+    at.remove();
   }
 });

@@ -107,7 +107,7 @@ async function filling(runId: string): Promise<Source> {
       await agentOk(bound.node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
       await agentOk(bound.node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace: copy }, to: { environment: SESSIONS, workspace }, quotaBytes: quota.capacityBytes });
       await inAgentNetwork(bound.node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
-      await agentOk(bound.node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
+      await agentOk(bound.node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release, manifest });
       await coldCaches(workspace);
     },
     // Started once its restore's first exec has answered: the agent's fill of the node's cache runs on from there.

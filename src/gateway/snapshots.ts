@@ -35,8 +35,11 @@
  * into a pod made for it; one whose restore so fails is given up, and the restore made into a pod of its
  * own. One whose restore runsc refuses falls back at once; one whose pod cannot start otherwise, as a pull or a
  * node's hiccup fails it, is deferred, as the others that may pass. Only the snapshot the record
- * says it was released into restores, or one its node's agent compacted from it since, which is the
- * same: one it has moved on from since is stale. A restore that cannot be done now, as what it
+ * says it was released into restores, of the manifest the record holds, or the one its node's agent
+ * compacted from it since, which is the same, as the agent records it beside it: nothing of the
+ * bucket is read for it. Every end of a binding writes the record, and one whose write fails has the
+ * workspace's snapshots forgotten in the bucket and every node's cache, so that no record names a
+ * snapshot the workspace moved on from that any node restores. A restore that cannot be done now, as what it
  * needs fails for a while, is deferred, its snapshot kept, the bind refused to be tried again, for
  * DEFER_FOR_MS from its first; one that never can, or one deferred for that long, falls back, its
  * snapshot and its record forgotten, the workspace bound to a free pod of its pool, from bayma's
@@ -80,6 +83,7 @@ import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, RESTORE_ANNOTATION, RESTORE_PAUSED_ANNOTATION, RESUMED_CONDITION, SANDBOX_STOP_REASON_VARIABLE, SESSION_TEMPLATE_ANNOTATION, SNAPSHOT_ID, SPENT_REASON, STOP_WAIT_ARG, UNSPENT_REASON } from "../kube/sandbox-shape.ts";
 import type { Manifest } from "../node-agent/agent.ts";
 import { RESTORE_RUNNING_WAIT_MS } from "../node-agent/names.ts";
+import type { Released } from "../node-agent/workspaces.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
@@ -230,11 +234,12 @@ const UNSAVEABLE_STATUS = 410;
 /**
  * How a restored workspace's spend of its snapshot is tried again where it fails: five times more,
  * 200 ms after the first, then twice as long each time, some 6 s in all, as an agent started again,
- * or the bucket's moment, passes; and how its record's clearing is, three times more, before its
- * bind is through.
+ * or the bucket's moment, passes; how its record's clearing is, three times more, before its
+ * bind is through; and how a release's record is, as many.
  */
 const SPEND_TRIES = { times: 5, schedule: Schedule.exponential("200 millis") };
 const CLEAR_TRIES = { times: 3, schedule: Schedule.exponential("200 millis") };
+const RECORD_TRIES = CLEAR_TRIES;
 /**
  * When a restored workspace whose spend's tries all failed is spent again, as its pod is looked at: a minute after, then
  * twice as long after each that fails again, an hour at most, each said once.
@@ -256,10 +261,11 @@ const DEFERRED_STATUS = 425;
 /** Whether `error`, a checkpoint's, says its sandbox can be saved no more. */
 const unsaveable = (error: NodeAgentError | KubeApiError): boolean => error._tag === "NodeAgentError" && error.status === UNSAVEABLE_STATUS;
 
-/** A snapshot a workspace is released into: its id, and the gVisor release that took it. */
+/** A snapshot a workspace is released into: its id, the gVisor release that took it, and its manifest, which its restore restores. */
 export interface SavedSnapshot {
   readonly snapshot: string;
   readonly release: string;
+  readonly manifest: Manifest;
   /** The pod a release's save took it of, where one did. */
   readonly pod?: string;
 }
@@ -438,7 +444,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       if (taken._tag === "Success") {
         const { snapshot, release, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted ${pool.namespace}/${workspace} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
-        return { outcome: "snapshotted", saved: { snapshot, release } } as const;
+        return { outcome: "snapshotted", saved: { snapshot, release, manifest: taken.success } } as const;
       }
       if (unsaveable(taken.failure)) return { outcome: "unsaveable", why: taken.failure.message } as const;
       const after = yield* podOf(pool, name);
@@ -471,7 +477,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       const recorded = yield* agents.released(ref(pool, workspace)).pipe(Effect.retry({ times: 3, schedule: Schedule.exponential("200 millis") }));
       if (recorded?.pod !== name) return null;
       yield* Effect.logInfo(`${pool.namespace}/${workspace} was saved already as ${recorded.snapshot}, by a release of its pod ${name} before: it is released into it`);
-      return { snapshot: recorded.snapshot, release: recorded.release };
+      return { snapshot: recorded.snapshot, release: recorded.release, manifest: recorded.manifest };
     });
 
   /**
@@ -480,18 +486,19 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * where it ran out of it: unless a release's save took a snapshot of that pod already, as one whose
    * pod's end or detach failed after its save, which it stays released into (savedAlready). Where the
    * record cannot be read, it is left as it is, said so, rather than written over: the record an
-   * older release left, which names no snapshot of this pod, so the next bind falls back to bayma's
-   * checkpoints.
+   * older release left, which names no snapshot of this pod; the workspace's snapshots are forgotten,
+   * so the next bind falls back to bayma's checkpoints rather than restore what that record names.
    */
   const releasedUnsaved = (pool: Pool, workspace: string, pod: string, memoryLimit: string | null = null): Effect.Effect<void, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       const already = yield* savedAlready(pool, workspace, pod).pipe(Effect.result);
       if (already._tag === "Failure") {
-        return yield* Effect.logWarning(`could not read what ${named(pool, workspace)} was released into, so its record is left as it is: ${already.failure.message}`);
+        yield* Effect.logWarning(`could not read what ${named(pool, workspace)} was released into, so its record is left as it is, and its snapshots forgotten: ${already.failure.message}`);
+        return yield* forget(pool, workspace, "what it was released into could not be read as its pod ended unsaved");
       }
       if (already.success) return;
       const into = yield* liveSnapshotOf(pool, workspace);
-      yield* agents.setReleased(ref(pool, workspace), into === null || memoryLimit === null ? into : { ...into, memoryLimit });
+      yield* recordRelease(pool, workspace, into === null || memoryLimit === null ? into : { ...into, memoryLimit });
     }).pipe(withLogScope("snapshots"));
 
   const save = (pool: Pool, workspace: string, name: string): Effect.Effect<Saved, KubeApiError> =>
@@ -516,21 +523,40 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       }
       if (taken.outcome === "unsaveable" || taken.outcome === "kept") yield* goOnWithStop(pool, workspace, name);
       const saved = taken.outcome === "snapshotted" ? taken.saved : null;
-      // Its record, for its next bind, tried a few times: its sandbox has ended, so it is released all the same where none
-      // can be written, its next bind then finding a snapshot it was not released into, which it forgets.
-      yield* agents.setReleased(ref(pool, workspace), saved && { ...saved, pod: name }).pipe(
-        Effect.retry({ times: 3, schedule: Schedule.exponential("200 millis") }),
+      // Its record, for its next bind: its sandbox has ended, so it is released all the same where none can be written, its
+      // snapshots forgotten (recordRelease), its next bind coming back from bayma's checkpoints.
+      yield* recordRelease(pool, workspace, saved && { ...saved, pod: name }).pipe(
         Effect.catch((error) => Effect.logWarning(`${pool.namespace}/${workspace}'s release into ${saved?.snapshot ?? "no snapshot"} could not be recorded, so its next bind comes back from bayma's checkpoints: ${error.message}`)),
         sandboxSpan("alasio.sandbox.release.record", pool, workspace),
       );
+      // Released into none, as its sandbox ended unsaved or can be saved no more: what of it was saved before, as its last live
+      // snapshot or a commit whose answer was lost, its next bind restores nothing of, and is forgotten now.
+      if (taken.outcome === "lost" || taken.outcome === "unsaveable") yield* forget(pool, workspace, `its release saved none (${taken.outcome})`);
       return { saved };
     }).pipe(sandboxSpan("alasio.sandbox.release", pool, workspace, { "k8s.pod.name": name }), withLogScope("snapshots"));
 
-  /** Forgets the workspace's snapshot, saying why; one that cannot be forgotten is said so too, and collected later. */
+  /**
+   * Forgets the workspace's snapshots, saying why: in the bucket, then in every node's cache, so that no node restores what
+   * a record of its release still names, as one whose write failed leaves it. One that cannot be forgotten is said so too,
+   * and collected later.
+   */
   const forget = (pool: Pool, workspace: string, why: string): Effect.Effect<void> =>
-    agents.forget(ref(pool, workspace)).pipe(
-      Effect.catch((error) => Effect.logWarning(`could not forget the snapshot of ${pool.namespace}/${workspace}: ${error.message}`)),
-      Effect.andThen(Effect.logInfo(`forgot the snapshot of ${pool.namespace}/${workspace}: ${why}`)),
+    Effect.gen(function*() {
+      yield* agents.forget(ref(pool, workspace));
+      for (const node of yield* agents.nodes) yield* agents.discard(node, ref(pool, workspace), []);
+      yield* Effect.logInfo(`forgot the snapshot of ${pool.namespace}/${workspace}: ${why}`);
+    }).pipe(Effect.catch((error) => Effect.logWarning(`could not forget the snapshot of ${pool.namespace}/${workspace}, ${why}: ${error.message}`)));
+
+  /**
+   * Records the workspace released into `into`, or none, tried a few times (RECORD_TRIES). Its bind restores what its record
+   * names, reading nothing of the bucket, so a record that cannot be written, which may name a snapshot the workspace has
+   * moved on from since, as one whose clear after its restore failed does, has the workspace's snapshots forgotten
+   * everywhere (forget): its next bind then finds the images it names nowhere, and falls back. It fails as the write did.
+   */
+  const recordRelease = (pool: Pool, workspace: string, into: Released | null): Effect.Effect<void, NodeAgentError | KubeApiError> =>
+    agents.setReleased(ref(pool, workspace), into).pipe(
+      Effect.retry(RECORD_TRIES),
+      Effect.tapError((error) => forget(pool, workspace, `its release into ${into?.snapshot ?? "none"} could not be recorded: ${error.message}`)),
     );
 
   /** Since when each workspace's restore has been deferred, from the first that was: in memory, as the gateway's start begins a window anew. */
@@ -845,23 +871,15 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       Effect.gen(function*() {
         if (!snapshots || pool.namespace !== mainNamespace) return null;
         const started = yield* Clock.currentTimeMillis;
-        // Its record and its current snapshot read at once, the restore waiting on both.
-        const [record, current] = yield* Effect.all([agents.released(ref(pool, workspace)).pipe(Effect.result), agents.current(ref(pool, workspace)).pipe(Effect.result)], { concurrency: 2 }).pipe(
-          sandboxSpan("alasio.sandbox.restore.current", pool, workspace),
-        );
-        const read = record._tag === "Success" ? current : record;
-        if (read._tag === "Failure") return yield* (passing(read.failure) ? deferOr : fallBack)(pool, workspace, "unreadable", read.failure.message);
-        const manifest = read.success;
-        const into = record._tag === "Success" ? record.success : null;
-        if (!manifest) {
-          // Released into a snapshot there is no more, as one forgotten: bound anew, the record with it.
-          if (into) return yield* fallBack(pool, workspace, "stale", `its record names the snapshot ${into.snapshot}, which it holds no more`);
-          return null;
-        }
-        // Only the snapshot it was released into, or one its node's agent compacted from that one since, which is the same.
-        if (into?.snapshot !== manifest.snapshot && (into === null || into.snapshot !== manifest.compactedFrom)) {
-          return yield* fallBack(pool, workspace, "stale", `its snapshot ${manifest.snapshot} is not the one it was released into (${into?.snapshot ?? "none"})`);
-        }
+        // Its record alone, which holds the manifest of the snapshot it was released into, or of the one its node's agent
+        // compacted from that one since, which is the same: nothing of the bucket is read before its restore's own reads. A
+        // record names none of what the workspace moved on from: each is cleared once its restore resumes, and one that is not
+        // is written over by the release after, or has the workspace's snapshots forgotten where that cannot be (recordRelease).
+        const record = yield* agents.released(ref(pool, workspace)).pipe(Effect.result, sandboxSpan("alasio.sandbox.restore.record", pool, workspace));
+        if (record._tag === "Failure") return yield* (passing(record.failure) ? deferOr : fallBack)(pool, workspace, "unreadable", record.failure.message);
+        const into = record.success;
+        if (!into) return null;
+        const { manifest } = into;
         const kept = snapshots.releases.find(({ release }) => release === manifest.release);
         if (!kept) return yield* fallBack(pool, workspace, "release", `gVisor ${manifest.release}, which took it, is no longer kept`);
         const base = templateOf(mode, manifest.podTemplate as V1PodTemplateSpec);
@@ -1065,18 +1083,18 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     // Its bayma holds its stop until its pod's deletion less its own stop (BAYMA_STOP_SECONDS).
     const heldUntil = deletion === undefined ? Infinity : new Date(deletion).getTime() - BAYMA_STOP_SECONDS * 1000;
     const name = pod.metadata?.name ?? "";
-    const record = (saved: SavedSnapshot | null) => agents.setReleased(ref(pool, workspace), saved);
+    const record = (saved: SavedSnapshot | null) => recordRelease(pool, workspace, saved);
     return Effect.gen(function*() {
-      if (!snapshots || pool.namespace !== mainNamespace) return yield* record(null);
+      if (!snapshots || pool.namespace !== mainNamespace) return yield* agents.setReleased(ref(pool, workspace), null);
       // Saved already by an end of it before, as one whose detach failed after: released into that snapshot. Where that
       // cannot be read, saved as it would be, but recorded only where saved: what the record holds is not written over with
       // the snapshot taken live, or none. A first end that saves nothing so leaves the record an older release left, which
-      // names no snapshot of this pod, and the next bind falls back to bayma's checkpoints.
+      // names no snapshot of this pod: its snapshots are forgotten, so the next bind falls back to bayma's checkpoints.
       const already = yield* savedAlready(pool, workspace, name).pipe(Effect.result);
       if (already._tag === "Success" && already.success) return;
       const unread = already._tag === "Failure";
       if (unread) yield* Effect.logWarning(`could not read what ${named(pool, workspace)} was released into, so it is recorded only where saved now: ${already.failure.message}`);
-      const recordUnsaved = unread ? Effect.void : Effect.flatMap(liveSnapshotOf(pool, workspace), record);
+      const recordUnsaved = unread ? forget(pool, workspace, "what it was released into could not be read, and its end saved none") : Effect.flatMap(liveSnapshotOf(pool, workspace), record);
       if (!holdsStop(pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER))) {
         yield* Effect.logWarning(`${named(pool, workspace)} is not snapshotted as its pod ends: its bayma holds no stop for it`);
         yield* counted("unheld");
@@ -1188,7 +1206,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     !snapshots || pool.namespace !== mainNamespace
       ? Effect.succeed(null)
       : agents.current(ref(pool, workspace)).pipe(
-        Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
+        Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release, manifest })),
         // Its restore, or the fallback from it, the one to spend it, not the look as well.
         Effect.tap((live) => Effect.sync(() => (live !== null && takenLive.get(named(pool, workspace))?.snapshot === live.snapshot ? takenLive.delete(named(pool, workspace)) : undefined))),
         Effect.catch((error) => Effect.logWarning(`could not read whether ${named(pool, workspace)} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
@@ -1206,7 +1224,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       releases.add(1, { "alasio.sandbox.release.outcome": "unsaveable" });
       yield* Effect.logWarning(`${named(pool, workspace)} can be saved no more, as its live checkpoint failed as every checkpoint of it will: it is released, to come back from bayma's checkpoints`);
       yield* goOnWithStop(pool, workspace, name);
-      yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not record ${named(pool, workspace)}'s release into none: ${error.message}`)));
+      yield* recordRelease(pool, workspace, null).pipe(Effect.catch((error) => Effect.logWarning(`could not record ${named(pool, workspace)}'s release into none: ${error.message}`)));
+      // What was saved of it live, its next bind restores nothing of.
+      yield* forget(pool, workspace, "it can be saved no more");
     }).pipe(withLogScope("snapshots"));
 
   /** Whether `pool`'s workspaces are snapshotted: main's alone, as alasio's were. */
@@ -1229,9 +1249,9 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       if (!released) return null;
       const current = yield* agents.current(ref(pool, from));
       if (current?.snapshot !== released.snapshot && current?.compactedFrom !== released.snapshot) return null;
-      const { snapshot, release } = yield* agents.copy(ref(pool, from), ref(into, to));
-      yield* Effect.logInfo(`gave the fork ${into.namespace}/${to} of ${pool.namespace}/${from} its snapshot ${snapshot}`);
-      return { snapshot, release };
+      const manifest = yield* agents.copy(ref(pool, from), ref(into, to));
+      yield* Effect.logInfo(`gave the fork ${into.namespace}/${to} of ${pool.namespace}/${from} its snapshot ${manifest.snapshot}`);
+      return { snapshot: manifest.snapshot, release: manifest.release, manifest };
     }).pipe(
       Effect.catch((error) => Effect.as(Effect.logWarning(`the fork ${into.namespace}/${to} of ${pool.namespace}/${from} carries no snapshot: ${error.message}`), null)),
       withLogScope("snapshots"),

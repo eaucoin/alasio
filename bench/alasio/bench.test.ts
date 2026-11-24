@@ -218,9 +218,10 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     phase = "restore-cold";
     await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
     await agentOk(node, "POST", "/workspaces/clones", { from: { environment: SESSIONS, workspace: copy }, to: { environment: SESSIONS, workspace }, quotaBytes: quota.capacityBytes });
-    // Its snapshot current again, its manifest put back as current.json, as a checkpoint commits it (src/node-agent/agent.ts commit).
+    // Its snapshot current again, its manifest put back as current.json, as a checkpoint commits it (src/node-agent/agent.ts commit),
+    // and its release recorded again with that manifest, as the gateway records one (src/gateway/snapshots.ts recordRelease).
     await inAgentNetwork(node, [new URL("dist/s3.mjs", COMMON).pathname, "copy", `${SESSIONS}/${workspace}/manifests/${manifest.snapshot}.json`, `${SESSIONS}/${workspace}/current.json`]);
-    await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release });
+    await agentOk(node, "PUT", `/workspaces/${SESSIONS}/${workspace}/released`, { snapshot: manifest.snapshot, release: manifest.release, manifest });
     const cacheRemoved = await coldCaches(workspace);
     const coldStandby = await standbyFor(node, standbyArm(run));
     const coldBeside = load === null ? null : await load.beside("cold");

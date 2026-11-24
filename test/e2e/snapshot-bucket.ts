@@ -7,13 +7,17 @@
  *   current snapshot's image in the bucket with as many zeros, as a disk's rot would.
  *   Prints one JSON line of the file overwritten.
  * - `release <environment> <workspace> <release>` says the workspace's current snapshot was
- *   taken by gVisor's `release`, as one taken by a release no longer kept says. Prints one
- *   JSON line of the snapshot and the release it said.
+ *   taken by gVisor's `release`, as one taken by a release no longer kept says, in the bucket and
+ *   in the workspace's record of its release, whose manifest a bind restores. Prints one JSON line
+ *   of the snapshot and the release it said.
  * - `outlive <environment> <workspace>` says the workspace's current snapshot was taken live,
  *   at a state generation of bayma's its state directory, as the snapshot's pod template runs
  *   bayma with it, has never been at: one that holds the session no more, which a restore of it
- *   finds as it would resume its sandbox. Prints one JSON line of the snapshot and the
- *   generation it said.
+ *   finds as it would resume its sandbox; in the bucket and in the workspace's record of its
+ *   release. Prints one JSON line of the snapshot and the generation it said.
+ *
+ * The record is read and written through the agent's own API, on its pod's loopback, with the
+ * token the agent is given.
  *
  * alasio's modules are imported by their paths in the repository, which inNodeAgent in
  * harness.ts rewrites to the image's as it pipes this in.
@@ -24,6 +28,7 @@ import { Effect, Schema } from "effect";
 
 import { CURRENT_FILE, Manifest } from "../../src/node-agent/agent.ts";
 import { LAYERS_DIR } from "../../src/node-agent/cache.ts";
+import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../src/node-agent/names.ts";
 import { makeS3Bucket } from "../../src/node-agent/s3.ts";
 
 /** The file of the image overwritten: its snapshot, its image, its path in the image, and its size. */
@@ -71,10 +76,24 @@ const bucket = makeS3Bucket({
 
 const current = `${environment}/${workspace}/${CURRENT_FILE}`;
 
+/** The workspace's record of its release, through the agent's API: what `change` makes of the one there is, of its manifest as `change` makes it. */
+const recordSays = (change: (manifest: Manifest) => Manifest) =>
+  Effect.promise(async () => {
+    const url = `http://127.0.0.1:${NODE_AGENT_PORT}/workspaces/${encodeURIComponent(environment ?? "")}/${encodeURIComponent(workspace ?? "")}/released`;
+    const headers = { authorization: `Bearer ${variable(NODE_AGENT_TOKEN_VARIABLE)}` };
+    const read = await fetch(url, { headers });
+    if (!read.ok) throw new Error(`the record of ${environment}/${workspace}'s release could not be read: ${read.status} ${await read.text()}`);
+    const record = (await read.json()) as { readonly manifest: Manifest };
+    const manifest = change(record.manifest);
+    const written = await fetch(url, { method: "PUT", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ ...record, release: manifest.release, manifest }) });
+    if (!written.ok) throw new Error(`the record of ${environment}/${workspace}'s release could not be written: ${written.status} ${await written.text()}`);
+  });
+
 const said = await Effect.runPromise(Effect.gen(function*() {
   const manifest = yield* Schema.decodeUnknownEffect(Manifest)(yield* bucket.getJson(current));
   if (verb === "release" && release) {
     yield* bucket.putJson(current, { ...manifest, release });
+    yield* recordSays((recorded) => ({ ...recorded, release }));
     const done: Released = { snapshot: manifest.snapshot, release };
     return done;
   }
@@ -84,6 +103,7 @@ const said = await Effect.runPromise(Effect.gen(function*() {
     const stateDir = containers.flatMap(({ args = [] }) => (args.includes("--state-dir") ? [args[args.indexOf("--state-dir") + 1] ?? ""] : []))[0];
     if (!stateDir) return yield* Effect.die(new Error(`the snapshot ${manifest.snapshot} of ${environment}/${workspace} runs no bayma with a state directory`));
     yield* bucket.putJson(current, { ...manifest, live: { stateDir, generation: NEVER_REACHED, running: [] } });
+    yield* recordSays((recorded) => ({ ...recorded, live: { stateDir, generation: NEVER_REACHED, running: [] } }));
     const done: Outlived = { snapshot: manifest.snapshot, generation: NEVER_REACHED };
     return done;
   }
