@@ -19,10 +19,13 @@
  * its standby pending, and a standby claimed is a session's like any other.
  *
  * So a standby costs its node a session's room: it requests a whole session's memory, the
- * template's, though an empty sandbox holds far less (some 18 MiB in its pod, and some 14 MiB of
- * shims), as alasio sets no memory budget for standbys yet, nor lowers a standby's requests until
- * it is claimed. A node keeps one, at most, of the last restore's template and release there, a
- * standby of another taken off as it is made.
+ * template's, though an empty sandbox holds far less (STANDBY_MEMORY_BYTES), as alasio lowers no
+ * standby's requests until it is claimed. What it holds is held ahead of a session's need, within
+ * its node's memory budget for that, as its node's agent says it (../node-agent/memory.ts): none
+ * is made on a node whose budget has no room for one, and one on a node that holds more ahead than
+ * its budget is deleted as the standbys are looked at, as the bound sandboxes there have grown into
+ * it. A node keeps one, at most, of the last restore's template and release there, a standby of
+ * another taken off as it is made.
  * One is made STANDBY_AFTER_MS after a restore on its node, out of the way of the restore's
  * first execs, which share its node's processors with its boot; one that ended, as a node that
  * stopped ends one, is made anew. A restore claims one by an update conditioned on the version
@@ -50,13 +53,17 @@ import { FREE_LABEL, type Pool } from "../binder/names.ts";
 import { hasStatus, KubeClient } from "../kube/client.ts";
 import { RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION, STANDBY_ANNOTATION, STANDBY_LABEL, standbySocket } from "../kube/sandbox-shape.ts";
 import { withLogScope } from "../shared/log.ts";
+import type { MemoryBudget } from "../sandbox/node-agents.ts";
 import { ATTACH_VOLUME, ownDirectory, restorePodName } from "./names.ts";
 
 /** How long after a restore on a node its next standby is made there. */
 export const STANDBY_AFTER_MS = 10_000;
 
-/** How often the standbys are looked at, those that ended and those on a node cordoned, not Ready or gone deleted. */
+/** How often the standbys are looked at, those that ended, those on a node cordoned, not Ready or gone, and those over their node's memory budget deleted. */
 export const STANDBY_SWEEP_MS = 30_000;
+
+/** What a standby holds of its node's memory: an empty sandbox, some 18 MiB in its pod, and some 14 MiB of shims. */
+export const STANDBY_MEMORY_BYTES = 32 * 1024 ** 2;
 
 /** A standby whose claim's answer was lost, and which could not be read again to tell whether it was made: the restore cannot go on. */
 export class StandbyUnsure extends Schema.TaggedError<StandbyUnsure>()("StandbyUnsure", { pod: Schema.String, reason: Schema.String }) {
@@ -86,6 +93,9 @@ export interface Standbys {
   readonly keep: (pool: Pool, node: string, template: V1PodTemplateSpec, runtimeClassName: string) => Effect.Effect<void>;
 }
 
+/** How many MiB `bytes` is, for a log. */
+const mib = (bytes: number): string => `${Math.round(bytes / 1024 ** 2)} MiB`;
+
 /** Whether `pod` is a standby of `template` under `runtimeClassName`. */
 const isOf = (pod: V1Pod, template: V1PodTemplateSpec, runtimeClassName: string): boolean =>
   pod.spec?.runtimeClassName === runtimeClassName && pod.metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION] === template.metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION];
@@ -99,14 +109,20 @@ const standing = (pod: V1Pod): boolean =>
   !pod.metadata?.deletionTimestamp && pod.status?.phase === "Running" && (pod.status.podIPs?.length ?? 0) > 0 &&
   (pod.status.containerStatuses ?? []).length > 0 && (pod.status.containerStatuses ?? []).every(({ state }) => state?.running !== undefined);
 
-/** How the standbys are kept: each made `afterMs` after a restore on its node (STANDBY_AFTER_MS), and looked at every `sweepMs` (STANDBY_SWEEP_MS). */
+/**
+ * How the standbys are kept: within the memory budget of each node for what is held ahead, as
+ * `budgetOf` says it (null where it cannot be told, as where its agent does not answer, a standby
+ * then kept); each made `afterMs` after a restore on its node (STANDBY_AFTER_MS), and
+ * looked at every `sweepMs` (STANDBY_SWEEP_MS).
+ */
 export interface StandbysOptions {
+  readonly budgetOf: (node: string) => Effect.Effect<MemoryBudget | null>;
   readonly afterMs?: number;
   readonly sweepMs?: number;
 }
 
 /** The standbys of main's sessions' namespace `namespace`, as the module says and `options` time them, the gateway's while the scope lasts. */
-export const makeStandbys = Effect.fnUntraced(function*(namespace: string, { afterMs = STANDBY_AFTER_MS, sweepMs = STANDBY_SWEEP_MS }: StandbysOptions = {}): Effect.fn.Return<Standbys, never, KubeClient | Scope.Scope> {
+export const makeStandbys = Effect.fnUntraced(function*(namespace: string, { budgetOf, afterMs = STANDBY_AFTER_MS, sweepMs = STANDBY_SWEEP_MS }: StandbysOptions): Effect.fn.Return<Standbys, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
 
   /** The standbys of `namespace`, on `node` where named. */
@@ -152,8 +168,19 @@ export const makeStandbys = Effect.fnUntraced(function*(namespace: string, { aft
     );
 
   /**
-   * Deletes the standbys that ended, and those on a node that keeps none (keepsNoneOn), as one drained, cordoned, not Ready
-   * or gone; and forgets those it made that it finds no more, deleted or claimed, made at least a sweep before it looked.
+   * Why `node` keeps no more held ahead of its sessions' need: what it holds so, and `more` besides, is over its memory budget
+   * for it, as its agent says; null where it is not, or where that cannot be told.
+   */
+  const overBudget = (node: string, more: number): Effect.Effect<string | null> =>
+    Effect.map(budgetOf(node), (budget) =>
+      budget !== null && budget.budgetedBytes + more > budget.budgetBytes
+        ? `its node ${node} holds ${mib(budget.budgetedBytes)} ahead of its sessions' need, of a memory budget of ${mib(budget.budgetBytes)} for it`
+        : null);
+
+  /**
+   * Deletes the standbys that ended, those on a node that keeps none (keepsNoneOn), as one drained, cordoned, not Ready or
+   * gone, and those on a node over its memory budget (overBudget); and forgets those it made that it finds no more, deleted or
+   * claimed, made at least a sweep before it looked.
    */
   const sweep = Effect.gen(function*() {
     const looked = Date.now();
@@ -163,8 +190,10 @@ export const makeStandbys = Effect.fnUntraced(function*(namespace: string, { aft
     yield* Effect.forEach(
       Map.groupBy(found.filter((pod) => !pod.metadata?.deletionTimestamp), (pod) => pod.metadata?.labels?.[STANDBY_LABEL] ?? ""),
       ([node, there]) =>
-        Effect.flatMap(keepsNoneOn(node), (why) =>
-          Effect.forEach(there, (pod) => (why !== null ? remove(pod, why) : ended(pod) ? remove(pod, "it ended") : Effect.void), { discard: true })),
+        Effect.gen(function*() {
+          const why = (yield* keepsNoneOn(node)) ?? (yield* overBudget(node, 0));
+          yield* Effect.forEach(there, (pod) => (why !== null ? remove(pod, why) : ended(pod) ? remove(pod, "it ended") : Effect.void), { discard: true });
+        }),
       { discard: true },
     );
   }).pipe(
@@ -267,6 +296,12 @@ export const makeStandbys = Effect.fnUntraced(function*(namespace: string, { aft
         if (pod !== kept) yield* remove(pod, ended(pod) ? "it ended" : `a restore on ${node} ran of another template or gVisor release`);
       }
       if (kept) return;
+      // None where it would hold more ahead than its node's memory budget has room for.
+      const short = yield* overBudget(node, STANDBY_MEMORY_BYTES);
+      if (short !== null) {
+        yield* Effect.logInfo(`made no standby on ${node}: ${short}, too little for one`);
+        return;
+      }
       const standby = standbyOf(pool, node, template, runtimeClassName);
       // Its own before it is asked for, so that one made whose answer was lost is deleted as the gateway stops too.
       made.set(standby.metadata?.name ?? "", Date.now());

@@ -19,12 +19,12 @@ import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import { RELEASES } from "../src/gateway/releases.ts";
 import { ATTACH_DURATION, DETACH_DURATION, makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
-import { makeStandbys, type Standbys } from "../src/gateway/standbys.ts";
+import { makeStandbys, STANDBY_MEMORY_BYTES, type Standbys } from "../src/gateway/standbys.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import type { Released } from "../src/node-agent/workspaces.ts";
 import { DEFER_FOR_MS } from "../src/gateway/snapshots.ts";
-import { type AttachRequest, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
+import { type AttachRequest, type MemoryBudget, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { sessionKey } from "../src/sandbox/names.ts";
 import { currentTraceparent, TracingLayer } from "../src/telemetry/index.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -118,6 +118,8 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "outlasts a
       // What is attached on its node is reachable, unless a test says otherwise.
       attachments: () => Effect.succeed([]),
       prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused, restoreStandby: unused,
+      // Each node's memory budget for what is held ahead has room, unless a test says otherwise.
+      memoryBudget: () => Effect.succeed({ budgetBytes: 4 * 1024 ** 3, budgetedBytes: 0 }),
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused, bindFree: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
@@ -2053,10 +2055,17 @@ async function standbySessions(): Promise<{ readonly namespace: string; readonly
   return { namespace, pool, template };
 }
 
-/** The gateway's standbys of `namespace`, kept at once and looked at every 100 ms, their KubeClient as `kubeOf` makes it: and how they stop. */
-async function keptStandbys(namespace: string, kubeOf: (kube: KubeClient["Service"]) => KubeClient["Service"] = (kube) => kube): Promise<{ readonly standbys: Standbys; readonly stop: () => Promise<void> }> {
+/**
+ * The gateway's standbys of `namespace`, kept at once and looked at every 100 ms, their KubeClient as `kubeOf` makes it, each
+ * node's memory budget as `budgetOf` says (none told, unless given): and how they stop.
+ */
+async function keptStandbys(
+  namespace: string,
+  kubeOf: (kube: KubeClient["Service"]) => KubeClient["Service"] = (kube) => kube,
+  budgetOf: (node: string) => Effect.Effect<MemoryBudget | null> = () => Effect.succeed(null),
+): Promise<{ readonly standbys: Standbys; readonly stop: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
-  const standbys = await run(makeStandbys(namespace, { afterMs: 0, sweepMs: 100 }).pipe(Scope.provide(scope), Effect.updateService(KubeClient, kubeOf)));
+  const standbys = await run(makeStandbys(namespace, { budgetOf, afterMs: 0, sweepMs: 100 }).pipe(Scope.provide(scope), Effect.updateService(KubeClient, kubeOf)));
   return { standbys, stop: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
 }
 
@@ -2161,6 +2170,31 @@ test("a gateway that starts deletes every standby there, a gateway's beside it a
     assert.ok(read && !read.metadata?.deletionTimestamp, "the claimed standby was deleted");
   } finally {
     await beside.stop();
+  }
+});
+
+test("no standby is made on a node whose memory budget for what is held ahead has no room for one, and one is deleted once its node holds more ahead than its budget", async () => {
+  const { namespace, pool, template } = await standbySessions();
+  for (const node of ["node-roomy", "node-full", "node-untold"]) await readyNode(node);
+  const budgets = new Map<string, MemoryBudget>([
+    ["node-roomy", { budgetBytes: 4 * STANDBY_MEMORY_BYTES, budgetedBytes: 2 * STANDBY_MEMORY_BYTES }],
+    ["node-full", { budgetBytes: 4 * STANDBY_MEMORY_BYTES, budgetedBytes: 3 * STANDBY_MEMORY_BYTES + 1 }],
+  ]);
+  const { standbys, stop } = await keptStandbys(namespace, undefined, (node) => Effect.sync(() => budgets.get(node) ?? null));
+  try {
+    for (const node of ["node-roomy", "node-full", "node-untold"]) await Effect.runPromise(standbys.keep(pool, node, template, STANDBY_RUNTIME_CLASS));
+    await standbysOnNode(namespace, "node-roomy", 1);
+    // A node whose agent cannot tell its budget keeps one.
+    await standbysOnNode(namespace, "node-untold", 1);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await standbysOnNode(namespace, "node-full", 0);
+    // Its bound sandboxes grown into its budget, what it holds ahead is over it: its standby is deleted as the standbys are looked at.
+    budgets.set("node-roomy", { budgetBytes: 2 * STANDBY_MEMORY_BYTES, budgetedBytes: 2 * STANDBY_MEMORY_BYTES + 1 });
+    await standbysOnNode(namespace, "node-roomy", 0);
+    await standbysOnNode(namespace, "node-untold", 1);
+  } finally {
+    await stop();
+    await run(withKube((kube) => Effect.forEach(["node-roomy", "node-full", "node-untold"], (name) => kube.remove("v1", "Node", "", name), { discard: true })));
   }
 });
 
