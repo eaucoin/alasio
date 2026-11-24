@@ -16,6 +16,7 @@
     "savesWithLoadWaitSince": "20261102.0-eaucoin.10",
     "savesSummarySince": "20261102.0-eaucoin.11",
     "restoresWithETagsSince": "20261102.0-eaucoin.11",
+    "recordsWorkingSetAfterSaveSince": "20261102.0-eaucoin.11",
     "releases": [
       {
         "release": "20261102.0-eaucoin.10",

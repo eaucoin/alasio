@@ -13,7 +13,7 @@ import { type Cluster, KubeConfig, type User, type V1Node, type V1Pod, type V1Ru
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
-import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass, recordsWorkingSetAfterSave } from "../../../src/node-agent/names.ts";
 import type { KubeApi } from "../kube/api.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "./stargz.ts";
 
@@ -211,6 +211,13 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     "  # touches in its first seconds after a restore are recorded, for its next restore to read first.",
     `  dirty-tracking = "wp"`,
     `  working-set-window = "3s"`,
+    ...(recordsWorkingSetAfterSave(release, pins.gvisor.recordsWorkingSetAfterSaveSince)
+      ? [
+        "  # So are those it touches first after a live checkpoint, where it holds no set to save, so that a restore",
+        "  # of a sandbox never restored before reads first what it touches first too.",
+        `  working-set-after-save = "if-none"`,
+      ]
+      : []),
     "  # A checkpoint ends the sandbox's TCP connections through its network device, whose link saves and restores",
     "  # none (fdbased, without SaveRestore): a checkpoint that stops the sandbox aborts and closes each as it saves",
     "  # it, and a live one marks each, to be closed in a sandbox restored from it (the fork's",
