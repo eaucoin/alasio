@@ -140,8 +140,12 @@ export interface SandboxCgroup extends SandboxMemory {
   readonly cgroup: string | null;
 }
 
-/** The node's sandboxes' memory, and their pods' cgroups, as the module says. */
-export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions, "runsc" | "nodeRoot" | "attachRoot">): Effect.Effect<readonly SandboxCgroup[]> =>
+/**
+ * The node's sandboxes' memory, and their pods' cgroups, as the module says; of each only what its
+ * cgroup holds where `split` is false, its memory.stat not read, as each read of it has the kernel
+ * gather its counts from every processor.
+ */
+export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions, "runsc" | "nodeRoot" | "attachRoot">, split = true): Effect.Effect<readonly SandboxCgroup[]> =>
   Effect.gen(function*() {
     const cgroups = join(nodeRoot, "sys", "fs", "cgroup");
     const listed = yield* runsc.containers.pipe(
@@ -163,7 +167,7 @@ export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions,
         const bound = (yield* Effect.promise(() => text(join(attachRoot, namespace, pod, "token")))) !== null;
         const state: SandboxState = bound ? "bound" : containers.some(({ annotations }) => annotations[STANDBY_ANNOTATION] !== undefined) ? "standby" : "free";
         const cgroup = yield* Effect.promise(() => podCgroup(cgroups, uid));
-        const stat = cgroup === null ? null : yield* Effect.promise(() => text(join(cgroup, "memory.stat")));
+        const stat = cgroup === null || !split ? null : yield* Effect.promise(() => text(join(cgroup, "memory.stat")));
         return {
           namespace,
           pod,
@@ -173,7 +177,7 @@ export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions,
           fileBytes: statOf(stat, "file"),
           shmemBytes: statOf(stat, "shmem"),
           // A kernel without zswap's accounting counts none.
-          zswapBytes: cgroup === null ? null : (yield* Effect.promise(() => numberIn(join(cgroup, "memory.zswap.current")))) ?? 0,
+          zswapBytes: cgroup === null || !split ? null : (yield* Effect.promise(() => numberIn(join(cgroup, "memory.zswap.current")))) ?? 0,
           cgroup,
         } satisfies SandboxCgroup;
       }), { concurrency: 4 });
