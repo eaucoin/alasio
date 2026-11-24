@@ -233,7 +233,9 @@ jobs:
         if: always()
         run: |
           sudo journalctl -u k3s --no-pager -o short-iso-precise | zstd -q >"$BENCH_DIR/logs/k3s-journal.zst" || true
-          log=$(sudo find /var/lib/rancher /run/k3s -name containerd.log 2>/dev/null | head -n 1)
+          log=$(sudo find / -xdev -name containerd.log -path '*k3s*' 2>/dev/null | head -n 1)
+          echo "containerd's log: ${log:-none}"
+          sudo journalctl -u 'containerd-stargz*' -u 'stargz*' --no-pager -o short-iso-precise | zstd -q >"$BENCH_DIR/logs/stargz-journal.zst" || true
           [ -z "$log" ] || sudo cat "$log" | zstd -q >"$BENCH_DIR/logs/containerd.log.zst" || true
           sudo k3s kubectl logs -n alasio daemonset/alasio-node-agent --tail=-1 --timestamps 2>&1 | zstd -q >"$BENCH_DIR/logs/node-agent.log.zst" || true
       - name: Upload the results
