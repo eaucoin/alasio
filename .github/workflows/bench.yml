@@ -227,6 +227,14 @@ jobs:
       - name: Keep the boot logs
         if: always()
         run: sudo tar -C /var/log -cf - runsc 2>/dev/null | zstd -q >"$BENCH_DIR/logs/runsc-boot-logs.tar.zst" || true
+      # Spike: what k3s's kubelet and containerd said as they ran the sandboxes, and the node agent, to place a cold
+      # restore's waits.
+      - name: Keep the node's logs
+        if: always()
+        run: |
+          sudo journalctl -u k3s --no-pager -o short-iso-precise | zstd -q >"$BENCH_DIR/logs/k3s-journal.zst" || true
+          sudo zstd -q -c /var/lib/rancher/k3s/agent/containerd/containerd.log >"$BENCH_DIR/logs/containerd.log.zst" || true
+          sudo k3s kubectl logs -n alasio daemonset/alasio-node-agent --tail=-1 --timestamps 2>&1 | zstd -q >"$BENCH_DIR/logs/node-agent.log.zst" || true
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
