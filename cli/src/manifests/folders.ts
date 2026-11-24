@@ -11,7 +11,7 @@ import { FOLDER_TOKEN_FILE } from "../../../src/gateway/names.ts";
 import { sandboxBaymaTelemetryEnv } from "../../../src/sandbox/telemetry.ts";
 import { imageReference } from "../images.ts";
 import { accountRole, componentName, envOf, given, hostVolumeMounts, hostVolumes, imagePullSecrets, NAMESPACE, otelEnv, RELEASE } from "./common.ts";
-import type { InstallConfig } from "./config.ts";
+import { HOST_BAYMA_IMAGE, type InstallConfig } from "./config.ts";
 import { folderDeletionPolicy, folderPodPolicy, folderSecretPolicy } from "./admission.ts";
 import { boundBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -27,6 +27,15 @@ const RECEIVER = componentName("receiver");
 /** Whether the installation has folder workspaces, whose instances the sandbox gateway makes: the host profile. */
 export function foldersRun(config: InstallConfig): boolean {
   return config.host.enabled;
+}
+
+/**
+ * Whether `image` is the bayma this release pins (HOST_BAYMA_IMAGE), whose server takes
+ * --checkpoint-reuse: a bayma the installation names in its place may be one from before it,
+ * which refuses the option and would not start.
+ */
+function takesCheckpointReuse(image: InstallConfig["host"]["baymaImage"]): boolean {
+  return image.repository === HOST_BAYMA_IMAGE.repository && image.digest === HOST_BAYMA_IMAGE.digest;
 }
 
 /** The template of a folder instance's pod, as the operator runs bayma on their own machine: bayma itself, as them, with the machine's mounts, under the cluster's own runtime, which its process snapshots need. */
@@ -54,7 +63,10 @@ export function hostPodTemplate(config: InstallConfig): V1PodTemplateSpec {
         name: "bayma",
         image: imageReference(host.baymaImage),
         imagePullPolicy: "IfNotPresent",
-        args: ["mcp-http", "--host", "0.0.0.0", "--port", String(FOLDER_PORT), "--default-durability", "checkpointed"],
+        // Its sessions checkpointed, each keeping the checkpoint it holds rather than read again what
+        // it wrote, and committing none an exec left unchanged, as a pool's sessions do, where its
+        // bayma is the one this release pins.
+        args: ["mcp-http", "--host", "0.0.0.0", "--port", String(FOLDER_PORT), "--default-durability", "checkpointed", ...(takesCheckpointReuse(host.baymaImage) ? ["--checkpoint-reuse", "on"] : [])],
         workingDir: host.home,
         env: [{ name: "HOME", value: host.home }, ...envOf(host.env)],
         ports: [{ name: "mcp", containerPort: FOLDER_PORT }],

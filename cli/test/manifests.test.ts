@@ -3517,6 +3517,12 @@ describe("the sandbox service", () => {
     const [bayma] = config.folders.template.spec.containers as V1Container[];
     assert.equal(config.folders.template.spec.runtimeClassName, undefined);
     assert.deepEqual(bayma?.securityContext?.capabilities?.add, ["CHECKPOINT_RESTORE", "SYS_PTRACE"]);
+    // Its sessions checkpointed, each keeping the checkpoint it holds, as a pool's do; but under a bayma the installation names
+    // in place of the one this release pins, which may be one from before the option, not given it.
+    assert.deepEqual(bayma?.args?.slice(-6, -2), ["--default-durability", "checkpointed", "--checkpoint-reuse", "on"]);
+    const named = install({ host: { enabled: true, baymaImage: { tag: "0.14.2", digest: `sha256:${"5".repeat(64)}` } } });
+    const [other] = JSON.parse(one<V1ConfigMap>(named, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}").folders.template.spec.containers as V1Container[];
+    assert.deepEqual(other?.args?.slice(-4, -2), ["--default-durability", "checkpointed"]);
     assert.deepEqual(bayma?.args?.slice(-2), ["--telemetry-token-file", "/run/alasio/bayma/token"]);
     assert.equal(bayma?.env?.find(({ name }) => name === "OTEL_EXPORTER_OTLP_ENDPOINT")?.value, "http://alasio-receiver.alasio.svc.cluster.local:4318");
     // The gateway's identity there: pods, their tokens' Secrets, the bindings' Leases and what the pods use; the receiver's, which watches the Leases.
