@@ -289,6 +289,9 @@ export const LOADING_STALL_MOST_SECONDS = LOADING_SAVE_LATEST_SECONDS - LOADING_
 /** The variable holding a node agent's stall window, in seconds (LOADING_STALL_SECONDS). */
 export const LOADING_STALL_SECONDS_VARIABLE = "ALASIO_LOADING_STALL_SECONDS";
 
+/** The variable saying whether a node agent's checkpoints upload their images in one pass (./agent.ts NodeAgentOptions onePassSaves): `true` or `false`. */
+export const ONE_PASS_SAVES_VARIABLE = "ALASIO_ONE_PASS_SAVES";
+
 /**
  * The variable that gives a node agent, for a test alone, the timings LOADING_SAVE_FLOOR_SECONDS,
  * LOADING_STALL_SECONDS and how often it looks at a restore's reads, as JSON

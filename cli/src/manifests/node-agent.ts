@@ -41,6 +41,7 @@ import {
   NODE_AGENT_TOKEN_VARIABLE,
   NODE_DIRECTORY,
   nodeAgentStopSeconds,
+  ONE_PASS_SAVES_VARIABLE,
   POD_IP_VARIABLE,
   RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE,
@@ -159,6 +160,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               // How long a release's save of a sandbox its restore from the bucket still reads may see no byte of it served (src/node-agent/agent.ts).
               { name: LOADING_STALL_SECONDS_VARIABLE, value: String(durationSeconds(sessions.snapshots.loadingStallWait) ?? 0) },
+              { name: ONE_PASS_SAVES_VARIABLE, value: String(sessions.snapshots.onePassSaves) },
               // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.
               { name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),

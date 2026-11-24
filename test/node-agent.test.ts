@@ -11,7 +11,8 @@ import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
-import { closeSync, constants, type PathLike, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, type PathLike, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { open as openFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -34,6 +35,7 @@ import {
   COLLECT_GRACE_MS,
   COMPACTING_FILE,
   compactionDue,
+  hashAhead,
   type Killed,
   type Layer as Image,
   makeNodeAgent,
@@ -264,6 +266,8 @@ interface NodeOptions {
   readonly pods?: NodeAgentOptions["pods"];
   /** Its cache as `cache` changes it. */
   readonly cache?: (cache: SnapshotCache) => SnapshotCache;
+  /** Whether its agent's checkpoints upload their images in one pass (NodeAgentOptions onePassSaves). */
+  readonly onePassSaves?: boolean;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -271,7 +275,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -301,6 +305,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
         ...(loadingSave === undefined ? {} : { loadingSave }),
         pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
+        ...(onePassSaves === undefined ? {} : { onePassSaves }),
       });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod };
     });
@@ -418,6 +423,31 @@ const preparing = (agent: NodeAgent, { gofer, ...ref }: WorkspaceRef & { readonl
       manifest === null ? Effect.fail(new NoSnapshot(ref)) : agent.prepare({ ...ref, manifest, ...(gofer === undefined ? {} : { gofer }) })
     ),
   );
+
+test("a file hashed ahead of its upload is read once, from its start, each part let go once the hash has read past its end, and the SHA-256 is the file's; a file that cannot be read fails both", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "alasio-hash-ahead-"));
+  try {
+    // Larger than a read stream's chunk, so the hash reads it in several.
+    const data = Buffer.from(Array.from({ length: 300 * 1024 }, (_, index) => index % 253));
+    const path = join(directory, "pages.img");
+    writeFileSync(path, data);
+    const reads = await Effect.runPromise(readsUnder(directory, Effect.promise(async () => {
+      const ahead = hashAhead(path);
+      // Each end resolves only once the hash has read so far, which it has once it has the whole file.
+      const order: string[] = [];
+      const ends = [data.length, 1, 200 * 1024, data.length + 1].map((end) => ahead.through(end).then(() => order.push(String(end))));
+      assert.equal(await ahead.sha256, sha256(data));
+      await Promise.all(ends);
+      assert.deepEqual(order.slice(0, 2), ["1", String(200 * 1024)]);
+    })));
+    assert.deepEqual(reads, [path]);
+    const gone = hashAhead(join(directory, "gone.img"));
+    await assert.rejects(gone.through(1), /ENOENT/u);
+    await assert.rejects(gone.sha256, /ENOENT/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("a runtime's options file gives runsc its shim's flags", () => {
   assert.deepEqual(
@@ -583,6 +613,7 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
         podTemplate: POD_TEMPLATE,
         layers: [{ digest: image.digest, files }],
         bytes: files.reduce((sum, { bytes }) => sum + bytes, 0),
+        durability: "store",
       });
       const prefix = `main/fs-abc/layers/${image.digest}`;
       // Its image's files, each then looked at, then its manifest, then the commit.
@@ -713,6 +744,109 @@ test("a checkpoint looks at the files of its own image and of those it refers to
       assert.equal((yield* preparing(third.agent, workspace)).source, "bucket");
       assert.deepEqual(s3.requests.slice(asked).filter((each) => each.startsWith("HEAD")).toSorted(), files.toSorted());
       assert.equal(s3.mostHeading(), files.length);
+    })
+  ));
+
+test("a checkpoint taken in one pass uploads its image's files all at once, each with the SHA-256 of what it holds, looks at nothing in the bucket before it commits, and writes its manifest beside its commit; then it looks at the images it refers to, each the bucket lost put again from the cache", () =>
+  added("alasio.node_agent.checkpoint.layer_checks", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+        const [baseImage] = base.layers;
+        assert.ok(baseImage);
+        // Restored on another node, whose checkpoints are taken in one pass, its image fetched into the cache there.
+        const there = yield* node("node-2", { onePassSaves: true });
+        const restored = Effect.gen(function*() {
+          const { manifest } = yield* preparing(there.agent, workspace);
+          yield* there.agent.spend(workspace, manifest.snapshot);
+          yield* there.agent.resume(resumeRequest(manifest.snapshot));
+        });
+        yield* restored;
+        yield* fetched(there, base);
+        // Its pages' upload held until the others have gone: they go beside it.
+        let pagesHeld = (): void => {};
+        s3.holdPut = (key) => (key.endsWith("/pages.img") ? new Promise<void>((resolve) => (pagesHeld = resolve)) : null);
+        const asked = s3.requests.length;
+        const since = ended().length;
+        const taking = yield* Effect.forkChild(there.agent.checkpoint(request("fs-abc")));
+        const together = yield* Effect.promise(async () => {
+          while (s3.requests.slice(asked).filter((each) => each.startsWith("PUT ")).length < IMAGE_FILES.length) await new Promise((resolve) => setTimeout(resolve, 10));
+        }).pipe(Effect.timeout("5 seconds"), Effect.result);
+        pagesHeld();
+        s3.holdPut = () => null;
+        const delta = yield* Fiber.join(taking);
+        assert.ok(together._tag === "Success", `its files went up one after another: ${s3.requests.slice(asked).join(", ")}`);
+        const [own, ...layers] = delta.layers;
+        assert.ok(own);
+        assert.deepEqual(layers, base.layers);
+        // Each of its files as the cache holds it, with the ETag the bucket answered.
+        assert.deepEqual(own.files, filesOf(join(there.cacheDir, "main", "fs-abc", "layers", own.digest)));
+        assert.equal(delta.durability, "store");
+        // Its own files went up, then its manifest and its commit, at once: no look at the bucket before.
+        const committing = s3.requests.slice(asked, s3.requests.indexOf("PUT main/fs-abc/current.json", asked) + 1);
+        assert.deepEqual(committing.toSorted(), [
+          ...IMAGE_FILES.map((path) => `PUT main/fs-abc/layers/${own.digest}/${path}`),
+          `PUT main/fs-abc/manifests/${delta.snapshot}.json`,
+          "PUT main/fs-abc/current.json",
+        ].toSorted());
+        assert.deepEqual(JSON.parse(s3.objects.get(`main/fs-abc/manifests/${delta.snapshot}.json`)?.toString() ?? ""), delta);
+        assert.deepEqual(yield* there.agent.current(workspace), delta);
+        // After it, what it refers to looked at, in a trace of its own.
+        yield* Effect.promise(() => endedLater("alasio.node_agent.checkpoint.check", since));
+        assert.deepEqual(
+          s3.requests.slice(asked).filter((each) => each.startsWith("HEAD")).toSorted(),
+          IMAGE_FILES.map((path) => `HEAD main/fs-abc/layers/${baseImage.digest}/${path}`).toSorted(),
+        );
+
+        // Its base's pages lost from the bucket, the next of a sandbox restored from it is committed all the same, and
+        // they are put again from the cache once it is.
+        const lost = `main/fs-abc/layers/${baseImage.digest}/pages.img`;
+        const pages = s3.objects.get(lost);
+        s3.objects.delete(lost);
+        yield* restored;
+        const again = ended().length;
+        const next = yield* there.agent.checkpoint(request("fs-abc"));
+        assert.deepEqual(next.layers.slice(1), delta.layers);
+        yield* Effect.promise(() => endedLater("alasio.node_agent.checkpoint.check", again));
+        assert.deepEqual(s3.objects.get(lost), pages);
+      }).pipe(Effect.provide(TracingLayer))
+    )
+  ).then((counted) =>
+    assert.deepEqual(counted, {
+      "alasio.node_agent.checkpoint.layer_check.outcome=held": 2,
+      "alasio.node_agent.checkpoint.layer_check.outcome=put again": 1,
+    })
+  ));
+
+test("a checkpoint syncs its image to the node's disk, each of its files, its directory and the one that holds it, before it commits it", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      // Each sync of a file or a directory, by its inode, and how many requests the bucket had been asked as it was.
+      const synced = new Map<bigint, number>();
+      const handle = yield* Effect.promise(() => openFile(join(here.cacheDir, "..", "probe"), "w"));
+      const prototype = Object.getPrototypeOf(handle) as { sync: (this: { readonly fd: number }) => Promise<void> };
+      yield* Effect.promise(() => handle.close());
+      const original = prototype.sync;
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          prototype.sync = function() {
+            synced.set(fstatSync(this.fd, { bigint: true }).ino, s3.requests.length);
+            return original.call(this);
+          };
+        }),
+        () => Effect.sync(() => void (prototype.sync = original)),
+      );
+      const { layers: [image], snapshot } = yield* here.agent.checkpoint(request("fs-abc"));
+      assert.ok(image);
+      const committed = s3.requests.indexOf("PUT main/fs-abc/current.json");
+      const layersDir = join(here.cacheDir, "main", "fs-abc", "layers");
+      const directory = join(layersDir, image.digest);
+      for (const path of [...IMAGE_FILES.map((file) => join(directory, file)), directory, layersDir]) {
+        const at = synced.get(statSync(path, { bigint: true }).ino);
+        assert.ok(at !== undefined && at <= committed, `${path} was not synced before the commit of ${snapshot}`);
+      }
     })
   ));
 
@@ -920,16 +1054,19 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
 /** The names of `spans`, in their order. */
 const namesOf = (spans: readonly ReadableSpan[]): string[] => spans.map(({ name }) => name);
 
-test("a checkpoint is traced step by step: its wait for the workspace, runsc's save and the pause it took, its image's inspection and layers, its cache, its files' digests, each file's upload, what it refers to looked at in the bucket, runsc's verification beside, and the commit that makes it durable", () =>
+/** Of `steps`, a checkpoint's, the names of those that run in turn: not runsc's verification nor the image's sync to the disk, which run beside its upload. */
+const inTurn = (steps: readonly ReadableSpan[]): string[] =>
+  namesOf(steps).filter((name) => name !== "alasio.node_agent.checkpoint.verify" && name !== "alasio.node_agent.checkpoint.sync");
+
+test("a checkpoint is traced step by step: its wait for the workspace, runsc's save and the pause it took, its image's inspection and layers, its cache, its files' digests, each file's upload, what it refers to looked at in the bucket, runsc's verification and the image's sync beside, and the commit that makes it durable", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
       const manifest = yield* here.agent.checkpoint(request("fs-abc"));
       const steps = childrenOf(endedSpan("alasio.node_agent.checkpoint"));
       const step = (name: string) => steps.find((span) => span.name === `alasio.node_agent.checkpoint.${name}`);
-      // Verified as it is uploaded, beside it.
-      assert.deepEqual(namesOf(steps).filter((name) => name !== "alasio.node_agent.checkpoint.verify"), ["lock", "runsc", "inspect", "layers", "cache", "digest", "upload", "heads", "commit"].map((name) => `alasio.node_agent.checkpoint.${name}`));
-      assert.ok(step("verify"));
+      assert.deepEqual(inTurn(steps), ["lock", "runsc", "inspect", "layers", "cache", "digest", "upload", "heads", "commit"].map((name) => `alasio.node_agent.checkpoint.${name}`));
+      assert.ok(step("verify") && step("sync"));
       assert.ok(steps.every((span) => span.attributes["alasio.sandbox.name"] === "fs-abc"));
       assert.equal(step("runsc")?.attributes["alasio.snapshot.pause_ms"], manifest.pauseMs);
       const upload = step("upload");
@@ -938,6 +1075,18 @@ test("a checkpoint is traced step by step: its wait for the workspace, runsc's s
       assert.deepEqual(
         childrenOf(upload).map((span) => [span.name, span.attributes["alasio.snapshot.file"], span.attributes["alasio.snapshot.bytes"]]),
         image?.files.map(({ path, bytes }) => ["alasio.node_agent.checkpoint.upload.put", path, bytes]),
+      );
+
+      // In one pass, its files hashed as they upload, with nothing looked at before the commit.
+      const onePass = yield* node("node-2", { onePassSaves: true });
+      const taken = yield* onePass.agent.checkpoint(request("fs-other"));
+      const passSteps = childrenOf(endedSpan("alasio.node_agent.checkpoint"));
+      assert.deepEqual(inTurn(passSteps), ["lock", "runsc", "inspect", "layers", "cache", "upload", "commit"].map((name) => `alasio.node_agent.checkpoint.${name}`));
+      const passUpload = passSteps.find((span) => span.name === "alasio.node_agent.checkpoint.upload");
+      assert.ok(passUpload);
+      assert.deepEqual(
+        childrenOf(passUpload).map((span) => [span.name, span.attributes["alasio.snapshot.file"], span.attributes["alasio.snapshot.bytes"]]).toSorted(),
+        taken.layers[0]?.files.map(({ path, bytes }) => ["alasio.node_agent.checkpoint.upload.put", path, bytes]).toSorted(),
       );
     }).pipe(Effect.provide(TracingLayer))
   ));
