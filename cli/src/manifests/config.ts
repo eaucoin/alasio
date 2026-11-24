@@ -330,6 +330,14 @@ const Snapshots = Schema.Struct({
   /** The most of snapshots each node keeps on its disk, for restores there. */
   nodeCache: defaulted(Size, "5Gi"),
   /**
+   * Whether a snapshot's image is uploaded in one pass: each of its files hashed as it uploads,
+   * all of them at once; the images it refers to, which its parent's manifest says the bucket
+   * holds, looked at only once it is committed; and its manifest written beside its commit. A
+   * release is durable in the store sooner by the hashes' read, the uploads one after another,
+   * and the store's round trips that waited on each other. Off unless set, until it is measured.
+   */
+  onePassSaves: defaulted(Schema.Boolean, false),
+  /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
    * limit is at least that and its budget of what it holds written and not yet on the disk

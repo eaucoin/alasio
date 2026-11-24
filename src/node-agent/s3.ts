@@ -162,9 +162,10 @@ export interface Received {
 export interface S3Bucket {
   /**
    * Puts the file at `path` as the object `key`, streamed: the ETag the bucket answered. Each part of it, or the whole
-   * of one put in one, is sent once `ready` has resolved, where given, as work that yields to another waits.
+   * of one put in one, is sent once `ready` has resolved, where given, told the byte its part ends before: as work that
+   * yields to another waits, or as an upload waits for what reads the file before it.
    */
-  readonly putFile: (key: string, path: string, ready?: () => Promise<void>) => Effect.Effect<string, S3Error>;
+  readonly putFile: (key: string, path: string, ready?: (end: number) => Promise<void>) => Effect.Effect<string, S3Error>;
   /** Writes the object `key`, of `bytes`, to the file at `path`, streamed: its size and SHA-256. */
   readonly getFile: (key: string, path: string, bytes: number) => Effect.Effect<Received, S3Error>;
   /** Puts `value` as the object `key`, as JSON. */
@@ -562,7 +563,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
       attempt("upload", key, async (signal) => {
         const { size } = await stat(path);
         if (size <= partBytes) {
-          await ready?.();
+          await ready?.(size);
           const response = await succeeded(await call("PUT", key, { body: { file: path, size } }, signal));
           await bodyText(response, 0);
           const etag = response.headers.etag;
@@ -572,7 +573,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         const parts = ranges(size);
         return multipart(key, parts.length, async (number, query, partSignal) => {
           const { start, length } = parts[number - 1] ?? { start: 0, length: 0 };
-          await ready?.();
+          await ready?.(start + length);
           const response = await succeeded(await call("PUT", key, { query, body: { file: path, size: length, start } }, partSignal));
           await bodyText(response, 0);
           const etag = response.headers.etag;

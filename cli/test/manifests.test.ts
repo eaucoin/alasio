@@ -233,6 +233,7 @@ describe("configuration", () => {
       stopWait: "60s",
       loadingStallWait: "90s",
       nodeCache: "5Gi",
+      onePassSaves: false,
       nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
   });
@@ -2610,7 +2611,7 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the gVisor release their node's runtime starts sandboxes with, the first that restores from the bucket, the first that bounds a save's wait for pages still loading, how long a resumed restore may read it through them, how long a release's save of a sandbox whose restore reads it still may see no byte of it served, and workspace storage's metadata engine", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the gVisor release their node's runtime starts sandboxes with, the first that restores from the bucket, the first that bounds a save's wait for pages still loading, how long a resumed restore may read it through them, how long a release's save of a sandbox whose restore reads it still may see no byte of it served, whether a checkpoint uploads its image in one pass, and workspace storage's metadata engine", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
@@ -2626,6 +2627,7 @@ describe("node agents", () => {
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
       ALASIO_LOADING_STALL_SECONDS: "90",
+      ALASIO_ONE_PASS_SAVES: "false",
       META_URL: { secretKeyRef: { name: "alasio-workspaces-quotas", key: "metaurl" } },
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
@@ -2637,6 +2639,7 @@ describe("node agents", () => {
     // A minute at least, however small a session.
     assert.equal(env({ sessions: { resources: { limits: { memory: "64Mi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "60");
     assert.equal(env({ sessions: { snapshots: { loadingStallWait: "2m" } } })["ALASIO_LOADING_STALL_SECONDS"], "120");
+    assert.equal(env({ sessions: { snapshots: { onePassSaves: true } } })["ALASIO_ONE_PASS_SAVES"], "true");
     // Without a collector, it exports nothing.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
   });

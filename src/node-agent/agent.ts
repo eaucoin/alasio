@@ -11,8 +11,9 @@
  *   holds them all otherwise;
  * - `manifests/<snapshot>.json`: what each snapshot is (Manifest): its image and its
  *   layers, each of whose files is in the bucket as the manifest says before it is written;
- * - `current.json`: the manifest of the workspace's current snapshot, written last, which
- *   commits it. A workspace without one has no snapshot to restore.
+ * - `current.json`: the manifest of the workspace's current snapshot, written last, or, of a
+ *   checkpoint taken in one pass, beside its manifest, which commits it. A workspace without
+ *   one has no snapshot to restore.
  *
  * A checkpoint ends the sandbox it saves. Once it has begun, the workspace's current
  * snapshot no longer holds what the workspace is, whose files and processes have moved
@@ -91,8 +92,8 @@
  * stays until they end.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { constants, createReadStream } from "node:fs";
+import { mkdir, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isIP, isIPv6 } from "node:net";
 import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -216,6 +217,12 @@ export const Manifest = Schema.Struct({
   pauseMs: Count,
   /** How long its image took to upload. */
   uploadMs: Count,
+  /**
+   * How durable it was as it was committed: `store`, its images and its commit in the store, and
+   * its images synced to the node's disk before the commit. Absent: it was saved before durability
+   * was recorded, and its images were not synced to the node's disk; in the store all the same.
+   */
+  durability: Schema.optional(Schema.Literal("store")),
   /** For a snapshot taken live, what it caught: it holds the session only while bayma's state generation is that one. */
   live: Schema.optional(Caught),
   /**
@@ -781,6 +788,14 @@ export interface NodeAgentOptions {
    * the agent's ServiceAccount, which reads the sessions' pods).
    */
   readonly pods: (namespace: string, name: string) => Stream.Stream<V1Pod | null, KubeApiError>;
+  /**
+   * Whether a checkpoint uploads its image in one pass, its files hashed as they upload, all at
+   * once (hashedAndPut), writes its manifest beside its commit, and looks at the images it refers
+   * to in the bucket only once it is committed (checkLater); not as one that hashes its files,
+   * then uploads them one after another, then looks at them and the images it refers to in the
+   * bucket, then writes its manifest and its commit one after the other: no unless told.
+   */
+  readonly onePassSaves?: boolean;
 }
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
@@ -914,6 +929,10 @@ const sizes = meter.createHistogram("alasio.node_agent.snapshot.size", {
   description: "The size of a checkpoint's image",
   unit: "By",
 });
+const layerChecks = meter.createCounter("alasio.node_agent.checkpoint.layer_checks", {
+  description: "The images a checkpoint taken in one pass refers to, looked at in the bucket once it is committed, by outcome: held, put again from the node's cache, or what failed",
+  unit: "{image}",
+});
 const copies = meter.createCounter("alasio.node_agent.copies", {
   description: "Snapshots copied from one workspace to another by the node agent, by outcome",
   unit: "{copy}",
@@ -983,14 +1002,87 @@ async function fileSha256(path: string, ready?: () => Promise<void>): Promise<st
 /** A file of an image as it is on the disk, before the bucket holds it. */
 type ImageFile = Omit<SnapshotFile, "etag">;
 
+/** The paths of the files of an image directory, in it, in order. */
+async function imagePaths(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { withFileTypes: true, recursive: true });
+  return entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
+}
+
 /** The files of an image directory, each with its size and SHA-256, by their paths in it, in order; read as fileSha256 reads them. */
 async function imageFiles(directory: string, ready?: () => Promise<void>): Promise<ImageFile[]> {
-  const entries = await readdir(directory, { withFileTypes: true, recursive: true });
-  const paths = entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
-  return Promise.all(paths.map(async (path) => {
+  return Promise.all((await imagePaths(directory)).map(async (path) => {
     const file = join(directory, path);
     return { path, bytes: (await stat(file)).size, sha256: await fileSha256(file, ready) };
   }));
+}
+
+/**
+ * The SHA-256 of the file at `path`, in hex, as it is read once from its start, and what
+ * resolves once that read has passed the byte `end`, or fails as it does: what each part of an
+ * upload of the file waits for (hashedAndPut), so that the file is read from the disk once, by
+ * the hash, its upload reading the same bytes after it, from the page cache, as runsc writes an
+ * image past it (`--direct`). Its failure is told by both, and by neither left unhandled.
+ */
+export function hashAhead(path: string): { readonly sha256: Promise<string>; readonly through: (end: number) => Promise<void> } {
+  let read = 0;
+  let failed: { readonly cause: unknown } | null = null;
+  let waiting: { readonly end: number; readonly resolve: () => void; readonly reject: (cause: unknown) => void }[] = [];
+  const settle = () => {
+    const due = waiting.filter(({ end }) => failed !== null || end <= read);
+    waiting = waiting.filter((each) => !due.includes(each));
+    for (const { resolve, reject } of due) {
+      if (failed === null) resolve();
+      else reject(failed.cause);
+    }
+  };
+  const sha256 = (async () => {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(path) as AsyncIterable<Buffer>) {
+      hash.update(chunk);
+      read += chunk.length;
+      settle();
+    }
+    read = Number.POSITIVE_INFINITY;
+    settle();
+    return hash.digest("hex");
+  })().catch((cause: unknown) => {
+    failed = { cause };
+    settle();
+    throw cause;
+  });
+  sha256.catch(() => {});
+  return {
+    sha256,
+    through: (end) =>
+      new Promise<void>((resolve, reject) => {
+        waiting.push({ end, resolve, reject });
+        settle();
+      }),
+  };
+}
+
+/** Syncs the file or directory at `path` to the disk. */
+async function syncPath(path: string, directory: boolean): Promise<void> {
+  const handle = await open(path, directory ? constants.O_RDONLY | constants.O_DIRECTORY : constants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Syncs an image directory to the disk: each of its files, then each directory in it, itself,
+ * and the one it was moved into, which holds its name. What runsc writes with `O_DIRECT` is past
+ * the page cache but not past the device's, nor is any file's size or name.
+ */
+async function syncImage(directory: string): Promise<void> {
+  const entries = await readdir(directory, { withFileTypes: true, recursive: true });
+  await Promise.all(entries.filter((entry) => entry.isFile()).map((entry) => syncPath(join(entry.parentPath, entry.name), false)));
+  const directories = entries.filter((entry) => entry.isDirectory()).map((entry) => join(entry.parentPath, entry.name));
+  await Promise.all(directories.map((each) => syncPath(each, true)));
+  await syncPath(directory, true);
+  await syncPath(dirname(directory), true);
 }
 
 /** Whether `found`, an image's files on the disk, are `layer`'s. */
@@ -1035,7 +1127,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1226,6 +1318,27 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       )).pipe(Effect.map((uploaded) => ({ digest, files: uploaded })));
 
   /**
+   * The files of the image `digest` the cache holds of the workspace, each hashed and uploaded in one read of it (hashAhead),
+   * all at once: its layer, each file with its size, its SHA-256, and the ETag its upload was answered with, in a span of
+   * its own, `put`, of its bytes.
+   */
+  const hashedAndPut = (ref: WorkspaceRef, digest: string, put: string): Effect.Effect<Layer, S3Error | CacheError> =>
+    Effect.gen(function*() {
+      const directory = cache.image(ref.environment, ref.workspace, digest);
+      const paths = yield* onDisk(() => imagePaths(directory));
+      const files = yield* Effect.forEach(paths, (path) =>
+        Effect.gen(function*() {
+          const file = join(directory, path);
+          const { size: bytes } = yield* onDisk(() => stat(file));
+          yield* Effect.annotateCurrentSpan({ "alasio.snapshot.bytes": bytes });
+          const ahead = hashAhead(file);
+          const [etag, sha256] = yield* Effect.all([bucket.putFile(layerKey(ref, digest, path), file, ahead.through), onDisk(() => ahead.sha256)], { concurrency: 2 });
+          return { path, bytes, sha256, etag };
+        }).pipe(withAlasioSpan(put, { attributes: { ...spanAttributes(ref), "alasio.snapshot.file": path } })), { concurrency: "unbounded" });
+      return { digest, files };
+    });
+
+  /**
    * Those of `layers` of the workspace's, in their order, a file of which is not in the bucket
    * as it was put, of its size and of the ETag its upload was answered with; none where every
    * file is. Their files are looked at BUCKET_HEADS at a time.
@@ -1262,6 +1375,38 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const again = yield* upload(ref, layer.digest, files, put);
       if (!(yield* inBucket(ref, again))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor once put again` });
       return again;
+    });
+
+  /**
+   * Looks at `referred`, the images of the workspace's that `committed`, a snapshot a checkpoint took in one pass, refers to,
+   * in the bucket, once it is committed, as its checkpoint, which took them to be there as its parent's manifest says, did not:
+   * each the bucket does not hold as it was put is put again from the cache, as layerInBucket puts one. Beside whatever else
+   * the agent does, in its scope, the workspace's images spared meanwhile; what fails is said, and counted. A trace of its
+   * own, linked to the checkpoint's it began in, which it outlives.
+   */
+  const checkLater = (committed: Manifest, referred: readonly Layer[]): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      if (referred.length === 0) return Effect.void;
+      const begunIn = currentTraceparent();
+      const counted = (outcome: string, count = 1) => Effect.sync(() => layerChecks.add(count, { "alasio.node_agent.checkpoint.layer_check.outcome": outcome }));
+      const checked = Effect.gen(function*() {
+        const missing = yield* notInBucket(committed, referred);
+        yield* counted("held", referred.length - missing.length);
+        for (const layer of missing) {
+          yield* putAgain(committed, layer, "alasio.node_agent.checkpoint.check.put").pipe(
+            Effect.andThen(counted("put again")),
+            Effect.catch((error) =>
+              counted(error._tag).pipe(Effect.andThen(Effect.logWarning(`the snapshot ${committed.snapshot} of ${prefixOf(committed)} refers to its image ${layer.digest}, which the bucket does not hold as it was put: ${error.message}`)))
+            ),
+          );
+        }
+      }).pipe(
+        Effect.catch((error) => counted(error._tag).pipe(Effect.andThen(Effect.logWarning(`could not look at the images the snapshot ${committed.snapshot} of ${prefixOf(committed)} refers to in the bucket: ${error.message}`)))),
+        (checking) => inFlightWhile([committed], checking),
+        withAlasioSpan("alasio.node_agent.checkpoint.check", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot }, parent: null, links: begunIn === null ? [] : [begunIn] }),
+        withLogScope("node-agent"),
+      );
+      return checked.pipe(Effect.forkIn(scope), Effect.asVoid);
     });
 
   /**
@@ -1388,24 +1533,37 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
         })).pipe(step("alasio.node_agent.checkpoint.layers", request));
       yield* cache.commit(environment, workspace, snapshot, image.digest).pipe(step("alasio.node_agent.checkpoint.cache", request));
-      // Its files' SHA-256, which its manifest records, and the cache's stamp of them as checked so.
-      const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest))).pipe(
+      const directory = cache.image(environment, workspace, image.digest);
+      const put = "alasio.node_agent.checkpoint.upload.put";
+      // In one pass: each of its files hashed as it is uploaded, all at once, and what it refers to taken to be in the bucket
+      // as its parent's manifest says, looked at once it is committed (checkLater). Or its files' SHA-256 first, then each
+      // uploaded in turn, then its own image and those it refers to looked at together, as the prepare of a restore looks at
+      // its chain's. Its files' SHA-256 are what its manifest records, and the cache's stamp of them as checked so.
+      const hashedFirst = onePassSaves ? null : yield* onDisk(() => imageFiles(directory)).pipe(
         Effect.tap((hashed) => cache.stamp(environment, workspace, image.digest, hashed)),
         step("alasio.node_agent.checkpoint.digest", request),
       );
-      const uploadedAt = yield* Clock.currentTimeMillis;
-      const [[uploadMs, layers], verified] = yield* Effect.all([
-        timed(Effect.gen(function*() {
-          const uploaded = yield* upload(request, image.digest, files, "alasio.node_agent.checkpoint.upload.put").pipe(step("alasio.node_agent.checkpoint.upload", request));
-          // Its own image and those it refers to looked at together, as the prepare of a restore looks at its chain's.
+      const uploaded: Effect.Effect<readonly Layer[], S3Error | CacheError | SnapshotCorrupt> = hashedFirst === null
+        ? hashedAndPut(request, image.digest, put).pipe(
+          Effect.tap(({ files }) => cache.stamp(environment, workspace, image.digest, files.map(({ etag: _, ...file }) => file))),
+          Effect.map((own) => [own, ...referred]),
+          step("alasio.node_agent.checkpoint.upload", request),
+        )
+        : Effect.gen(function*() {
+          const own = yield* upload(request, image.digest, hashedFirst, put).pipe(step("alasio.node_agent.checkpoint.upload", request));
           return yield* Effect.gen(function*() {
-            const missing = yield* notInBucket(request, [uploaded, ...referred]);
-            if (missing.includes(uploaded)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
-            return [uploaded, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer, "alasio.node_agent.checkpoint.upload.put") : Effect.succeed(layer)))];
+            const missing = yield* notInBucket(request, [own, ...referred]);
+            if (missing.includes(own)) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
+            return [own, ...yield* Effect.forEach(referred, (layer) => (missing.includes(layer) ? putAgain(request, layer, put) : Effect.succeed(layer)))];
           }).pipe(step("alasio.node_agent.checkpoint.heads", request));
-        })),
+        });
+      const uploadedAt = yield* Clock.currentTimeMillis;
+      // Its image synced to the node's disk as it uploads, before it is committed.
+      const [[uploadMs, layers], verified] = yield* Effect.all([
+        timed(uploaded),
         verifiedStaged({ environment, workspace, snapshot, release }, [image.digest, ...referred.map(({ digest }) => digest)]).pipe(step("alasio.node_agent.checkpoint.verify", request)),
-      ], { concurrency: 2 });
+        onDisk(() => syncImage(directory)).pipe(step("alasio.node_agent.checkpoint.sync", request)),
+      ], { concurrency: 3 });
       yield* inTime(request, snapshot, uploadedAt);
       const manifest: Manifest = {
         environment,
@@ -1419,15 +1577,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         takenAt: new Date(takenAt).toISOString(),
         pauseMs,
         uploadMs,
+        durability: "store",
         ...(caught === undefined ? {} : { live: caught }),
       };
-      // Committed: in the cache, then in the bucket, its manifest and then its commit, which make it durable.
+      // Committed: in the cache, then in the bucket, its manifest and its commit, which make it durable; in one pass, the
+      // two written at once, the one waiting on the other no more.
       yield* Effect.gen(function*() {
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         if (verified) yield* sayVerified(manifest);
-        yield* bucket.putJson(manifestKey(request, snapshot), manifest);
-        yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
+        const named = bucket.putJson(manifestKey(request, snapshot), manifest);
+        const committed = bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
+        yield* onePassSaves ? Effect.all([named, committed], { concurrency: 2, discard: true }) : named.pipe(Effect.andThen(committed));
       }).pipe(step("alasio.node_agent.checkpoint.commit", request));
+      if (onePassSaves) yield* checkLater(manifest, referred);
       return manifest;
     }).pipe(Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)));
 
