@@ -122,6 +122,15 @@ test("where systemd runs the machine, runsc places its sandboxes' cgroups throug
   assert.doesNotMatch(options(false), /systemd/u);
 });
 
+test("runsc records a working set after a live checkpoint, where it holds none, from the release pinned as the first that does, and only from it", () => {
+  const since = pins.gvisor.recordsWorkingSetAfterSaveSince;
+  const flags = (release: string) => runscFlags([...containerdFiles([release], { systemd: false })].find(([path]) => path.endsWith(".toml"))?.[1] ?? "");
+  const past = since.replace(/\d+$/u, (number) => `${Number(number) + 1}`);
+  const before = since.replace(/\d+$/u, (number) => `${Number(number) - 1}`);
+  for (const release of [since, past]) assert.deepEqual(flags(release), ["--restore-validate-files=all", "--dirty-tracking=wp", "--working-set-window=3s", "--working-set-after-save=if-none", "--allow-live-tcp-migration=false", "--app-huge-pages=false"], release);
+  for (const release of [before, "20990101.0"]) assert.ok(!flags(release).some((flag) => flag.startsWith("--working-set-after-save")), release);
+});
+
 test("the gvisor RuntimeClass runs the current release, and each release kept has one of its own, labelled as alasio's", () => {
   const labels = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
   assert.deepEqual(gvisorRuntimeClasses(["21000101.0", "20990101.0"]).map(({ apiVersion, kind, metadata, handler }) => [apiVersion, kind, metadata?.name, metadata?.labels, handler]), [
