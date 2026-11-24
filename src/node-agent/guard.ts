@@ -9,7 +9,8 @@
  * So, every GUARD_MS, the agent reads what each sandbox's pod holds (./memory.ts sandboxesOf) and
  * what the node has left for them: the least of what /proc/meminfo says is available over
  * kubelet's soft eviction threshold, and what each cgroup above the pods (kubepods' and their
- * QoS classes') has under its memory.max. Each bound sandbox's cgroup, the one its processes are
+ * QoS classes') has under its memory.max, its clean page cache counted as room, as the kernel
+ * reclaims it before it must kill (aboveRoom). Each bound sandbox's cgroup, the one its processes are
  * in (its pod sandbox's scope), it limits to what it holds and its share of that room, an equal
  * share of each bound one's, SANDBOX_MEMORY_SLACK_BYTES at the least, and gives memory.oom.group,
  * so a sandbox that grows past its share is ended by its own cgroup's OOM, whole, as the room it
@@ -30,7 +31,7 @@ import { dirname, join } from "node:path";
 import { Effect, Exit, Schedule, type Scope } from "effect";
 
 import { meter } from "../telemetry/index.ts";
-import { meminfoOf, type MemoryOptions, numberIn, type SandboxCgroup, type SandboxState, sandboxesOf } from "./memory.ts";
+import { meminfoOf, type MemoryOptions, numberIn, type SandboxCgroup, type SandboxState, sandboxesOf, statOf } from "./memory.ts";
 import { NODE_MEMORY_HARD_EVICTION_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES } from "./names.ts";
 
 /** How often the guard looks at the node's memory. */
@@ -98,7 +99,12 @@ export async function sandboxCgroup(pod: string): Promise<string> {
   return holding.length === 1 ? (holding[0] ?? pod) : pod;
 }
 
-/** What each cgroup above the pods `pods`, under the root `cgroups`, has left under its memory.max: the least, or Infinity where none has one. */
+/**
+ * What each cgroup above the pods `pods`, under the root `cgroups`, has left under its
+ * memory.max: what it does not hold, and of what it holds its page cache the kernel reclaims as it
+ * nears its limit, clean (its active and inactive file pages, but those dirty or being written
+ * back). The least, or Infinity where none has a limit.
+ */
 export async function aboveRoom(cgroups: string, pods: readonly string[]): Promise<number> {
   const above = new Set<string>();
   for (const pod of pods) for (let dir = dirname(pod); dir.startsWith(`${cgroups}/`); dir = dirname(dir)) above.add(dir);
@@ -106,7 +112,11 @@ export async function aboveRoom(cgroups: string, pods: readonly string[]): Promi
   for (const dir of above) {
     const max = await numberIn(join(dir, "memory.max"));
     const current = await numberIn(join(dir, "memory.current"));
-    if (max !== null && current !== null) room = Math.min(room, max - current);
+    if (max === null || current === null) continue;
+    const stat = await text(join(dir, "memory.stat"));
+    const of = (key: string) => statOf(stat, key) ?? 0;
+    const reclaimable = Math.max(0, of("active_file") + of("inactive_file") - of("file_dirty") - of("file_writeback"));
+    room = Math.min(room, max - current + reclaimable);
   }
   return room;
 }

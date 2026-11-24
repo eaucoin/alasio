@@ -66,7 +66,7 @@ test("a sandbox's processes are found in the one cgroup of its pod's that holds 
   }
 });
 
-test("what the cgroups above the pods have left is the least of each's limit less what it holds, one without a limit counting none", async () => {
+test("what the cgroups above the pods have left is the least of each's limit less what it holds but its clean page cache, one without a limit counting none", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-guard-above-"));
   try {
     const qos = join(root, "kubepods.slice", "kubepods-burstable.slice");
@@ -79,6 +79,10 @@ test("what the cgroups above the pods have left is the least of each's limit les
     assert.equal(await aboveRoom(root, [pod]), 4 * GIB);
     writeFileSync(join(qos, "memory.max"), `${9 * GIB}\n`);
     assert.equal(await aboveRoom(root, [pod]), 2 * GIB);
+    // Its clean page cache is room, as the kernel reclaims it first; not what is dirty or being written back.
+    writeFileSync(join(root, "kubepods.slice", "memory.max"), `${20 * GIB}\n`);
+    writeFileSync(join(qos, "memory.stat"), `anon ${4 * GIB}\nfile ${3 * GIB}\nactive_file ${GIB}\ninactive_file ${2 * GIB}\nfile_dirty ${512 * MIB}\nfile_writeback ${256 * MIB}\nshmem 0\n`);
+    assert.equal(await aboveRoom(root, [pod]), 2 * GIB + 3 * GIB - 768 * MIB);
     assert.equal(await aboveRoom(root, []), Number.POSITIVE_INFINITY);
   } finally {
     rmSync(root, { recursive: true, force: true });
