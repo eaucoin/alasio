@@ -1,10 +1,14 @@
-// The Bun fixtures (idle, poller, saturating), installed into a bayma Bun session by the
-// driver's setup exec, which prepends `const PARAMS = {...};`. bayma runs a Bun session's main
+// The Bun fixtures (idle, poller, saturating, saturating-4), installed into a bayma Bun session by
+// the driver's setup exec, which prepends `const PARAMS = {...};`. bayma runs a Bun session's main
 // thread only while an exec runs, so what runs in the background runs in a Worker: the
 // background loop (chunk rewrites, children, the socket, the file) and the ticker. Memory is
 // 1 MiB SharedArrayBuffer chunks, random at setup; a rewrite stamps (chunk, page, version,
 // STAMP) at the head of each of a chunk's 256 pages, so every page of it is dirtied and its
-// random rest is kept, whose SHA-256 per chunk setup records.
+// random rest is kept, whose SHA-256 per chunk setup records. saturating-4 is saturating with
+// its memory and its rewrites shared among four processes, the session's and three writers of
+// its own, each rewriting its quarter at a quarter of the rate: as many address spaces, each
+// dirtying its own, as a sandbox of several processes has. Its rates and rewrites counted are the
+// session's process's alone; its checks read every writer's pages too.
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 
@@ -32,7 +36,14 @@ const MAX_GAP_MS = 8;
 const TICKS = 9;
 
 const { fixture, sizeMib, runId, rateMibS = 0, workspace = "/workspace" } = PARAMS;
-const count = Math.max(1, Math.round(sizeMib));
+/** Whether the fixture is the saturating one, of one process or of several. */
+const saturating = fixture === "saturating" || fixture === "saturating-4";
+/** The processes that hold and rewrite the fixture's memory, the session's first. */
+const WRITERS = fixture === "saturating-4" ? 4 : 1;
+const total = Math.max(WRITERS, Math.round(sizeMib));
+/** The chunks each process holds: the session's the first, each writer's the next, the last writer's the rest. */
+const share = Math.floor(total / WRITERS);
+const count = share;
 const ctl = new Int32Array(new SharedArrayBuffer(4 * 4));
 const counters = new Float64Array(new SharedArrayBuffer(8 * 16));
 const versions = new Uint32Array(new SharedArrayBuffer(4 * count));
@@ -87,7 +98,7 @@ onmessage = ({ data: { ctl, counters } }) => {
 const loopSource = `
 const fs = require("node:fs");
 onmessage = async ({ data: p }) => {
-  const { ctl, counters, versions, chunks, fixture, rateMibS, workspace } = p;
+  const { ctl, counters, versions, chunks, fixture, saturating, rateMibS, workspace } = p;
   const words = chunks.map((chunk) => new Uint32Array(chunk));
   const stamp = ${stamp.toString()};
   const PAGES = ${PAGES}, PAGE = ${PAGE}, STAMP = ${STAMP};
@@ -124,8 +135,8 @@ onmessage = async ({ data: p }) => {
       if ((await new Response(poll.stdout).text()).startsWith("poll ")) counters[${POLLS}] += 1;
     }, 2000);
   }
-  if (fixture === "saturating") {
-    // The job's copy bandwidth, over the whole heap, in 10 ms ticks.
+  if (saturating) {
+    // The job's copy bandwidth, over the whole heap, in 10 ms ticks: this process's share of it.
     let owed = 0;
     let last = performance.now();
     setInterval(() => {
@@ -187,20 +198,111 @@ function worker(source, message) {
   return made;
 }
 
+const now = () => Number(process.hrtime.bigint()) / 1e6;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A writer of saturating-4's: its chunks, from the `first`th, random and stamped as the session's
+// are, rewritten at its share of the rate in 10 ms ticks while it runs, and its answers over IPC to
+// `stop` and `start` (said once no tick rewrites, or once they do again) and `check` (every page of
+// its chunks read: the indices of those not as written).
+const writerSource = `
+const crypto = require("node:crypto");
+const { first, count, rateMibS } = JSON.parse(process.env.BENCH_WRITER);
+const PAGE = ${PAGE}, CHUNK = ${CHUNK}, PAGES = ${PAGES}, STAMP = ${STAMP};
+const stamp = ${stamp.toString()};
+const scratch = new Uint8Array(CHUNK);
+const digestOf = ${digestOf.toString()};
+const chunks = [];
+for (let index = 0; index < count; index++) {
+  const chunk = new ArrayBuffer(CHUNK);
+  crypto.randomFillSync(new Uint8Array(chunk));
+  stamp(new Uint32Array(chunk), first + index, 0);
+  chunks.push(chunk);
+}
+const digests = chunks.map(digestOf);
+const words = chunks.map((chunk) => new Uint32Array(chunk));
+const versions = new Uint32Array(count);
+let running = true;
+let rewrites = 0;
+let owed = 0;
+let last = performance.now();
+let next = 0;
+setInterval(() => {
+  const now = performance.now();
+  if (!running) {
+    last = now;
+    return;
+  }
+  owed = Math.min(rateMibS, owed + (rateMibS * (now - last)) / 1000);
+  last = now;
+  while (owed >= 1) {
+    versions[next] += 1;
+    stamp(words[next], first + next, versions[next]);
+    rewrites += 1;
+    next = (next + 1) % count;
+    owed -= 1;
+    if (performance.now() - now >= 20) break;
+  }
+}, 10);
+const intact = () => {
+  const bad = [];
+  for (let index = 0; index < count && bad.length < 8; index++) {
+    let ok = true;
+    for (let page = 0; page < PAGES && ok; page++) {
+      const at = page * (PAGE / 4);
+      ok = words[index][at] === first + index && words[index][at + 1] === page && words[index][at + 2] === versions[index] && words[index][at + 3] === STAMP;
+    }
+    if (!ok || digestOf(chunks[index]) !== digests[index]) bad.push(first + index);
+  }
+  return bad;
+};
+process.on("message", (asked) => {
+  if (asked === "stop") running = false;
+  if (asked === "start") running = true;
+  process.send(asked === "check" ? { bad: intact(), rewrites } : { [asked]: true });
+});
+process.send({ ready: true });
+`;
+
+/** saturating-4's writers, each a process of its own: what it held, and its asks of it, each answered by its next message, or failed once it has ended. */
+const writers = [];
+for (let index = 1; index < WRITERS; index++) {
+  const first = index * share;
+  const replies = [];
+  const waiting = [];
+  const child = Bun.spawn([process.execPath, "-e", writerSource], {
+    env: { ...process.env, BENCH_WRITER: JSON.stringify({ first, count: index === WRITERS - 1 ? total - first : share, rateMibS: rateMibS / WRITERS }) },
+    stdout: "ignore",
+    stderr: "inherit",
+    ipc(message) {
+      const next = waiting.shift();
+      if (next) next.resolve(message);
+      else replies.push(message);
+    },
+  });
+  const ended = child.exited.then((code) => {
+    const error = new Error(`saturating-4's writer ${index} ended, with ${code}`);
+    for (const each of waiting.splice(0)) each.reject(error);
+    throw error;
+  });
+  ended.catch(() => {});
+  const reply = () =>
+    replies.length > 0 ? Promise.resolve(replies.shift()) : Promise.race([new Promise((resolve, reject) => waiting.push({ resolve, reject })), ended]);
+  writers.push({ pid: child.pid, ask: (message) => (child.send(message), reply()), ready: reply() });
+}
+for (const writer of writers) await writer.ready;
+
 const ticker = worker(tickerSource, { ctl, counters });
 Atomics.store(ctl, RUN, 1);
 let loop = null;
-let held = [];
+let held = writers.map(({ pid }) => pid);
 if (fixture !== "idle") {
-  loop = worker(loopSource, { ctl, counters, versions, chunks, fixture, rateMibS, workspace });
-  held = await new Promise((resolve, reject) => {
+  loop = worker(loopSource, { ctl, counters, versions, chunks, fixture, saturating, rateMibS: rateMibS / WRITERS, workspace });
+  held = [...held, ...await new Promise((resolve, reject) => {
     loop.onmessage = ({ data }) => resolve(data.held);
     loop.onerror = (event) => reject(new Error(event.message));
-  });
+  })];
 }
-
-const now = () => Number(process.hrtime.bigint()) / 1e6;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** VmRSS of this process and the processes it holds, in bytes. */
 function rssBytes() {
@@ -215,7 +317,7 @@ function rssBytes() {
   return [process.pid, ...held].reduce((sum, pid) => sum + of(pid), 0);
 }
 
-/** Stops the background loop, as a check needs memory and files to stand still, `during` it. */
+/** Stops the background loop, and saturating-4's writers, as a check needs memory and files to stand still, `during` it. */
 async function stopped(during) {
   if (!loop) return during();
   Atomics.store(ctl, RUN, 0);
@@ -228,14 +330,16 @@ async function stopped(during) {
     await sleep(5);
   }
   try {
+    await Promise.all(writers.map(({ ask }) => ask("stop")));
     return await during();
   } finally {
     Atomics.store(ctl, RUN, 1);
+    await Promise.all(writers.map(({ ask }) => ask("start")));
   }
 }
 
-/** Every page's stamp and every chunk's random rest: every page read. */
-function memoryIntact() {
+/** Every page's stamp and every chunk's random rest, the writers' among them: every page read. */
+async function memoryIntact() {
   const bad = [];
   for (let index = 0; index < count && bad.length < 8; index++) {
     const words = new Uint32Array(chunks[index]);
@@ -246,6 +350,7 @@ function memoryIntact() {
     }
     if (!ok || digestOf(chunks[index]) !== digests[index]) bad.push(index);
   }
+  for (const { ask } of writers) bad.push(...(await ask("check")).bad);
   return bad;
 }
 
@@ -301,8 +406,8 @@ globalThis.bench = {
   },
   /** The first exec after a restore: the marker it holds live, and the loop's counters; for saturating, a full GC and every page read. */
   async first() {
-    const seen = { marker, chunks: chunks.length, rewrites: counters[REWRITES] };
-    if (fixture === "saturating") {
+    const seen = { marker, chunks: total, rewrites: counters[REWRITES] };
+    if (saturating) {
       Bun.gc(true);
       seen.bad_chunks = await stopped(memoryIntact);
     }
@@ -312,8 +417,8 @@ globalThis.bench = {
   async verify() {
     const result = { marker, memory: null, children: null, file: null, socket: null, running: null };
     const bad = await stopped(async () => {
-      const found = memoryIntact();
-      if (fixture === "saturating") {
+      const found = await memoryIntact();
+      if (saturating) {
         const lines = fs.readFileSync(`${workspace}/bench-append.log`, "utf8").split("\n").filter(Boolean);
         const appended = counters[APPENDED];
         result.file = lines.length === appended && lines.every((line, index) => line === `seq ${index}`);
@@ -328,7 +433,7 @@ globalThis.bench = {
       const spawned = Bun.spawnSync(["bash", "-c", "echo ok"]).stdout.toString().trim() === "ok";
       result.children = held.every(alive) && spawned && (await grows(HELD_TICKS, 2500));
     }
-    if (fixture === "saturating") {
+    if (saturating) {
       result.file = result.file && (await grows(APPENDED, 300));
       result.socket = counters[SOCKET_CLOSED] === 1 ? "closed" : (await grows(ECHOED, 2000)) ? "open" : "hung";
     }
@@ -338,5 +443,5 @@ globalThis.bench = {
   },
 };
 
-const installed = { marker, chunks: count, pids: [process.pid, ...held], rss_bytes: rssBytes() };
+const installed = { marker, chunks: total, pids: [process.pid, ...held], rss_bytes: rssBytes() };
 console.log(`BENCH:${JSON.stringify(installed)}`);

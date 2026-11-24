@@ -24,7 +24,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-export const FIXTURES = ["idle", "poller", "fan-out", "saturating", "repl-bun", "repl-bun-checkpointed", "repl-python", "repl-python-checkpointed"] as const;
+export const FIXTURES = ["idle", "poller", "fan-out", "saturating", "saturating-4", "repl-bun", "repl-bun-checkpointed", "repl-python", "repl-python-checkpointed"] as const;
 export type Fixture = (typeof FIXTURES)[number];
 
 /** The fixtures' sources, as the bundle embeds them, or read beside this file when it runs unbundled. */
