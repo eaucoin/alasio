@@ -11,11 +11,14 @@
  * kubelet's soft eviction threshold, and what each cgroup above the pods (kubepods' and their
  * QoS classes') has under its memory.max, its clean page cache counted as room, as the kernel
  * reclaims it before it must kill (aboveRoom). Each bound sandbox's cgroup, the one its processes are
- * in (its pod sandbox's scope), it limits to what it holds and its share of that room, an equal
- * share of each bound one's, SANDBOX_MEMORY_SLACK_BYTES at the least, and gives memory.oom.group,
- * so a sandbox that grows past its share is ended by its own cgroup's OOM, whole, as the room it
- * grows into is what the others are kept from. A sandbox not bound, a pool's free pod or a
- * standby, holds little and is left as kubelet makes it.
+ * in (its pod sandbox's scope), it gives memory.oom.group, and limits to what it holds and its
+ * share of that room, an equal share of each bound one's, SANDBOX_MEMORY_SLACK_BYTES at the least,
+ * where that share is less than SANDBOX_MEMORY_LIMITED_BELOW_BYTES: so a sandbox that grows past
+ * its share is ended by its own cgroup's OOM, whole, as the room it grows into is what the others
+ * are kept from. Where each has more, none is limited, as none grows by as much between two looks,
+ * and a limit costs what it holds: the kernel bounds what a cgroup may dirty of the page cache by
+ * its limit, which slowed a sandbox's stop's save of 3 GiB by some 200 ms under a limit of GiBs. A
+ * sandbox not bound, a pool's free pod or a standby, holds little and is left as kubelet makes it.
  *
  * Where the node nonetheless comes near its end, what is available over kubelet's hard eviction
  * threshold or under a cgroup above the pods less than SANDBOX_MEMORY_SLACK_BYTES (the shares'
@@ -47,6 +50,9 @@ const LIST_MS = 2_000;
  */
 export const SANDBOX_MEMORY_SLACK_BYTES = 256 * 1024 ** 2;
 
+/** The share of the room below which bound sandboxes are limited, as the module says: more than any grows by between two looks. */
+export const SANDBOX_MEMORY_LIMITED_BELOW_BYTES = 1024 ** 3;
+
 /** By how much a sandbox's limit must move before it is written again. */
 const LIMIT_STEP_BYTES = 16 * 1024 ** 2;
 
@@ -58,9 +64,9 @@ export interface Guarded {
   readonly scopeBytes: number;
 }
 
-/** What the guard does at a look: the limit of each bound sandbox's cgroup, by its key; and the sandbox it ends, if any. */
+/** What the guard does at a look: the limit of each bound sandbox's cgroup, by its key, null where it has none; and the sandbox it ends, if any. */
 export interface GuardPlan {
-  readonly limits: ReadonlyMap<string, number>;
+  readonly limits: ReadonlyMap<string, number | null>;
   readonly end: string | null;
 }
 
@@ -73,7 +79,7 @@ export interface GuardPlan {
 export function guardPlan(room: number, lastRoom: number, sandboxes: readonly Guarded[], ended: ReadonlySet<string>): GuardPlan {
   const bound = sandboxes.filter(({ state }) => state === "bound");
   const share = Math.max(SANDBOX_MEMORY_SLACK_BYTES, Math.floor(Math.max(0, room) / Math.max(1, bound.length)));
-  const limits = new Map(bound.map(({ key, scopeBytes }) => [key, scopeBytes + share]));
+  const limits = new Map(bound.map(({ key, scopeBytes }) => [key, share < SANDBOX_MEMORY_LIMITED_BELOW_BYTES ? scopeBytes + share : null]));
   // None while one ended is still there, its memory being freed (some 0.5 s for 2.5 GiB), which would end another for nothing.
   if (lastRoom >= SANDBOX_MEMORY_SLACK_BYTES || sandboxes.some(({ key }) => ended.has(key))) return { limits, end: null };
   return { limits, end: sandboxes.toSorted((a, b) => b.bytes - a.bytes)[0]?.key ?? null };
@@ -162,7 +168,9 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot }: GuardOptions, endedBe
       const scope = scopes.get(key);
       if (scope === undefined) continue;
       const held = yield* Effect.promise(() => numberIn(join(scope, "memory.max")));
-      if (held === null || Math.abs(held - limit) >= LIMIT_STEP_BYTES) yield* Effect.promise(() => write(join(scope, "memory.max"), `${limit}\n`));
+      if (limit === null ? held !== null : held === null || Math.abs(held - limit) >= LIMIT_STEP_BYTES) {
+        yield* Effect.promise(() => write(join(scope, "memory.max"), limit === null ? "max\n" : `${limit}\n`));
+      }
       // Set again as systemd may set it back, as it sets its units' cgroups' attributes.
       if ((yield* Effect.promise(() => text(join(scope, "memory.oom.group"))))?.trim() !== "1") yield* Effect.promise(() => write(join(scope, "memory.oom.group"), "1\n"));
     }
