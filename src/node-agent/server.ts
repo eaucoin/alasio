@@ -220,13 +220,14 @@ import {
   NODE_AGENT_RUN_DIR,
   NODE_AGENT_RUN_DIR_VARIABLE,
   goferReadsFile,
+  goferUrlsDir,
   storeSocket,
   storeTokensFile,
   WORKSPACES_ROOT,
 } from "./names.ts";
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
-import { keepNodeAdmitted } from "./store-admission.ts";
+import { nodeAdmitted } from "./store-admission.ts";
 import { makeStoreUrls } from "./store-urls.ts";
 import { makeS3Bucket, type StoreUnconditional } from "./s3.ts";
 import { makeStandbyRestores, StandbyRestoreRequest, type StandbyRestores } from "./standby.ts";
@@ -634,9 +635,10 @@ const CONDITIONS_TRIES = Schedule.min([Schedule.exponential("1 second"), Schedul
  * (RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE; none unless given, each image then downloaded whole after its restore),
  * the first that reads a restore's files straight from the store by URLs the agent presigns
  * (RESTORES_BY_URL_SINCE_VARIABLE; none unless given, as the installation reads restores through the agent,
- * ./store-urls.ts), whose reads it follows by their gofers' counts, kept beside its restores' tokens
- * (./gofer-reads.ts), and keeps its node admitted to the bundled store by the policy
- * STORE_FROM_NODES_POLICY_VARIABLE names, where given (./store-admission.ts), its pod's address (POD_IP_VARIABLE),
+ * ./store-urls.ts), whose reads it follows by their gofers' counts, kept beside its restores' tokens, their URLs
+ * signed anew as long as it does (./gofer-reads.ts), each prepared once its node is admitted to the bundled store
+ * by the policy STORE_FROM_NODES_POLICY_VARIABLE names, where given (./store-admission.ts), its pod's address
+ * (POD_IP_VARIABLE),
  * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
  * as on its socket on the node, beside its restores' tokens (NODE_AGENT_RUN_DIR, unless
  * NODE_AGENT_RUN_DIR_VARIABLE says), how long a resumed restore may read it there
@@ -680,11 +682,20 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const runDir = yield* Config.String(NODE_AGENT_RUN_DIR_VARIABLE).pipe(Config.withDefault(NODE_AGENT_RUN_DIR));
   const storeProxy = yield* makeStoreProxy({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }, host: podIP, port: STORE_PROXY_PORT, socket: storeSocket(runDir), tokensFile: storeTokensFile(runDir) });
   // Straight from the store, by URLs the agent presigns, the restores of a release that reads so, followed by their gofers' counts.
-  const goferReads = yield* makeGoferReads({ file: goferReadsFile(runDir) });
   const presign = makeStoreUrls({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) } });
+  const goferReads = yield* makeGoferReads({ urlsDir: goferUrlsDir(runDir), presign, file: goferReadsFile(runDir) });
   const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT, current });
   const host = makeHostCommands();
   const kube = yield* Effect.provide(Effect.service(KubeClient), KubeClient.layer);
+  // Those prepared once the node is admitted to the bundled store, which they read from its own network, where the installation has them.
+  const admission = yield* Config.String(STORE_FROM_NODES_POLICY_VARIABLE).pipe(Config.option);
+  const admitted = yield* Deferred.make<void>();
+  if (Option.isSome(admission)) {
+    const [policyNamespace = "", policyName = ""] = admission.value.split("/");
+    yield* Effect.forkScoped(nodeAdmitted(kube, policyNamespace, policyName, node).pipe(Effect.andThen(Deferred.succeed(admitted, undefined))));
+  } else {
+    yield* Deferred.succeed(admitted, undefined);
+  }
   const store = makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) });
   // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
   const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));
@@ -702,7 +713,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     bucket: store,
     storeProxy,
     goferReads,
-    presign,
+    admitted: Deferred.await(admitted),
     restoresByUrlSince,
     host,
     restoresFromBucketSince,
@@ -727,12 +738,6 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, standbys: makeStandbyRestores({ restores }), memory: nodeMemory(memory), guard });
   // What is attached on the node, kept to the pods the cluster has on it.
   yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
-  // The node admitted to the bundled store, which its restores read by URLs from its own network, where the installation has them.
-  const admission = yield* Config.String(STORE_FROM_NODES_POLICY_VARIABLE).pipe(Config.option);
-  if (Option.isSome(admission)) {
-    const [policyNamespace = "", policyName = ""] = admission.value.split("/");
-    yield* Effect.forkScoped(keepNodeAdmitted(kube, host, policyNamespace, policyName, node));
-  }
   // As it stops, before its API does: its restores' reads of the bucket done first.
   yield* Effect.addFinalizer(() =>
     Effect.gen(function*() {

@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { after, before, describe, test } from "node:test";
 
 import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1EndpointSlice, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
@@ -30,6 +31,7 @@ import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { AGENTS, alasioOk, type Forward, inContainer, kube, lakeQuery, nodeAgents, paths, reachability, ref, runCronJob } from "../../test/e2e/harness.ts";
 import { makeS3Bucket, presignedUrl } from "../../src/node-agent/s3.ts";
+import { makeStoreUrls, SIGNED_BEFORE_MS } from "../../src/node-agent/store-urls.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SERVING_LABEL, SUSPEND_AFTER } from "../control/endpoints.ts";
@@ -1483,7 +1485,7 @@ export function neonStack(): void {
         }
       });
 
-      test("the object store takes a URL the node agent presigns of an object, by Signature Version 4 in its query, for that object's GET alone, of a range and as of its ETag too, until it expires: the scope a restore reading by URLs relies on", async () => {
+      test("the object store takes a URL the node agent presigns of an object, by Signature Version 4 in its query, for that object's GET alone, of a range and as of its ETag too, from a little before its date until it expires, however its path is written and whatever its name holds: the scope a restore reading by URLs relies on", async () => {
         const one = (await gateways())[0] ?? assert.fail("no gateway runs");
         const bucket = `presigned-${Date.now()}`;
         const store = await kube.forward(NAMESPACE, componentName("seaweedfs"), 8333);
@@ -1496,6 +1498,7 @@ export function neonStack(): void {
           const etag = (await Effect.runPromise(objects.head("main/fs-abc/layers/d1/pages.img")))?.etag ?? assert.fail("the object is not there");
           await Effect.runPromise(objects.putJson("main/fs-abc/layers/d2/pages.img", { other: true }));
           const url = (key: string, method: "GET" | "HEAD" = "GET", at = new Date(), seconds = 60) => presignedUrl(store.base, bucket, key, method, signer, at, seconds);
+          // The scope a URL grants, checked on every release of the store alasio installs, as each runs this.
           const asked = async (to: string, init: RequestInit = {}) => {
             const response = await fetch(to, init);
             return { status: response.status, body: await response.text() };
@@ -1517,6 +1520,58 @@ export function neonStack(): void {
           assert.equal((await asked(url("main/fs-abc/layers/d1/pages.img", "GET", new Date(Date.now() - 50_000), 60))).status, 200);
           // Signed by a key the store does not hold: refused.
           assert.equal((await asked(presignedUrl(store.base, bucket, "main/fs-abc/layers/d1/pages.img", "GET", { ...signer, secretAccessKey: "another" }, new Date(), 60))).status, 403);
+          // As the agent signs one, dated a little before its clock: taken.
+          const agentSigned = await Effect.runPromise(makeStoreUrls({ store: { endpoint: store.base, bucket, ...signer } })("main/fs-abc/layers/d1/pages.img", 60));
+          assert.equal(new URL(agentSigned).searchParams.get("X-Amz-Expires"), String(60 + SIGNED_BEFORE_MS / 1000));
+          assert.equal((await asked(agentSigned)).status, 200);
+
+          // Its path made another object's, as the store might normalize it, sent as written: refused (403, or 400 as a
+          // path the store will not take), or d1's own bytes, never d2's.
+          const signed = new URL(own);
+          const d1Path = signed.pathname;
+          const asWritten = (path: string) =>
+            new Promise<{ readonly status: number; readonly body: string }>((resolve, reject) => {
+              const sent = httpRequest({ host: signed.hostname, port: signed.port, path: `${path}${signed.search}`, method: "GET" }, (response) => {
+                const chunks: Buffer[] = [];
+                response.on("data", (chunk: Buffer) => chunks.push(chunk)).on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString() })).on("error", reject);
+              });
+              sent.on("error", reject).end();
+            });
+          const d2Body = (await asked(url("main/fs-abc/layers/d2/pages.img"))).body;
+          for (
+            const path of [
+              d1Path.replace("/d1/", "/d1/../d2/"),
+              d1Path.replace("/d1/", "/d1/%2E%2E/d2/"),
+              d1Path.replace("/d1/", "/d1%2F..%2Fd2/"),
+              d1Path.replace("/layers/d1/", "/layers/d2%2F..%2Fd1/"),
+              d1Path.replace("/d1/", "//d1/"),
+              d1Path.replace("/d1/", "/d1//"),
+              d1Path.replace("/d1/", "/./d1/"),
+              d1Path.replace("/d1/", "/d1/./"),
+              d1Path.replace("/d1/pages.img", "/d2/../d1/pages.img"),
+            ]
+          ) {
+            const got = await asWritten(path);
+            assert.ok([400, 403].includes(got.status) || (got.status === 200 && got.body === whole.body), `${path}: ${got.status} ${got.body.slice(0, 200)}`);
+            assert.notEqual(got.body, d2Body, path);
+          }
+          // Names that would carry another request in them, signed as the agent signs a name: each is of no object here, so
+          // none is answered, d2's least of all.
+          for (
+            const key of [
+              "main/fs-abc/layers/d1/../d2/pages.img",
+              "main/fs-abc/layers/d1/%2E%2E/d2/pages.img",
+              "main/fs-abc/layers/d1%2F..%2Fd2/pages.img",
+              "main/fs-abc/layers/d2/pages.img?versionId=null",
+              "main/fs-abc/layers/d2/pages.img#d1",
+              "main/fs-abc/layers/d2/pages.img\r\nx-amz-copy-source: d1",
+              "main/fs-abc/layers/d2/pages.img&X-Amz-Expires=604800",
+            ]
+          ) {
+            const got = await asked(url(key));
+            assert.notEqual(got.status, 200, `${JSON.stringify(key)}: ${got.status} ${got.body.slice(0, 200)}`);
+            assert.notEqual(got.body, d2Body, key);
+          }
         } finally {
           store.close();
           await onGateway(one, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});

@@ -12,8 +12,9 @@
  * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS, and for
  * one ending though the gateway did not end it, released as it ends (./sessions.ts drain); the
  * pools' refusals by the sandbox pods' policy are counted every REFUSALS_MS (./refusals.ts);
- * and what of main's snapshots no workspace has a use for is collected every COLLECT_MS
- * (./snapshots.ts collect).
+ * what of main's snapshots no workspace has a use for is collected every COLLECT_MS
+ * (./snapshots.ts collect); and, where restores read the bundled store from the nodes' networks,
+ * the policy that admits the nodes to it is kept to the cluster's nodes (./store-admission.ts).
  * What stops it is logged.
  */
 import { lookup } from "node:dns/promises";
@@ -48,6 +49,7 @@ import {
 import { makeFolders } from "./folders.ts";
 import { makeHarnesses } from "./harnesses.ts";
 import { makeSessions, sessionKeyAttributes } from "./sessions.ts";
+import { keepNodesAdmitted } from "./store-admission.ts";
 
 /** How often bound pods are looked at for one to release: each pod's bayma is asked no oftener than its poll (./sessions.ts). */
 const SWEEP_MS = 5_000;
@@ -159,6 +161,8 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
       Schedule.spaced(SWEEP_MS),
     ));
     yield* Effect.forkScoped(Effect.repeat(sessions.collect, Schedule.spaced(COLLECT_MS)));
+    // The cluster's nodes admitted to the bundled store, which restores read from the nodes' networks, where they do (./store-admission.ts).
+    if (config.storeFromNodes) yield* Effect.forkScoped(keepNodesAdmitted(yield* KubeClient, config.storeFromNodes.namespace, config.storeFromNodes.name));
     // The folder instances', as often: each idle one released, and each whose bayma ended.
     if (folders) {
       yield* Effect.forkScoped(Effect.repeat(

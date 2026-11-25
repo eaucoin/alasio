@@ -15,7 +15,7 @@ import { closeSync, constants, type PathLike, existsSync, fstatSync, mkdirSync, 
 import { open as openFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
@@ -65,15 +65,15 @@ import {
   type WorkspaceRef,
 } from "../src/node-agent/agent.ts";
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
-import { type GoferReads, makeGoferReads } from "../src/node-agent/gofer-reads.ts";
+import { type GoferReads, makeGoferReads, URL_TTL_MS } from "../src/node-agent/gofer-reads.ts";
 import { GROWTH_WINDOW_MS, Restores, SANDBOX_MEMORY_SLACK_BYTES } from "../src/node-agent/guard.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
 import type { NodeMemory } from "../src/node-agent/memory.ts";
 import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags, SandboxGone } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket, type S3Options, sigV4Authorization } from "../src/node-agent/s3.ts";
-import { makeStoreProxy, PREPARED_FOR_MS, type StoreProxy } from "../src/node-agent/store-proxy.ts";
-import { makeStoreUrls } from "../src/node-agent/store-urls.ts";
+import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
+import { makeStoreUrls, SIGNED_BEFORE_MS } from "../src/node-agent/store-urls.ts";
 import { NODE_PINS } from "../cli/src/cluster/node.ts";
 import { backgroundReadSeconds, LOAD_WAIT_WATCHDOG_MARGIN_SECONDS, LOADING_SAVE_LATEST_SECONDS, NODE_AGENT_PORT, restoresFromBucket, SAVE_HOOK_SECONDS, SAVE_LOAD_WAIT_SECONDS, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
@@ -277,6 +277,8 @@ interface NodeOptions {
   readonly restoresByUrlSince?: string;
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
+  /** What its agent's prepares by URLs wait on for its node to be admitted to the store (NodeAgentOptions admitted), none unless given. */
+  readonly admitted?: Effect.Effect<void>;
   /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
   readonly pods?: NodeAgentOptions["pods"];
   /** Its cache as `cache` changes it. */
@@ -300,7 +302,7 @@ async function withBucket(
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, ...resends });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, restoresWithETagsSince = "", restoresWithPagesCacheSince = "", restoresByUrlSince = "", backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, deltaAfterColdRestore, restores }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, restoresWithETagsSince = "", restoresWithPagesCacheSince = "", restoresByUrlSince = "", backgroundReadMs = BACKGROUND_READ_MS, admitted, pods, cache: cached = (cache) => cache, onePassSaves, deltaAfterColdRestore, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -314,9 +316,9 @@ async function withBucket(
       const sockets = socket ? mkdtempSync(join("/tmp", "alasio-agent-")) : null;
       if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
       const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }), ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) }).pipe(Effect.orDie);
-      // Its restores that read the bucket by URLs, followed by their gofers' counts, as long as its proxy's tokens last.
-      const goferReads = yield* makeGoferReads({ ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) });
+      // Its restores that read the bucket by URLs, signed by its keys, followed by their gofers' counts, as long as its proxy's tokens last.
       const presign = makeStoreUrls({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS } });
+      const goferReads = yield* makeGoferReads({ urlsDir: join(root, name, "urls"), presign, ...(quietMs === undefined ? {} : { quietMs }), ...(preparedForMs === undefined ? {} : { preparedForMs }) });
       const pod = { podIPs: [POD_IP] as readonly string[], containerIds: [CONTAINER, OTHER_CONTAINER] as readonly string[], gone: false };
       const compacted: Node["compacted"] = { recorded: [], fails: false };
       const restarted = makeNodeAgent({
@@ -329,7 +331,7 @@ async function withBucket(
         bucket,
         storeProxy,
         goferReads,
-        presign,
+        ...(admitted === undefined ? {} : { admitted }),
         restoresByUrlSince,
         host: host.host,
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
@@ -2808,9 +2810,11 @@ test("a restore from the bucket's images are fetched into the cache once it is d
     })
   ));
 
-/** Writes what the gofer of a restore that reads the bucket by URLs counts in its served file, beside its options at `imagePath`: `bytes`, the file replaced whole. */
-const servedBy = (imagePath: string, bytes: number): void => {
-  const file = join(imagePath, "served");
+/** The served file the gofer of a restore that reads the bucket by URLs counts in, as its options at `imagePath` say, while they are there. */
+const servedFileOf = (imagePath: string): string => goferOptionsOf(imagePath).options["served_file"] as string;
+
+/** Writes what the gofer of a restore that reads the bucket by URLs counts in its served file `file`: `bytes`, the file replaced whole. */
+const servedBy = (file: string, bytes: number): void => {
   writeFileSync(`${file}.new`, `${bytes}\n`);
   renameSync(`${file}.new`, file);
 };
@@ -2823,7 +2827,7 @@ const logging = <A, E, R>(run: Effect.Effect<A, E, R>) =>
     return { logged, exit };
   });
 
-test("a restore from the bucket under a release that reads it by URLs is given, of each file it reads of each image of its chain, a URL presigned by the agent's keys for that object alone, by GET alone, for as long as it may be prepared and read in the background, and no credentials, its options root's alone; its gofer counts in a file beside them, which the copy runsc inspects the image by names none; nothing it is given, answers, logs or traces holds the agent's secret, nor its answer, logs or traces a URL's signature; under a release before, it reads through the proxy", () =>
+test("a restore from the bucket under a release that reads it by URLs is given, in a file root's alone, of each file it reads of each image of its chain, a URL presigned by the agent's keys for that object alone, by GET alone, for URL_TTL_MS, and no credentials, its options root's alone; its gofer counts in a file of its own beside them, which the copy runsc inspects the image by names none; nothing it is given, answers, logs or traces holds the agent's secret, nor its answer, logs or traces a URL's signature; under a release before, it reads through the proxy", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
@@ -2858,14 +2862,14 @@ test("a restore from the bucket under a release that reads it by URLs is given, 
       assert.equal(prepared.source, "bucket");
       const { files, mode, options } = goferOptionsOf(prepared.imagePath);
       assert.deepEqual([files, mode], [["s3_opts.json"], "600"]);
-      const { urls, etags, ...rest } = options as { readonly urls: Record<string, string>; readonly etags: Record<string, string> };
-      assert.deepEqual(rest, {
-        bucket: "snapshots",
-        object_prefix: `main/fs-abc/layers/${own.digest}/`,
-        layers_prefix: "main/fs-abc/layers/",
-        served_file: join(prepared.imagePath, "served"),
-        read_parallel: 16,
-      });
+      const { urls_file: urlsFile, served_file: servedFile, etags, ...rest } = options as { readonly urls_file: string; readonly served_file: string; readonly etags: Record<string, string> };
+      assert.deepEqual(rest, { bucket: "snapshots", object_prefix: `main/fs-abc/layers/${own.digest}/`, layers_prefix: "main/fs-abc/layers/", read_parallel: 16 });
+      // Its count in a file of its own beside them; its URLs in a file of its own, root's alone, apart from them, which its agent signs anew.
+      assert.equal(dirname(servedFile), prepared.imagePath);
+      assert.match(basename(servedFile), /^served-[0-9a-f]{16}$/u);
+      assert.match(urlsFile, /\/node-3\/urls\/gofer-[0-9a-f]{20}\.json$/u);
+      assert.equal((statSync(urlsFile).mode & 0o777).toString(8), "600");
+      const urls = JSON.parse(readFileSync(urlsFile, "utf8")) as Record<string, string>;
       // Each file its restore reads: its own image's every one, its layer's pages and their metadata alone; each by its ETag too.
       const paths = [...own.files.map(({ path }) => path), ...["pages.img", "pages_meta.img"].map((path) => `layers/${layer.digest}/${path}`)].sort();
       assert.deepEqual(Object.keys(urls).sort(), paths);
@@ -2875,7 +2879,7 @@ test("a restore from the bucket under a release that reads it by URLs is given, 
         const parsed = new URL(url);
         assert.equal(parsed.origin, new URL(s3.endpoint).origin);
         assert.equal(decodeURIComponent(parsed.pathname), `/snapshots/${keyOf(path)}`);
-        assert.equal(parsed.searchParams.get("X-Amz-Expires"), String(Math.ceil((PREPARED_FOR_MS + BACKGROUND_READ_MS) / 1000)));
+        assert.equal(parsed.searchParams.get("X-Amz-Expires"), String((URL_TTL_MS + SIGNED_BEFORE_MS) / 1000));
         assert.equal(parsed.searchParams.get("X-Amz-SignedHeaders"), "host");
         const got = yield* Effect.promise(() => fetch(url));
         assert.equal(got.status, 200);
@@ -2904,7 +2908,7 @@ test("a restore from the bucket under a release that reads it by URLs is given, 
       assert.equal(proxied.source, "bucket");
       const viaProxy = goferOptionsOf(proxied.imagePath).options;
       assert.equal(viaProxy["endpoint"], before.storeProxy.endpoint);
-      assert.ok(viaProxy["credentials"] !== undefined && viaProxy["urls"] === undefined && viaProxy["served_file"] === undefined);
+      assert.ok(viaProxy["credentials"] !== undefined && viaProxy["urls_file"] === undefined && viaProxy["served_file"] === undefined);
       assert.ok(!before.goferReads.follows("main/fs-abc"));
       assert.equal(endedSpan("alasio.node_agent.prepare").attributes["alasio.snapshot.read_path"], "proxy");
     }).pipe(Effect.provide(TracingLayer))
@@ -2926,6 +2930,7 @@ test("a restore from the bucket by URLs has its images fetched into the cache on
       writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
       const prepared = yield* preparing(there.agent, workspace);
       assert.equal(prepared.source, "bucket");
+      const served = servedFileOf(prepared.imagePath);
       yield* there.agent.resume(resumeRequest(manifest.snapshot));
       yield* Effect.sync(() => there.goferReads.readingOf(holder)?.expected).pipe(
         Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (expected) => expected === 45056 }),
@@ -2939,13 +2944,13 @@ test("a restore from the bucket by URLs has its images fetched into the cache on
       writeFileSync(join(stateDirIn(volume), "generation.json"), JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation }));
       there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/attach", source: volume }]);
       // Its gofer has read part of its pages: a live checkpoint deferred, nothing fetched.
-      servedBy(prepared.imagePath, 4096);
+      servedBy(served, 4096);
       assert.equal(failure(yield* there.agent.checkpoint(live("fs-abc")).pipe(Effect.exit)), "the sandbox of main/fs-abc is not saved live while its restore from the bucket reads it still, 4096 of 45056 bytes of its pages served: its release saves it");
       assert.equal(saves, 0);
       yield* Effect.sleep("1500 millis");
       assert.deepEqual(imagesOf(there, "fs-abc"), []);
       // Every byte read: fetched, and saved live.
-      servedBy(prepared.imagePath, 45056);
+      servedBy(served, 45056);
       yield* cached(there, manifest);
       assert.equal(there.goferReads.readingOf(holder), null);
       const taken = yield* there.agent.checkpoint(live("fs-abc"));
@@ -2954,13 +2959,15 @@ test("a restore from the bucket by URLs has its images fetched into the cache on
     })
   ));
 
-test("a release's save of a sandbox whose restore from the bucket by URLs reads it still has its loading ended by runsc's fail-load, said why, once it has run its floor and its gofer has read no byte for its stall window, whether or not the store answers, so its loading fails and the save with it; one whose fail-load fails is said loudly, its save waiting on", () =>
+test("a release's save of a sandbox whose restore from the bucket by URLs reads it still has its loading ended by runsc's fail-load, said why, once it has run its floor and its gofer has read no byte for its stall window, whether or not the store answers, so its loading fails and the save with it, its fail-load asked again once where it fails; one whose fail-load fails so is said loudly, its save waiting on", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
       const holder = "main/fs-abc";
       const taker = yield* node("node-1");
       const failedLoads: (readonly [string, string, string])[] = [];
+      /** Whether the next fail-load fails, as a call that does not reach the sandbox does, before it is runsc's. */
+      let failsOnce = false;
       let saving: Saving = (release, options, runsc) => runsc.checkpoint(release, options);
       const there = yield* node("node-2", {
         restoresByUrlSince: RELEASE,
@@ -2968,7 +2975,14 @@ test("a release's save of a sandbox whose restore from the bucket by URLs reads 
         runsc: (runsc) => ({
           ...runsc,
           checkpoint: (release, options) => saving(release, options, runsc),
-          failLoad: (release, containerId, reason) => Effect.sync(() => void failedLoads.push([release, containerId, reason])).pipe(Effect.andThen(runsc.failLoad(release, containerId, reason))),
+          failLoad: (release, containerId, reason) =>
+            Effect.sync(() => void failedLoads.push([release, containerId, reason])).pipe(
+              Effect.andThen(Effect.suspend(() => {
+                if (!failsOnce) return runsc.failLoad(release, containerId, reason);
+                failsOnce = false;
+                return Effect.fail(new RunscError({ release, command: "fail-load", reason: "the sandbox did not answer" }));
+              })),
+            ),
         }),
       });
       writeFileSync(join(there.releases.releasesDir, RELEASE, "remote-inspect"), "");
@@ -2985,8 +2999,9 @@ test("a release's save of a sandbox whose restore from the bucket by URLs reads 
       });
       // A save that waits on pages its gofer reads none of, the store away, refusing everything: once it has run its floor
       // and its gofer has read nothing for the stall window, its loading is ended on the node, and so the save fails, as
-      // runsc says of a sandbox whose loading failed.
+      // runsc says of a sandbox whose loading failed; its fail-load, failing once, asked again.
       yield* restored;
+      failsOnce = true;
       s3.refuse = () => 503;
       let times = { started: 0, ended: 0 };
       saving = (release) =>
@@ -2998,28 +3013,104 @@ test("a release's save of a sandbox whose restore from the bucket by URLs reads 
       const stalled = yield* logging(there.agent.checkpoint(request("fs-abc")));
       assert.match(failure(stalled.exit), /^the sandbox of main\/fs-abc can be saved no more, its restore having failed to read some of its pages: .*previous async page loading failed/u);
       assert.ok(times.ended - times.started >= 1000, `ended ${times.ended - times.started} ms after runsc's save started`);
-      assert.deepEqual(failedLoads.map(([release, containerId]) => [release, containerId]), [[RELEASE, CONTAINER]]);
-      assert.match(failedLoads[0]?.[2] ?? "", /^alasio bounds the save of main\/fs-abc as its restore loads: no byte of its pages has been served for 1 s/u);
       // Ended whole, though the save failed as it ended it: said, its following ended.
       const ends = yield* Effect.sync(() => stalled.logged.filter((line) => line.startsWith(`ended the loading of the restore of ${holder} from the bucket`))).pipe(
         Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (lines) => lines.length > 0 }),
         Effect.timeout("10 seconds"),
       );
       assert.equal(ends.length, 1);
+      assert.deepEqual(failedLoads.map(([release, containerId]) => [release, containerId]), [[RELEASE, CONTAINER], [RELEASE, CONTAINER]]);
+      assert.match(failedLoads[0]?.[2] ?? "", /^alasio bounds the save of main\/fs-abc as its restore loads: no byte of its pages has been served for 1 s/u);
       assert.ok(!there.goferReads.follows(holder));
       assert.match(ends[0] ?? "", /^ended the loading of the restore of main\/fs-abc from the bucket, as no byte of its pages has been served for 1 s while its release's save, running 1 s, waits, 0 of 45056 bytes of its pages read: /u);
       s3.refuse = () => null;
 
-      // One whose fail-load fails: said loudly, its save waiting on.
+      // One whose fail-load fails, asked again: said loudly, its save waiting on.
       failedLoads.length = 0;
       yield* restored;
       writeFileSync(join(there.releases.releasesDir, RELEASE, "fail-fail-load"), "");
       saving = (release, options, runsc) => Effect.sleep("2500 millis").pipe(Effect.andThen(runsc.checkpoint(release, options)));
       const held = yield* logging(there.agent.checkpoint(request("fs-abc")));
       assert.ok(Exit.isSuccess(held.exit));
-      assert.equal(failedLoads.length, 1);
+      assert.equal(failedLoads.length, 2);
       assert.ok(held.logged.some((line) => line.startsWith(`could not end the loading of the restore of ${holder} from the bucket`)), held.logged.join("\n"));
       rmSync(join(there.releases.releasesDir, RELEASE, "fail-fail-load"));
+    })
+  ));
+
+test("a prepare of a restore by URLs waits for its node to be admitted to the store before it signs them; one through the proxy waits for nothing", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const admission = yield* Deferred.make<void>();
+      const byUrl = yield* node("node-2", { restoresByUrlSince: RELEASE, admitted: Deferred.await(admission) });
+      writeFileSync(join(byUrl.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      const waiting = yield* Effect.forkChild(preparing(byUrl.agent, workspace));
+      yield* Effect.sleep("300 millis");
+      assert.ok(!byUrl.goferReads.follows("main/fs-abc"));
+      const urlsDir = join(dirname(byUrl.cacheDir), "urls");
+      assert.deepEqual(existsSync(urlsDir) ? readdirSync(urlsDir) : [], []);
+      yield* Deferred.succeed(admission, undefined);
+      const prepared = yield* Fiber.join(waiting);
+      assert.equal(prepared.source, "bucket");
+      assert.ok(byUrl.goferReads.follows("main/fs-abc"));
+
+      const proxied = yield* node("node-3", { admitted: Effect.never });
+      assert.equal((yield* preparing(proxied.agent, workspace)).source, "bucket");
+    })
+  ));
+
+test("a prepare that fails once it has given its restore a way to read the bucket leaves none: by URLs, its gofer's options are removed, its URLs too and signed no more, its reads followed no more; through the proxy, its options are removed and its token revoked", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const holder = "main/fs-abc";
+      yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      /** The options each prepare wrote, as the cache was given them. */
+      const written: string[] = [];
+      const recording = (cache: SnapshotCache): SnapshotCache => ({
+        ...cache,
+        prepareRemote: (environment, workspace, snapshot, name, options) => Effect.sync(() => void written.push(options)).pipe(Effect.andThen(cache.prepareRemote(environment, workspace, snapshot, name, options))),
+      });
+      // Its manifest, written once its options are, not written: where it goes is a directory.
+      const failing = (there: Node) => mkdirSync(join(there.cacheDir, "main", "fs-abc", "manifest.json"), { recursive: true });
+      const optionsLeft = (there: Node) => readdirSync(join(there.cacheDir, "main", "fs-abc")).filter((entry) => existsSync(join(there.cacheDir, "main", "fs-abc", entry, "s3_opts.json")));
+
+      const byUrl = yield* node("node-2", { restoresByUrlSince: RELEASE, cache: recording });
+      failing(byUrl);
+      assert.match(failure(yield* preparing(byUrl.agent, workspace).pipe(Effect.exit)), /EISDIR/u);
+      const { urls_file: urlsFile } = JSON.parse(written.at(-1) ?? "{}") as { readonly urls_file: string };
+      assert.ok(urlsFile.endsWith(".json"));
+      assert.deepEqual(optionsLeft(byUrl), []);
+      assert.ok(!existsSync(urlsFile));
+      assert.ok(!byUrl.goferReads.follows(holder));
+
+      const proxied = yield* node("node-3", { cache: recording });
+      failing(proxied);
+      assert.match(failure(yield* preparing(proxied.agent, workspace).pipe(Effect.exit)), /EISDIR/u);
+      const { credentials } = JSON.parse(written.at(-1) ?? "{}") as { readonly credentials: { readonly access_key_id: string; readonly secret_access_key: string } };
+      assert.deepEqual(optionsLeft(proxied), []);
+      assert.equal(proxied.storeProxy.readingOf(holder), null);
+      assert.equal(yield* throughProxy(proxied, { accessKeyId: credentials.access_key_id, secretAccessKey: credentials.secret_access_key }, `main/fs-abc/layers/${"b".repeat(64)}/pages.img`), 403);
+    })
+  ));
+
+test("the gofer of an earlier restore of a snapshot, counting on in the directory prepared anew for the next, counts in a file of its own, not the next restore's", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const holder = "main/fs-abc";
+      yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const there = yield* node("node-2", { restoresByUrlSince: RELEASE });
+      const earlier = servedFileOf((yield* preparing(there.agent, workspace)).imagePath);
+      const prepared = yield* preparing(there.agent, workspace);
+      const served = servedFileOf(prepared.imagePath);
+      assert.notEqual(served, earlier);
+      servedBy(earlier, 45056);
+      assert.equal(there.goferReads.readingOf(holder)?.served, 0);
+      servedBy(served, 4096);
+      assert.equal(there.goferReads.readingOf(holder)?.served, 4096);
     })
   ));
 

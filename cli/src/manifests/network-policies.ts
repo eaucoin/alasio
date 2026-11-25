@@ -478,9 +478,10 @@ function nodeAgentPolicies(config: InstallConfig, apiServer: ApiServer | null): 
  * The bundled store's S3 port as the nodes reach it from their own networks, whose restores'
  * checkpoint gofers read the snapshots bucket there straight from the store, by the URLs their
  * agents presign (src/node-agent/store-urls.ts): its rule, of each address any node holds, is
- * the node agents' to write, each keeping its own node's (src/node-agent/store-admission.ts),
- * which no pod selector could name, as nodes join and go after `alasio up`; none here, so that
- * the installation's applying it again leaves theirs, and a policy of no rule admits no one. A
+ * the sandbox gateway's to write, of the cluster's nodes as their Node objects say them
+ * (src/gateway/store-admission.ts), which no pod selector could name, as nodes join and go after
+ * `alasio up`; the node agents only read it. None here, so that the installation's applying it
+ * again leaves the gateway's, and a policy of no rule admits no one. A
  * session's pod, of no node's address, is not among them; what a URL grants is the boundary,
  * the port the store's own.
  */

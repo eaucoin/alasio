@@ -38,6 +38,8 @@ import type {
   V1Deployment,
   V1EnvVar,
   V1PodTemplateSpec,
+  V1Role,
+  V1RoleBinding,
   V1Service,
   V1ServiceAccount,
 } from "@kubernetes/client-node";
@@ -92,6 +94,7 @@ import {
 import { resumedConditionPolicy, sandboxPodPolicy } from "./admission.ts";
 import { durationSeconds, type InstallConfig, type Scale } from "./config.ts";
 import { LOG_BROKERS, logPrincipalSecret } from "./log.ts";
+import { nodesAdmittedToStore, STORE_FROM_NODES_POLICY } from "./node-agent.ts";
 import { boundBudget } from "./disruption.ts";
 import { FILER_STORE } from "./object-store.ts";
 import { priority } from "./priorities.ts";
@@ -364,6 +367,8 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
       : null,
     // Conversations' harnesses' pools, where they run in pools of their own.
     harnesses: harnessesConfig(config),
+    // The policy that admits the nodes to the bundled store, which it writes, where restores read the store from the nodes' networks.
+    storeFromNodes: nodesAdmittedToStore(config) ? { namespace: NAMESPACE, name: STORE_FROM_NODES_POLICY } : null,
   };
 }
 
@@ -420,6 +425,28 @@ function gatewayIdentity(): KubernetesObject[] {
     ]),
     ...environmentsFinder(GATEWAY, GATEWAY_COMPONENT),
   ];
+}
+
+/**
+ * That the gateway may write STORE_FROM_NODES_POLICY, it alone, and list the cluster's nodes, as
+ * it keeps the policy admitting each node's addresses, and no other, to the bundled store
+ * (src/gateway/store-admission.ts), which the node agents only read: its Role and ClusterRole,
+ * and their bindings.
+ */
+function storeAdmitter(): KubernetesObject[] {
+  const name = `${GATEWAY}-store-admission`;
+  const metadata = { name, labels: labels(GATEWAY_COMPONENT) };
+  const subjects = [{ kind: "ServiceAccount", name: GATEWAY, namespace: NAMESPACE }];
+  const role: V1Role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata: { ...metadata, namespace: NAMESPACE },
+    rules: [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [STORE_FROM_NODES_POLICY], verbs: ["get", "update"] }],
+  };
+  const binding: V1RoleBinding = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "RoleBinding", metadata: { ...metadata, namespace: NAMESPACE }, subjects, roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name } };
+  const nodes: V1ClusterRole = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRole", metadata, rules: [{ apiGroups: [""], resources: ["nodes"], verbs: ["list"] }] };
+  const nodesBinding: V1ClusterRoleBinding = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRoleBinding", metadata, subjects, roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name } };
+  return [role, binding, nodes, nodesBinding];
 }
 
 /** The gateway's Deployment, its configuration's ConfigMap, and its Services. */
@@ -885,6 +912,8 @@ export function sandboxServiceObjects(config: InstallConfig, carried: Carried): 
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
   return [
     ...gatewayIdentity(),
+    // Where restores read the bundled store from the nodes' networks, what lets it admit them.
+    ...(nodesAdmittedToStore(config) ? storeAdmitter() : []),
     ...gatewayObjects(config, carried),
     // Every pod of every environment's sessions held to the pools' templates, as Pod Security cannot.
     ...sandboxPodPolicy([poolTemplate(config, pools.none, "none", carried.cpuBaseline), poolTemplate(config, pools.full, "full", carried.cpuBaseline)], {

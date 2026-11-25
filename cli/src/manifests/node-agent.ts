@@ -26,7 +26,7 @@
  * and a restore's pod until it runs, to resume it (src/node-agent/agent.ts): no other right, and
  * nothing of any other namespace.
  */
-import type { KubernetesObject, V1ClusterRole, V1ClusterRoleBinding, V1DaemonSet, V1Role, V1RoleBinding, V1ServiceAccount, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
+import type { KubernetesObject, V1DaemonSet, V1Role, V1RoleBinding, V1ServiceAccount, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import {
   BACKGROUND_READ_SECONDS_VARIABLE,
@@ -169,7 +169,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE, value: sessions.snapshots.restoreWritesCache ? NODE_PINS.gvisor.restoresWithPagesCacheSince : "" },
               // None unless the operator's config says so (sessions.snapshots.restoreReads), each restore read through the agent.
               { name: RESTORES_BY_URL_SINCE_VARIABLE, value: sessions.snapshots.restoreReads === "presigned" ? NODE_PINS.gvisor.restoresByUrlSince : "" },
-              // The policy it keeps its node admitted to the bundled store by, its restores reading it from the node's network.
+              // The policy that admits its node to the bundled store, its restores reading it from the node's network, which it waits for.
               ...(nodesAdmittedToStore(config) ? [{ name: STORE_FROM_NODES_POLICY_VARIABLE, value: `${NAMESPACE}/${STORE_FROM_NODES_POLICY}` }] : []),
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               // How long a release's save of a sandbox its restore from the bucket still reads may see no byte of it served (src/node-agent/agent.ts).
@@ -203,7 +203,11 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
   };
 }
 
-/** The NetworkPolicy that admits the nodes to the bundled store's S3 port, which each node agent keeps its node's addresses in (src/node-agent/store-admission.ts). */
+/**
+ * The NetworkPolicy that admits the nodes to the bundled store's S3 port, which the sandbox
+ * gateway alone writes (src/gateway/store-admission.ts) and each node agent reads, waiting for
+ * its node to be admitted (src/node-agent/store-admission.ts).
+ */
 export const STORE_FROM_NODES_POLICY = componentName("seaweedfs-from-nodes");
 
 /**
@@ -216,24 +220,28 @@ export const nodesAdmittedToStore = ({ objectStore, networkPolicies, sessions }:
   objectStore.bundled.enabled && networkPolicies.enabled && sessions.snapshots.restoreReads === "presigned";
 
 /**
- * That the node agents may read STORE_FROM_NODES_POLICY and write it, it alone, and read the
- * cluster's nodes, as each keeps its node's addresses in it and drops those of nodes gone: its
- * Role and ClusterRole, and their bindings.
+ * That the node agents may read STORE_FROM_NODES_POLICY, it alone, and nothing more of it, as
+ * each waits for its node to be admitted before it prepares a restore by URLs: its writer is the
+ * sandbox gateway (./sandbox-gateway.ts storeAdmitter), so that no node's agent can change what it
+ * admits. Its Role, and its binding.
  */
-function storeAdmitters(): KubernetesObject[] {
+function storeAdmissionReaders(): KubernetesObject[] {
   const name = componentName("node-agent-store-admission");
-  const metadata = { name, labels: labels("node-agent") };
-  const subjects = [{ kind: "ServiceAccount", name: NODE_AGENT_ACCOUNT, namespace: NAMESPACE }];
+  const metadata = { name, namespace: NAMESPACE, labels: labels("node-agent") };
   const role: V1Role = {
     apiVersion: "rbac.authorization.k8s.io/v1",
     kind: "Role",
-    metadata: { ...metadata, namespace: NAMESPACE },
-    rules: [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [STORE_FROM_NODES_POLICY], verbs: ["get", "update"] }],
+    metadata,
+    rules: [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [STORE_FROM_NODES_POLICY], verbs: ["get"] }],
   };
-  const binding: V1RoleBinding = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "RoleBinding", metadata: { ...metadata, namespace: NAMESPACE }, subjects, roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name } };
-  const nodes: V1ClusterRole = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRole", metadata, rules: [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }] };
-  const nodesBinding: V1ClusterRoleBinding = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRoleBinding", metadata, subjects, roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name } };
-  return [role, binding, nodes, nodesBinding];
+  const binding: V1RoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "RoleBinding",
+    metadata,
+    subjects: [{ kind: "ServiceAccount", name: NODE_AGENT_ACCOUNT, namespace: NAMESPACE }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name },
+  };
+  return [role, binding];
 }
 
 /**
@@ -247,7 +255,7 @@ export function nodeAgentObjects(config: InstallConfig): KubernetesObject[] {
   return [
     serviceAccount,
     ...[NAMESPACE, sessionsNamespace(config, MAIN_ENVIRONMENT)].flatMap(nodeAgentPodReaders),
-    ...(nodesAdmittedToStore(config) ? storeAdmitters() : []),
+    ...(nodesAdmittedToStore(config) ? storeAdmissionReaders() : []),
     agents,
     verticalPodAutoscaler(agents, "Recommended"),
   ];
