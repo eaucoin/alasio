@@ -113,7 +113,7 @@ import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { currentTraceparent, meter, withAlasioSpan, withWaitSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
-import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
+import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, PAGES_METADATA_FILE, type SnapshotCache } from "./cache.ts";
 import { Restores } from "./guard.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
@@ -829,6 +829,12 @@ export interface NodeAgentOptions {
    */
   readonly onePassSaves?: boolean;
   /**
+   * Whether a restore from the bucket keeps the pages metadata of its snapshot's own image in the
+   * cache as it begins (keepParentLater), so that the restored sandbox's next checkpoint is a delta
+   * of that image before fetchLater has fetched it whole: no unless told.
+   */
+  readonly deltaAfterColdRestore?: boolean;
+  /**
    * Records, beside the workspace's files, the compaction of its snapshot `from` this agent
    * committed, `manifest` (./workspaces.ts setCompacted): what a restore of a workspace released
    * into `from` restores instead. One that fails leaves that restore to the snapshot compacted
@@ -977,6 +983,10 @@ const layerChecks = meter.createCounter("alasio.node_agent.checkpoint.layer_chec
 const uncaught = meter.createCounter("alasio.node_agent.checkpoint.uncaught", {
   description: "Release saves whose bayma's last-save.json could not be read once runsc's save had ended the sandbox, each kept recording no generation of bayma's state",
   unit: "{checkpoint}",
+});
+const parentsKept = meter.createCounter("alasio.node_agent.parents", {
+  description: "The pages metadata of a snapshot's image a restore from the bucket keeps in the node's cache, for the next checkpoint's delta, by outcome: kept, or what failed",
+  unit: "{image}",
 });
 const copies = meter.createCounter("alasio.node_agent.copies", {
   description: "Snapshots copied from one workspace to another by the node agent, by outcome",
@@ -1205,8 +1215,17 @@ function telling(cache: SnapshotCache, changed: Effect.Effect<void>): SnapshotCa
 const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
+/**
+ * The snapshot a checkpoint is a delta of, and the directory runsc reads its image's digest from: the image whole in the
+ * cache, or the pages metadata alone the cache keeps of it (./cache.ts keepParent).
+ */
+interface ParentImage {
+  readonly manifest: Manifest;
+  readonly image: string;
+}
+
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, deltaAfterColdRestore = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1543,7 +1562,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   /**
    * The snapshot of the sandbox `request` names, taken and committed as the module says:
    * its manifest. A delta of its base, its sandbox tracking its writes and the base's image
-   * in the cache; whole otherwise. Its save bounded while its sandbox loads, as one asked at
+   * in the cache, or, where deltaAfterColdRestore says so, the pages metadata of it the cache
+   * keeps (keepParentLater), all runsc reads of a parent image; whole otherwise. Its save bounded while its sandbox loads, as one asked at
    * `askedAt`, where given (boundWhileLoading).
    */
   const take = (request: CheckpointRequest, askedAt: number | null): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
@@ -1555,19 +1575,23 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const snapshot = snapshotId(takenAt);
       const base = bases.get(containerId);
       const [own] = base?.layers ?? [];
-      const extended = base !== undefined && own !== undefined && tracksWrites && prefixOf(base) === prefixOf(request) && (yield* cache.holds(environment, workspace, own.digest)) ? base : null;
+      const parentImage = base === undefined || own === undefined || !tracksWrites || prefixOf(base) !== prefixOf(request) ? null
+        : (yield* cache.holds(environment, workspace, own.digest)) ? cache.image(environment, workspace, own.digest)
+        : deltaAfterColdRestore ? yield* cache.parent(environment, workspace, own.digest)
+        : null;
+      const extended = parentImage === null || base === undefined ? null : { manifest: base, image: parentImage };
       // A live snapshot is taken whole, of no parent, where a delta of its parent would make a
       // chain due to be compacted: no live chain is compacted after (compactLater), as its
       // sandbox runs on and its next delta would be of this image whatever a compaction wrote,
       // so the chain the sandbox goes on extending is cut here. A whole save writes what a
       // compaction would, once, as part of a save made anyway, at the sandbox's pace, beside
       // the restore path, and with no second pass over the chain on the node.
-      const due = request.live === undefined || extended === null ? null : compactionDue(extended.layers, 1);
+      const due = request.live === undefined || extended === null ? null : compactionDue(extended.manifest.layers, 1);
       if (due !== null && extended !== null) {
-        yield* Effect.logInfo(`taking the snapshot ${snapshot} of ${prefixOf(request)} live whole, not as a delta of ${extended.snapshot}: with it, its chain would be due to be compacted, as ${due}`);
+        yield* Effect.logInfo(`taking the snapshot ${snapshot} of ${prefixOf(request)} live whole, not as a delta of ${extended.manifest.snapshot}: with it, its chain would be due to be compacted, as ${due}`);
       }
       const parent = due === null ? extended : null;
-      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.parent": parent?.snapshot ?? "" });
+      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.parent": parent?.manifest.snapshot ?? "" });
       yield* cache.room(memoryLimitOf(podTemplate), spared).pipe(Effect.flatMap(logEvicted));
       const staged = yield* cache.stage(environment, workspace, snapshot);
       return yield* commit(request, snapshot, takenAt, staged, parent, running, askedAt);
@@ -1609,7 +1633,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
 
   /**
-   * Saves the sandbox `request` names into `staged`, a delta of `parent`'s image if given,
+   * Saves the sandbox `request` names into `staged`, a delta of `parent`'s snapshot if given, of its image where it says,
    * and commits it as the snapshot `snapshot`: its manifest. What it staged goes if it fails.
    * Its save, as one asked at `askedAt`, where given, bounded while its sandbox loads
    * (boundWhileLoading); where its release bounds its waits for pages still loading
@@ -1617,11 +1641,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * run (loadWaitWatchdogMs), which loadWaitOf ends before the latest a revocation comes: a
    * watchdog, should runsc not defer it.
    */
-  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, container: RunningContainer, askedAt: number | null): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
+  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: ParentImage | null, container: RunningContainer, askedAt: number | null): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt | CommitOverdue> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, hook, podTemplate, live } = request;
       const { release } = container;
-      const [own] = parent?.layers ?? [];
       const hookSeconds = restoreHookSeconds(backgroundReadMs);
       const waits = yield* loadWaitOf(request, release, askedAt);
       // Of a release's save, where its bayma's hook says what it caught, found while the container's bundle says it, as the save
@@ -1639,7 +1662,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         imagePath: staged,
         hook,
         hookTimeout: `${hookSeconds}s`,
-        ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
+        ...(parent === null ? {} : { parentImagePath: parent.image }),
         live: live !== undefined,
         ...(waits === null ? {} : { loadWaitSeconds: waits }),
         ...(summaryFile === null ? {} : { summaryFile }),
@@ -1675,7 +1698,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image says runsc ${image.version} saved it, not ${runscVersion(release)}` });
       }
       // Each image it holds pages of is one of its parent's, whose files its manifest says.
-      const known = new Map((parent?.layers ?? []).map((layer) => [layer.digest, layer]));
+      const known = new Map((parent?.manifest.layers ?? []).map((layer) => [layer.digest, layer]));
       const referred = yield* Effect.forEach(digests, (digest) => {
         const layer = known.get(digest);
         return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
@@ -2363,6 +2386,49 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       );
     });
 
+  /**
+   * Keeps in the cache the pages metadata of the image `own` of the workspace's, as a restore of a snapshot of it from the
+   * bucket begins: one read of a small file beside the restore's, checked against the SHA-256 its manifest records of it, as
+   * a download of the image checks each file (./cache.ts keepParent). runsc takes the image's digest from it, the SHA-256 of
+   * its header, body and trailer, the page hashes after them left out. With it, the restored sandbox's next checkpoint is a
+   * delta of that image (take) before fetchLater has fetched it whole, after the restore has read it all. Kept as the
+   * workspace is held, the workspace spared from eviction meanwhile; what fails is said and counted, and leaves that
+   * checkpoint whole until then. In the agent's scope, a trace of its own, linked to the prepare's it began in.
+   */
+  const keepParentLater = (ref: WorkspaceRef, own: Layer): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const begunIn = currentTraceparent();
+      const { environment, workspace } = ref;
+      const counted = (outcome: string) => Effect.sync(() => parentsKept.add(1, { "alasio.node_agent.parent.outcome": outcome }));
+      const kept = Effect.gen(function*() {
+        const file = own.files.find(({ path }) => path === PAGES_METADATA_FILE);
+        if (file === undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${own.digest} has no ${PAGES_METADATA_FILE}, as its manifest says` });
+        if (yield* cache.holds(environment, workspace, own.digest)) return;
+        const directory = yield* cache.stageParent(environment, workspace, own.digest);
+        const got = yield* bucket.getFile(layerKey(ref, own.digest, file.path), join(directory, PAGES_METADATA_FILE), file.bytes);
+        if (got.bytes !== file.bytes || got.sha256 !== file.sha256) {
+          return yield* new SnapshotCorrupt({
+            environment,
+            workspace,
+            reason: `its image ${own.digest}'s ${PAGES_METADATA_FILE} is ${got.bytes} bytes of SHA-256 ${got.sha256}, where its manifest says ${file.bytes} bytes of ${file.sha256}`,
+          });
+        }
+        yield* exclusive([ref], cache.keepParent(environment, workspace, own.digest));
+      });
+      return inFlightWhile([ref], kept).pipe(
+        Effect.andThen(counted("kept")),
+        Effect.catch((error) =>
+          counted(error._tag).pipe(
+            Effect.andThen(Effect.logWarning(`could not keep the pages metadata of the image ${own.digest} of ${prefixOf(ref)} in the node's cache, so its next checkpoint is whole until the image is fetched: ${error.message}`)),
+          )
+        ),
+        withAlasioSpan("alasio.node_agent.parent", { attributes: { ...spanAttributes(ref), "alasio.snapshot.image": own.digest }, parent: null, links: begunIn === null ? [] : [begunIn] }),
+        withLogScope("node-agent"),
+        Effect.forkIn(scope),
+        Effect.asVoid,
+      );
+    });
+
   /** Fetches into the cache what fetchLater says, as it runs it in the background. */
   const fetchNow = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
     Effect.forEach(manifest.layers, (layer) =>
@@ -2515,6 +2581,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);
         if (reader !== null) yield* fetchLater(ref, manifest, reader);
+        if (reader !== null && deltaAfterColdRestore) yield* keepParentLater(ref, own);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));

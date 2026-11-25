@@ -18,7 +18,8 @@
  *   minute while one `hang-checkpoint` is, or waits while one `hold-checkpoint` is;
  * - `image inspect --json DIR`: describes the image, as saved by the release's runsc, whose
  *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
- *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's; or,
+ *   features of `image-cpu-features`, its digest that of its pages metadata but for the page
+ *   hashes after it, as runsc's; or,
  *   of an image in the bucket (DIR holding s3_opts.json), while a file `remote-inspect` is
  *   beside it, what the fork's runsc says of its test image (./runsc-image-inspect.json, a
  *   copy of runsc/cmd/image/testdata/inspect.json: two layers, 45056 bytes of pages), as
@@ -82,6 +83,12 @@ const read = (name, otherwise) => (existsSync(join(here, name)) ? readFileSync(j
 const rest = args.filter((arg) => !arg.startsWith("--root=") && !arg.startsWith("--systemd-cgroup="));
 const flag = (name) => rest.find((arg) => arg.startsWith("--" + name + "="))?.slice(name.length + 3);
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+// An image's pages metadata, as runsc writes it: its metadata, the image's digest the SHA-256 of it alone, then its page
+// hashes, which the digest leaves out.
+const metadataOf = (meta) => String(meta).split("\\n")[0];
+const metaOf = (meta) => JSON.parse(metadataOf(meta));
+const digestOf = (meta) => sha256(metadataOf(meta));
+const pagesMeta = (metadata, state) => JSON.stringify(metadata) + "\\n" + "page hashes of " + sha256(state);
 const containers = () => (existsSync(join(here, "..", "containers.json")) ? JSON.parse(readFileSync(join(here, "..", "containers.json"), "utf8")) : {});
 const stateOf = (id, { pid, bundle, annotations, status = "running" }) => ({ ociVersion: "1.0.2", id, status, pid, bundle, annotations });
 const checkpoint = () => {
@@ -92,13 +99,13 @@ const checkpoint = () => {
   if (parent !== undefined) {
     if (!existsSync(join(parent, "pages_meta.img"))) { process.stderr.write("checkpoint failed: the parent image " + parent + " has no pages metadata\\n"); process.exit(128); }
     const parentMeta = readFileSync(join(parent, "pages_meta.img"));
-    layers = [sha256(parentMeta), ...JSON.parse(parentMeta).layers];
+    layers = [digestOf(parentMeta), ...metaOf(parentMeta).layers];
   }
   mkdirSync(image, { recursive: true });
   // Each save its own state, as each sandbox's moment is.
   const state = "state of " + id + " at " + process.hrtime.bigint();
   writeFileSync(join(image, "checkpoint.img"), state);
-  writeFileSync(join(image, "pages_meta.img"), JSON.stringify({ state: sha256(state), layers }));
+  writeFileSync(join(image, "pages_meta.img"), pagesMeta({ state: sha256(state), layers }, state));
   // A delta holds what the sandbox wrote since its parent: an eighth of its memory, or what a file delta-pages-bytes says.
   writeFileSync(join(image, "pages.img"), Buffer.alloc(parent === undefined ? 4096 : Number(read("delta-pages-bytes", "512")), id));
   // Its summary, where asked, as image inspect and image layers describe the image, unless a file no-summary is beside it.
@@ -107,7 +114,7 @@ const checkpoint = () => {
     const meta = readFileSync(join(image, "pages_meta.img"));
     writeFileSync(summary, JSON.stringify({
       schema: 1,
-      image: { digest: sha256(meta), version: read("saved-by", "release-" + basename(here)), cpu_features: read("summary-cpu-features", read("image-cpu-features", "sse,avx")), layers, memory_files: [{ layer_bytes: [4096] }], files: [] },
+      image: { digest: digestOf(meta), version: read("saved-by", "release-" + basename(here)), cpu_features: read("summary-cpu-features", read("image-cpu-features", "sse,avx")), layers, memory_files: [{ layer_bytes: [4096] }], files: [] },
       save: { pause_ms: 1.5 },
       precopy: null,
       pages: null,
@@ -135,10 +142,10 @@ if (rest[0] === "checkpoint") {
     }
     const meta = readFileSync(join(image, "pages_meta.img"));
     process.stdout.write(JSON.stringify({
-      digest: sha256(meta),
+      digest: digestOf(meta),
       format: { major: 2, minor: 0 },
       state: { size: 10, metadata: { runsc_version: read("saved-by", "release-" + basename(here)), cpu_features: read("image-cpu-features", "sse,avx"), platform: "systrap" } },
-      layers: [{ pages_size: 4096, path: join(image, "pages.img") }, ...JSON.parse(meta).layers.map((digest) => ({ digest, pages_size: 4096, path: join(image, "layers", digest, "pages.img") }))],
+      layers: [{ pages_size: 4096, path: join(image, "pages.img") }, ...metaOf(meta).layers.map((digest) => ({ digest, pages_size: 4096, path: join(image, "layers", digest, "pages.img") }))],
       memory_files: [],
     }, null, 2) + "\\n");
   };
@@ -150,19 +157,19 @@ if (rest[0] === "checkpoint") {
   inspect();
 } else if (rest[0] === "image" && rest[1] === "layers") {
   const image = rest[rest.length - 1];
-  for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) process.stdout.write(digest + "\\n");
+  for (const digest of metaOf(readFileSync(join(image, "pages_meta.img"))).layers) process.stdout.write(digest + "\\n");
 } else if (rest[0] === "image" && rest[1] === "verify") {
   const image = rest[rest.length - 1];
   const failing = read("verify-status", "");
   if (failing !== "") { const [status, ...said] = failing.split(" "); process.stdout.write(said.join(" ") + "\\n"); process.exit(Number(status)); }
   const meta = readFileSync(join(image, "pages_meta.img"));
-  const { layers } = JSON.parse(meta);
+  const { layers } = metaOf(meta);
   for (const digest of layers) {
     const layer = join(image, "layers", digest, "pages_meta.img");
     if (!existsSync(layer)) { process.stderr.write("layer " + digest + " not found\\n"); process.exit(4); }
-    if (sha256(readFileSync(layer)) !== digest) { process.stderr.write("verify failed: layer " + digest + " is not the image of its digest\\n"); process.exit(3); }
+    if (digestOf(readFileSync(layer)) !== digest) { process.stderr.write("verify failed: layer " + digest + " is not the image of its digest\\n"); process.exit(3); }
   }
-  process.stdout.write("Image " + sha256(meta) + ": metadata and " + layers.length + " layers OK\\n");
+  process.stdout.write("Image " + digestOf(meta) + ": metadata and " + layers.length + " layers OK\\n");
 } else if (rest[0] === "image" && rest[1] === "compact") {
   const image = rest[rest.length - 1];
   const output = flag("output");
@@ -172,7 +179,7 @@ if (rest[0] === "checkpoint") {
     if (existsSync(join(here, "fail-compact"))) { process.stderr.write("compact failed: no space left on device\\n"); process.exit(128); }
     if (existsSync(output)) { process.stderr.write("compact failed: " + output + " exists\\n"); process.exit(1); }
     const pages = [readFileSync(join(image, "pages.img"))];
-    for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) {
+    for (const digest of metaOf(readFileSync(join(image, "pages_meta.img"))).layers) {
       const found = [join(image, "layers", digest), join(flag("layer-path"), digest)].find((each) => existsSync(join(each, "pages_meta.img")));
       if (found === undefined) { process.stderr.write("compact failed: layer " + digest + " not found\\n"); process.exit(1); }
       pages.push(readFileSync(join(found, "pages.img")));
@@ -180,7 +187,7 @@ if (rest[0] === "checkpoint") {
     mkdirSync(output);
     const state = readFileSync(join(image, "checkpoint.img"));
     writeFileSync(join(output, "checkpoint.img"), state);
-    writeFileSync(join(output, "pages_meta.img"), JSON.stringify({ state: sha256(state), layers: [], compacted: true }));
+    writeFileSync(join(output, "pages_meta.img"), pagesMeta({ state: sha256(state), layers: [], compacted: true }, state));
     writeFileSync(join(output, "pages.img"), Buffer.concat(pages));
   };
   if (existsSync(join(here, "hold-compact"))) {

@@ -339,6 +339,13 @@ const Snapshots = Schema.Struct({
    */
   onePassSaves: defaulted(Schema.Boolean, true),
   /**
+   * Whether a restore from the bucket keeps its snapshot's pages metadata on the node, all a
+   * delta of its image reads of it, so that the restored session's next save is a delta of it,
+   * as one restored from the node's cache's is, rather than its whole memory again until the
+   * node has fetched the image whole. Off unless set, until it is measured.
+   */
+  deltaAfterColdRestore: defaulted(Schema.Boolean, false),
+  /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
    * limit is at least that and its budget of what it holds written and not yet on the disk

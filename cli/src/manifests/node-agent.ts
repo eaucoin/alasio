@@ -33,6 +33,7 @@ import {
   backgroundReadSeconds,
   CONTAINERD,
   CPU_FEATURES_CONTAINER,
+  DELTA_AFTER_COLD_RESTORE_VARIABLE,
   GVISOR_RELEASE_VARIABLE,
   GVISOR_RELEASES,
   LOADING_STALL_SECONDS_VARIABLE,
@@ -163,6 +164,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               // How long a release's save of a sandbox its restore from the bucket still reads may see no byte of it served (src/node-agent/agent.ts).
               { name: LOADING_STALL_SECONDS_VARIABLE, value: String(durationSeconds(sessions.snapshots.loadingStallWait) ?? 0) },
               { name: ONE_PASS_SAVES_VARIABLE, value: String(sessions.snapshots.onePassSaves) },
+              { name: DELTA_AFTER_COLD_RESTORE_VARIABLE, value: String(sessions.snapshots.deltaAfterColdRestore) },
               // Workspace storage's metadata engine, which it sets workspaces' quotas on alone, as a user of its own there: no key of its object store.
               { name: META_URL_VARIABLE, valueFrom: { secretKeyRef: { name: WORKSPACE_QUOTAS, key: "metaurl" } } },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
