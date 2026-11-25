@@ -8,6 +8,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect } from "effect";
 
 import type { Pool } from "../binder/names.ts";
+import type { Guarded } from "../sandbox/node-agents.ts";
 import { meter } from "../telemetry/index.ts";
 
 export const RELEASES = "alasio.gateway.releases";
@@ -36,3 +37,15 @@ export const killedForMemory = (pod: V1Pod, container: string): boolean => {
 /** The memory limit of `pod`'s container `container`, as its spec gives it: null where it has none. */
 export const memoryLimitOf = (pod: V1Pod, container: string): string | null =>
   pod.spec?.containers.find(({ name }) => name === container)?.resources?.limits?.["memory"] ?? null;
+
+/**
+ * The memory the gVisor sandbox of `pod` ran out of, its container `container` ended with it, as
+ * its node's guard of its memory says what it did of it (`guarded`, ../node-agent/guard.ts; null where
+ * it did nothing, or its agent could not say): what it held as the guard ended it, its node having
+ * no more; the limit in force the guard set, less than its pod's, which its own cgroup's OOM ended
+ * it at; or else its pod's, as its spec gives it. In MiB, as a quantity; null where none is known.
+ */
+export const memoryRunOutOf = (pod: V1Pod, container: string, guarded: Pick<Guarded, "limitBytes" | "endedBytes"> | null): string | null => {
+  const bytes = guarded?.endedBytes ?? guarded?.limitBytes ?? null;
+  return bytes === null ? memoryLimitOf(pod, container) : `${Math.ceil(bytes / 1024 ** 2)}Mi`;
+};

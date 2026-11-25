@@ -124,6 +124,8 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "outlasts a
       prepare: unused, copy: unused, resume: unused, holdings: unused, held: unused, workspaces: unused, spend: unused, collect: unused, abandon: unused, restoreStandby: unused,
       // Each node's memory budget for what is held ahead has room, unless a test says otherwise.
       memoryBudget: () => Effect.succeed({ budgetBytes: 4 * 1024 ** 3, budgetedBytes: 0 }),
+      // The guard of each node's memory did nothing of its sandboxes, unless a test says otherwise.
+      guarded: () => Effect.succeed([]),
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, listEnvironments: unused(), quota: unused, sync: unused, bindFree: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
@@ -2186,6 +2188,37 @@ test("a bound pod whose sandbox was killed for its memory is released as oom, in
   await countedReleased(env.namespace, "oom", oomBefore);
   assert.equal(await releasedFor(env.namespace, "broken"), brokenBefore);
 });
+
+for (
+  const [how, guarded, ending, outOf] of [
+    ["at the limit its node's guard of its memory set, less than its pod's, that limit", { limitBytes: 1.5 * 1024 ** 3, endedBytes: null }, { exitCode: 137, reason: "OOMKilled" }, "1536Mi"],
+    ["by its node's guard of its memory, as its node had no more, what it held then", { limitBytes: null, endedBytes: 3 * 1024 ** 3 + 1 }, { exitCode: 137, reason: "Error" }, "3073Mi"],
+  ] as const
+) {
+  test(`a bound pod whose sandbox was killed for its memory ${how} is recorded with it, its release as oom`, async () => {
+    const env = await environment(1, { gvisor: true, memoryLimit: "4Gi" });
+    const recorded = agents();
+    let saved = false;
+    const guardedOn: string[] = [];
+    const live = {
+      ...recorded.agents,
+      current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/attach/ws/home/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null),
+      guarded: (node: string) => Effect.sync(() => (guardedOn.push(node), [{ namespace: env.namespace, pod: "another", limitBytes: 1024 ** 3, endedBytes: 1024 ** 3 }, { namespace: env.namespace, pod: bound.pod, ...guarded }])),
+    };
+    const { binder, sessions } = await sessionsOf(options(env, 7291), live);
+    const key = sessionKey("fs-guarded");
+    const oomBefore = await releasedFor(env.namespace, "oom");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    saved = true;
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: ending } }] } })));
+    await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+    for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
+    assert.deepEqual(recorded.asked, [`record ${env.namespace}/fs-guarded released into s-live, out of ${outOf}`, `detach node-a ${env.namespace}/${bound.pod}`]);
+    assert.deepEqual(guardedOn, ["node-a"]);
+    await countedReleased(env.namespace, "oom", oomBefore);
+  });
+}
 
 test("a bound pod whose workspace its node can reach no more, as its node's mount of workspace storage ended under it, is released as broken, into the snapshot taken of it live; one whose workspace is reachable is kept", async () => {
   const env = await environment(2, { gvisor: true });

@@ -75,7 +75,7 @@ import { isValidVolumeId, sessionKey, volumeIdOfKey } from "../sandbox/names.ts"
 import { type Attributes, meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
 import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
-import { killedForMemory, memoryLimitOf, released } from "./releases.ts";
+import { killedForMemory, memoryRunOutOf, released } from "./releases.ts";
 import { BaymaStatus, makeGatewaySnapshots } from "./snapshots.ts";
 
 /** The metrics of the gateway's sessions, as the module says. */
@@ -390,6 +390,13 @@ export const makeSessions = Effect.fnUntraced(function*(
         unreachableOn.set(node, pods);
         return pods;
       });
+    // What the guard of its node's memory did of the sandbox of the pod `pod` of `namespace`, asked only of one whose bayma
+    // ended; null where it did nothing, or its node's agent cannot be asked.
+    const guardedOf = (namespace: string, pod: V1Pod) =>
+      agents.guarded(pod.spec?.nodeName ?? "").pipe(
+        Effect.map((sandboxes) => sandboxes.find((sandbox) => sandbox.namespace === namespace && sandbox.pod === pod.metadata?.name) ?? null),
+        Effect.catch((error) => Effect.as(Effect.logWarning(`could not ask ${pod.spec?.nodeName ?? ""} what the guard of its memory did of ${pod.metadata?.name}: ${error.message}`), null)),
+      );
     for (const pool of yield* pools) {
       const bound = boundIn.get(pool.namespace) ?? new Set<string>();
       boundIn.set(pool.namespace, bound);
@@ -402,9 +409,11 @@ export const makeSessions = Effect.fnUntraced(function*(
         const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
         const ended = bayma !== undefined && (bayma.restartCount > 0 || bayma.state?.terminated !== undefined);
         if (ended || (yield* unreachable(pod.spec?.nodeName ?? "")).has(`${pool.namespace}/${pod.metadata?.name ?? ""}`)) {
-          // Killed for its memory, the whole sandbox, as gVisor runs it as one process on the node.
-          const killed = ended && killedForMemory(pod, BAYMA_CONTAINER);
-          const memoryLimit = killed ? memoryLimitOf(pod, BAYMA_CONTAINER) : null;
+          // Killed for its memory, the whole sandbox, as gVisor runs it as one process on the node: by the kernel, at its own
+          // limit or the one its node's guard of its memory set; or by that guard, as its node had no more.
+          const guarded = ended ? yield* guardedOf(pool.namespace, pod) : null;
+          const killed = ended && (killedForMemory(pod, BAYMA_CONTAINER) || (guarded?.endedBytes ?? null) !== null);
+          const memoryLimit = killed ? memoryRunOutOf(pod, BAYMA_CONTAINER, guarded) : null;
           const why = killed ? `sandbox ran out of its memory (${memoryLimit ?? "its limit"}) in its pod` : ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
           yield* Effect.logWarning(`${key}'s ${why} ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
           yield* Effect.forkDetach(releaseFor(pool, key, pod, killed ? "oom" : "broken", () =>

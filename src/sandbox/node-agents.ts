@@ -75,6 +75,11 @@ export type Prepared = typeof Prepared.Type;
 const MemoryBudget = Schema.Struct({ budgetBytes: Schema.Number, budgetedBytes: Schema.Number });
 export type MemoryBudget = typeof MemoryBudget.Type;
 
+/** What a node's guard of its memory did of a sandbox of late, as its agent says (../node-agent/guard.ts GuardRecord). */
+const Guarded = Schema.Struct({ namespace: Schema.String, pod: Schema.String, limitBytes: Schema.NullOr(Schema.Number), endedBytes: Schema.NullOr(Schema.Number) });
+export type Guarded = typeof Guarded.Type;
+const GuardedSandboxes = Schema.Struct({ sandboxes: Schema.Array(Guarded) });
+
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
@@ -161,6 +166,8 @@ export interface NodeAgents {
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
   /** What `node`'s memory budget for what is held ahead of a session's need is, and what is held so, as its agent says now. */
   readonly memoryBudget: (node: string) => Effect.Effect<MemoryBudget, NodeAgentError | KubeApiError>;
+  /** What the guard of `node`'s memory did of its sandboxes of late, the limit in force it set and what one it ended held, as its agent says now. */
+  readonly guarded: (node: string) => Effect.Effect<readonly Guarded[], NodeAgentError | KubeApiError>;
   /**
    * What `node` holds, as its agent last said it: kept as it changes, by a request its agent
    * answers once it does (watchHoldings), so a restore's choice of its node asks no agent;
@@ -585,6 +592,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       ),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
     memoryBudget: (node) => ask(node, "say what its node's memory holds", { method: "GET", path: "/memory", timeout: SHORT_CALL }, MemoryBudget),
+    guarded: (node) => ask(node, "say what the guard of its node's memory did", { method: "GET", path: "/memory/guard", timeout: SHORT_CALL }, GuardedSandboxes).pipe(Effect.map(({ sandboxes }) => sandboxes)),
     held: (node) =>
       Effect.suspend(() => {
         const known = kept.get(node);

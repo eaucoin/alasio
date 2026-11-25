@@ -126,6 +126,9 @@
  *   kubelet made it no directory, 409 where it has a binding already, or a mount.
  * - `GET /attachments`: `{ attachments: [{ namespace, pod, reachable }] }`, the pods of this node a
  *   workspace is attached into, each by whether what is attached is reachable still (./workspaces.ts).
+ * - `GET /memory/guard`: `{ sandboxes: [{ namespace, pod, limitBytes, endedBytes, at }] }`, what
+ *   the guard of the node's memory did of its sandboxes of late: the limit in force it set, and
+ *   what one it ended held (./guard.ts GuardRecord) (200).
  * - `POST /stop`, `{ namespace, pod, containerId, hook }`: has the bayma of the bound pod
  *   `namespace`/`pod` of a pool on this node, its container `containerId`, go on with the stop
  *   it holds, by `hook`, its `sandbox-hook stop`, run in it (./workspaces.ts) (204); 403 for a
@@ -182,7 +185,7 @@ import {
 } from "./agent.ts";
 import { convergeAttachments } from "./attachments.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
-import { guardNodeMemory } from "./guard.ts";
+import { guardNodeMemory, GuardRecords } from "./guard.ts";
 import { makeHostCommands } from "./host.ts";
 import { makeJuicefs } from "./juicefs.ts";
 import { makeWorkspaces, Released, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
@@ -232,6 +235,8 @@ export interface NodeAgentServerOptions {
   readonly standbys?: StandbyRestores;
   /** What the node's memory holds (./memory.ts nodeMemory), as `GET /memory` answers it; none unless given. */
   readonly memory?: Effect.Effect<NodeMemory>;
+  /** What the guard of the node's memory did of its sandboxes (./guard.ts GuardRecords), as `GET /memory/guard` answers it; none unless given. */
+  readonly guard?: GuardRecords;
 }
 
 /** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
@@ -362,6 +367,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   workspaces,
   standbys = makeStandbyRestores(),
   memory,
+  guard,
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
   const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred | SaveDeferred>(scope, failureOf);
@@ -489,6 +495,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "GET" && url === "/memory") {
       return memory === undefined ? Effect.succeed(answer(501, { error: "this node agent reads no memory of its node" })) : Effect.map(memory, (read) => answer(200, read));
+    }
+    if (method === "GET" && url === "/memory/guard") {
+      return Effect.succeed(guard === undefined ? answer(501, { error: "this node agent guards no memory of its node" }) : answer(200, { sandboxes: guard.all() }));
     }
     if (method === "GET" && url === "/attachments") return workspaces.attachments.pipe(Effect.map((attachments) => answer(200, { attachments })));
     if (method === "POST" && url === "/sync") {
@@ -660,8 +669,9 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   // What the node's memory holds, its sandboxes' and the budget of what is held ahead, as gauges and as its API answers it.
   const memory = { runsc, nodeRoot: NODE_ROOT, attachRoot: ATTACH_ROOT };
   yield* observeNodeMemory(memory);
-  yield* guardNodeMemory(memory);
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, memory: nodeMemory(memory) });
+  const guard = new GuardRecords();
+  yield* guardNodeMemory({ ...memory, records: guard });
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, memory: nodeMemory(memory), guard });
   // What is attached on the node, kept to the pods the cluster has on it.
   yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
   // As it stops, before its API does: its restores' reads of the bucket done first.
