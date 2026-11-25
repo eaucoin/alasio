@@ -240,7 +240,7 @@ export async function sourceOf(node: string, pod: V1Pod, prepared: string): Prom
 /** What the node agent of `node` and the sandbox gateway logged of `workspace`, timestamped: their last lines of it, which say where a restore spent its time. */
 export async function loggedOf(node: string, workspace: string): Promise<{ readonly agent: string[]; readonly gateway: string[] }> {
   const of = async (pod: string, container: string) =>
-    (await kube.logs(NAMESPACE, pod, container, { timestamps: true }).catch(() => "")).split("\n").filter((line) => line.includes(workspace)).slice(-25).map((line) => line.slice(0, 400));
+    (await kube.logs(NAMESPACE, pod, container, { timestamps: true }).catch(() => "")).split("\n").filter((line) => line.includes(workspace)).slice(-25).map((line) => line.slice(0, 4000));
   return { agent: await of((await nodeAgents()).get(node) ?? "", "node-agent"), gateway: await of(await kube.runningPod(NAMESPACE, GATEWAY), "sandbox-gateway") };
 }
 
