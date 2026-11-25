@@ -42,7 +42,7 @@ import {
   standbyArm, standbyFor,
 } from "./alasio.ts";
 import { mixedLoad } from "./mixed.ts";
-import { bootLog, bootLogs, bucketBytes, countStore, dropPageCache, inAgentNetwork, k3sReady, probeStore, sandboxIdOf, sayK3sRestarted, sayRunner, shapeAgents, storeBytes, vacuum } from "./node.ts";
+import { bootLog, bootLogs, bucketBytes, settle, countStore, dropPageCache, inAgentNetwork, k3sReady, probeStore, sandboxIdOf, sayK3sRestarted, sayRunner, shapeAgents, storeBytes, vacuum } from "./node.ts";
 import { emit, emitSpans, type Phase, type Result, store } from "./results.ts";
 import { probeExecMs, type Probed, restore, restoreBefore, restoreOutcome, restoreSpanMetrics } from "./restore.ts";
 import { saveLogged } from "./runsc-log.ts";
@@ -225,10 +225,13 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     const cacheRemoved = await coldCaches(workspace);
     const coldStandby = await standbyFor(node, standbyArm(run));
     const coldBeside = load === null ? null : await load.beside("cold");
+    // Spike: the node quiet first, where BENCH_SETTLE says so.
+    const settled = process.env["BENCH_SETTLE"] ? await settle(node) : null;
+    if (settled !== null) console.log(`# ${fixture} ${sizeMib} MiB run ${run}: ${settled.said}`);
     const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
     hold({
       fixture, sizeMib, run, phase: "restore-cold", ...restoreOutcome(cold, "bucket"), metrics: cold.metrics, correctness: cold.probed.correctness,
-      details: { ...cold.details, standby_before: coldStandby, cache_removed: cacheRemoved, mixed: coldBeside === null ? null : await coldBeside() },
+      details: { ...cold.details, standby_before: coldStandby, cache_removed: cacheRemoved, mixed: coldBeside === null ? null : await coldBeside(), settle: settled },
     }, cold.window.fromMs, cold.window.toMs);
     await endUnsaved(workspace, cold.pod);
     phase = "done";
