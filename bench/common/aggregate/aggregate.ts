@@ -99,8 +99,8 @@ const SHOWN: Readonly<Record<string, readonly string[]>> = {
   "exec-running": ["exec_running_ms", "probe_exec_ms", "verify_ms"],
   "save-live": ["save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "uploaded_bytes"],
   "save-stop": ["save_total_ms", "pause_reported_ms", "precopy_passes", "uploaded_bytes"],
-  "restore-warm": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "memory_bytes"],
-  "restore-cold": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "memory_bytes"],
+  "restore-warm": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "memory_bytes", "memory_file_bytes", "sandbox_overhead_bytes", "node_agent_memory_bytes"],
+  "restore-cold": ["first_exec_ms", "resident_ms", "verify_ms", "memory_peak_bytes", "memory_bytes", "memory_file_bytes", "sandbox_overhead_bytes", "node_agent_memory_bytes"],
   "save-after-cold": ["save_total_ms", "unavailable_ms", "pause_reported_ms", "uploaded_bytes", "image_bytes"],
   "turn-replay": ["turn_wait_ms", "added_latency_ms", "probe_exec_ms"],
 };
