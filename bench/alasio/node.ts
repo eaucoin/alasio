@@ -66,7 +66,10 @@ export async function podMemory(node: string, uid: string): Promise<{ readonly p
  */
 export async function storeBytes(node: string): Promise<{ readonly sent: number; readonly received: number }> {
   const listed = await onNode(node, `nsenter --target ${await agentPid(node)} --net sh -c 'iptables -L ${STORE_CHAIN} -v -x -n'`);
-  const bytes = (direction: string) => Number(listed.split("\n").find((line) => line.includes(`/* ${direction} */`))?.trim().split(/\s+/u)[1] ?? NaN);
+  // Spike: and the node's own, as a restore's checkpoint gofer reading by URLs sends and receives them.
+  const own = await onNode(node, `iptables -L ${STORE_CHAIN} -v -x -n`);
+  const bytes = (direction: string) =>
+    [listed, own].reduce((sum, each) => sum + Number(each.split("\n").find((line) => line.includes(`/* ${direction} */`))?.trim().split(/\s+/u)[1] ?? NaN), 0);
   return { sent: bytes("sent"), received: bytes("received") };
 }
 
@@ -80,6 +83,13 @@ export async function countStore(node: string): Promise<void> {
     `${inNetns} iptables -A ${STORE_CHAIN} ! -i lo -s ${address} -p tcp --sport 8333 -m comment --comment received`,
     `${inNetns} iptables -I OUTPUT -j ${STORE_CHAIN}`,
     `${inNetns} iptables -I INPUT -j ${STORE_CHAIN}`,
+    // Spike: the node's own, its connections to the Service's address as they were made, which kube-proxy sends on to a
+    // pod's, the toxiproxy's of the node's on the emulated profiles, not what lo carries to it.
+    `iptables -N ${STORE_CHAIN}`,
+    `iptables -A ${STORE_CHAIN} ! -o lo -p tcp -m conntrack --ctorigdst ${address} --ctorigdstport 8333 --ctdir ORIGINAL -m comment --comment sent`,
+    `iptables -A ${STORE_CHAIN} ! -i lo -p tcp -m conntrack --ctorigdst ${address} --ctorigdstport 8333 --ctdir REPLY -m comment --comment received`,
+    `iptables -I OUTPUT -j ${STORE_CHAIN}`,
+    `iptables -I INPUT -j ${STORE_CHAIN}`,
   ].join(" && "));
 }
 
@@ -246,6 +256,12 @@ export async function shapeAgents(): Promise<void> {
     await onNode(node, `${inNetns} iptables -t nat -A OUTPUT -p tcp -d ${address} --dport 8333 -m owner ! --uid-owner ${PROXY_UID} -j DNAT --to-destination 127.0.0.1:28333`);
     // Started again in its pod, whose network namespace, the rule and the proxy in it, stays.
     await onNode(node, `kill ${pid}`);
+    // Spike: and the node's own connections to the store, as a restore's checkpoint gofer reads it by URLs from the node's
+    // network, shaped alike by a toxiproxy of the node's, ahead of kube-proxy's rule of the Service.
+    await onNode(node, `setpriv --reuid=${PROXY_UID} --regid=${PROXY_UID} --clear-groups ${server} -host 127.0.0.1 -port 8475 >${BENCH_DIR}/logs/toxiproxy-host-${node}.log 2>&1 &`);
+    await onNode(node, `for _ in $(seq 50); do curl -fsS http://127.0.0.1:8475/version && exit 0; sleep 0.2; done; exit 1`);
+    await onNode(node, `${process.execPath} ${shape} --api http://127.0.0.1:8475 --profile ${PROFILE} --listen 127.0.0.1:28334 --upstream ${address}:8333`);
+    await onNode(node, `iptables -t nat -I OUTPUT 1 -p tcp -d ${address} --dport 8333 -m owner ! --uid-owner ${PROXY_UID} -j DNAT --to-destination 127.0.0.1:28334`);
   }
   for (const deadline = Date.now() + 300_000; ; await sleep(2000)) {
     const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
