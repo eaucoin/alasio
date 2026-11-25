@@ -233,7 +233,7 @@ describe("configuration", () => {
       stopWait: "60s",
       loadingStallWait: "90s",
       nodeCache: "5Gi",
-      onePassSaves: false,
+      onePassSaves: true,
       nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
   });
@@ -2628,7 +2628,7 @@ describe("node agents", () => {
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
       ALASIO_LOADING_STALL_SECONDS: "90",
-      ALASIO_ONE_PASS_SAVES: "false",
+      ALASIO_ONE_PASS_SAVES: "true",
       META_URL: { secretKeyRef: { name: "alasio-workspaces-quotas", key: "metaurl" } },
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
@@ -2640,7 +2640,7 @@ describe("node agents", () => {
     // A minute at least, however small a session.
     assert.equal(env({ sessions: { resources: { limits: { memory: "64Mi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "60");
     assert.equal(env({ sessions: { snapshots: { loadingStallWait: "2m" } } })["ALASIO_LOADING_STALL_SECONDS"], "120");
-    assert.equal(env({ sessions: { snapshots: { onePassSaves: true } } })["ALASIO_ONE_PASS_SAVES"], "true");
+    assert.equal(env({ sessions: { snapshots: { onePassSaves: false } } })["ALASIO_ONE_PASS_SAVES"], "false");
     // Without a collector, it exports nothing.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
   });
