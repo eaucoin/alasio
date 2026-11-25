@@ -89,6 +89,9 @@ const ImageInspection = Schema.Struct({
   memory_files: Schema.optional(Schema.Array(Schema.Struct({ layer_bytes: Schema.Array(Schema.Number) }))),
 });
 
+/** What `runsc fail-load` says: how many loads it ended. */
+const FailedLoads = Schema.Struct({ ended: Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)) });
+
 /**
  * What `runsc state` says of a container, as far as the agent reads it: its status, its sandbox's process, -1 or none for a
  * container not running (runsc/container/container.go SandboxPid), its bundle, and its spec's annotations.
@@ -296,6 +299,15 @@ export interface Runsc {
   readonly compact: (release: string, options: CompactOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** Waits until the restore of a container, by its runtime's id, has read every page of its image, as `runsc wait --restore` does. */
   readonly restored: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /**
+   * Ends the loading in the background of the pages of the restore of a container's sandbox, by
+   * the container's runtime's id, as a failed read of them ends it, `runsc fail-load`, for
+   * `reason`, which the sandbox logs, whatever the store answers: the pages not loaded yet are
+   * never loaded, and a save of the sandbox that waits for them fails at once ("previous async
+   * page loading failed"). How many loads it ended: none where the sandbox loads none. One not
+   * done within KILL_TIMEOUT_MS (RunscOptions.killTimeoutMs) fails, its runsc killed.
+   */
+  readonly failLoad: (release: string, containerId: string, reason: string) => Effect.Effect<number, RunscError | ReleaseNotInstalled>;
   /**
    * Whether this node's `release` restores the image at `imagePath`, its layers where a
    * restore finds them, as `runsc image verify --host` says: whole (the checksums and
@@ -529,6 +541,17 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
       run(release, ["image", "compact"], [`--output=${output}`, `--layer-path=${layerPath}`, "--working-set-first", imagePath], true, pausing).pipe(Effect.asVoid),
 
     restored: (release, containerId) => run(release, ["wait"], ["--restore", containerId]).pipe(Effect.asVoid),
+
+    failLoad: (release, containerId, reason) =>
+      run(release, ["fail-load"], [`--reason=${reason}`, containerId]).pipe(
+        Effect.timeoutOrElse({ duration: killTimeoutMs, orElse: () => Effect.fail(new RunscError({ release, command: `fail-load ${containerId}`, reason: `it did not end within ${killTimeoutMs / 1000} s` })) }),
+        Effect.flatMap(({ stdout }) =>
+          Effect.try({
+            try: () => Schema.decodeUnknownSync(FailedLoads)(JSON.parse(stdout)).ended,
+            catch: (cause) => new RunscError({ release, command: `fail-load ${containerId}`, reason: `it said no number of loads ended: ${String(cause)}` }),
+          })
+        ),
+      ),
 
     container: (containerId) =>
       Effect.gen(function*() {
