@@ -20,7 +20,7 @@
     "profile": { "enum": ["local", "s3-standard", "s3-express"] },
     "emulated": { "type": "boolean" },
     "run": { "type": "integer", "minimum": 1 },
-    "phase": { "enum": ["exec-running", "save-live", "save-stop", "restore-warm", "restore-cold", "turn-replay"] },
+    "phase": { "enum": ["exec-running", "save-live", "save-stop", "restore-warm", "restore-cold", "save-after-cold", "turn-replay"] },
     "tier": { "enum": ["T0", "T3", "T4", null] },
     "ok": { "type": "boolean" },
     "failure": { "type": ["string", "null"] },

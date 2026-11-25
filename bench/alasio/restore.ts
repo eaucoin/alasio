@@ -48,9 +48,10 @@ const RESTORE_BOUND_MS = 300_000;
  * A restore of the workspace from its snapshot `manifest` through the gateway, its first request
  * the probe's, on `node`, whose agent restores it: its result's measures, checks and details, its
  * pod, and its window on the wall clock, from its t0 to its first exec's answer. A cold one's bytes
- * from the store are counted until the fetch it starts is through.
+ * from the store are counted until the fetch it starts is through. `during`, where given, runs once
+ * every page of it is resident, before that fetch is through: what it answers, as `during`.
  */
-export async function restore(node: string, workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest, kind: "warm" | "cold") {
+export async function restore<D = null>(node: string, workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest, kind: "warm" | "cold", during?: () => Promise<D>) {
   const storeBefore = await storeBytes(node);
   const diskBefore = await diskReadBytes(node);
   // Settled whatever comes of the probe, which fails a restore that never answers before its pod is seen.
@@ -61,6 +62,7 @@ export async function restore(node: string, workspace: string, sessionId: string
   const settled = await watching;
   if ("error" in settled) throw settled.error;
   const { residentNs, pod, error } = settled.watched;
+  const duringIt = during === undefined ? null : await during();
   const diskRead = (await diskReadBytes(node)) - diskBefore;
   const storeReceived = (kind === "cold" ? await storeQuiet(node) : (await storeBytes(node)).received) - storeBefore.received;
   const name = pod.metadata?.name ?? "";
@@ -109,7 +111,7 @@ export async function restore(node: string, workspace: string, sessionId: string
     memory_stat: memory.stat, agent_memory: agentMemory, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
     ...(timeline === null ? {} : { pod_timeline: await timeline.stop(pod) }),
   };
-  return { probed, metrics, details, pod: name, window };
+  return { probed, metrics, details, pod: name, window, during: duringIt };
 }
 
 /**
