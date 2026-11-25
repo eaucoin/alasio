@@ -144,17 +144,19 @@ export interface SnapshotCache {
    */
   readonly stamped: (environment: string, workspace: string, digest: string) => Effect.Effect<readonly CheckedFile[] | null, CacheError>;
   /**
-   * Where the pages metadata of the image `digest` of the workspace is written until it is kept
-   * (keepParent), `PAGES_METADATA_FILE` in it, emptied first: none of the workspace's images.
+   * A directory of its own, made now, where the pages metadata of the image `digest` of the workspace is written until it is
+   * kept (keepParent), `PAGES_METADATA_FILE` in it: one for each writer however many write it at once, none of them another's.
    */
   readonly stageParent: (environment: string, workspace: string, digest: string) => Effect.Effect<string, CacheError>;
   /**
-   * Keeps the pages metadata staged of the image `digest` (stageParent), what a delta of that
-   * image needs of it, unless the cache holds the image whole, the staged one removed then.
+   * Keeps the pages metadata of the image `digest` staged in `staged` (stageParent), what a delta of that image needs of it,
+   * in place of any kept before; unless the cache holds the image whole, the staged one and any kept before removed then.
    */
-  readonly keepParent: (environment: string, workspace: string, digest: string) => Effect.Effect<void, CacheError>;
+  readonly keepParent: (environment: string, workspace: string, digest: string, staged: string) => Effect.Effect<void, CacheError>;
   /** The directory holding the pages metadata the cache keeps of the image `digest` of the workspace (keepParent), or null where it keeps none. */
   readonly parent: (environment: string, workspace: string, digest: string) => Effect.Effect<string | null, CacheError>;
+  /** Removes the pages metadata the cache keeps of the image `digest` of the workspace (keepParent), as one not what it was or of an image it holds whole. */
+  readonly dropParent: (environment: string, workspace: string, digest: string) => Effect.Effect<void, CacheError>;
   /** Whether the image `digest` of the workspace is whole in the cache. */
   readonly holds: (environment: string, workspace: string, digest: string) => Effect.Effect<boolean, CacheError>;
   /**
@@ -209,7 +211,7 @@ export interface SnapshotCache {
    * workspaces as `evict` does: those evicted. Fails, saying so, where it cannot.
    */
   readonly room: (bytes: number, spared: Spared) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
-  /** Removes what was left half written, and the copies left (remoteCopy, chainCopy). */
+  /** Removes what was left half written, the copies left (remoteCopy, chainCopy), and pages metadata kept of an image held whole. */
   readonly clean: Effect.Effect<void, CacheError>;
 }
 
@@ -371,29 +373,32 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
 
     stageParent: (environment, workspace, digest) => {
       checked(environment, workspace, null, [digest]);
-      const directory = join(workspaceDir(environment, workspace), PARENTS_DIR, staged(digest));
+      const parents = join(workspaceDir(environment, workspace), PARENTS_DIR);
       return attempt(async () => {
-        await rm(directory, { recursive: true, force: true });
-        await mkdir(directory, { recursive: true });
-        return directory;
+        await mkdir(parents, { recursive: true });
+        // Its name begins with ".", as what is half written does, so the next agent removes one a stopped agent left.
+        return await mkdtemp(join(parents, `${staged(digest)}-`));
       });
     },
 
-    keepParent: (environment, workspace, digest) => {
+    keepParent: (environment, workspace, digest, from) => {
       const target = parentDir(environment, workspace, digest);
-      const from = join(workspaceDir(environment, workspace), PARENTS_DIR, staged(digest));
+      if (relative(join(workspaceDir(environment, workspace), PARENTS_DIR), from).startsWith("..")) {
+        throw new Error(`the snapshot cache keeps no pages metadata staged in ${JSON.stringify(from)}`);
+      }
       return holds(environment, workspace, digest).pipe(
         Effect.flatMap((held) =>
           attempt(async () => {
-            if (held) return rm(from, { recursive: true, force: true });
-            // One kept already is the same file, as its digest says.
             await rm(target, { recursive: true, force: true });
+            if (held) return rm(from, { recursive: true, force: true });
             await rename(from, target);
           })
         ),
         Effect.andThen(use(environment, workspace)),
       );
     },
+
+    dropParent: (environment, workspace, digest) => attempt(() => rm(parentDir(environment, workspace, digest), { recursive: true, force: true })),
 
     parent: (environment, workspace, digest) =>
       attempt(() => directories(join(workspaceDir(environment, workspace), PARENTS_DIR))).pipe(
@@ -573,6 +578,12 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
             const directory = join(workspaceDir(environment, workspace), under);
             const entries = await readdir(directory).catch(() => [] as string[]);
             await Promise.all(entries.filter((name) => name.startsWith(".")).map((name) => rm(join(directory, name), { recursive: true, force: true })));
+          }
+          // The pages metadata kept of an image the cache holds whole, as an agent that stopped between the image's commit and its
+          // removal left it.
+          const held = await directories(join(workspaceDir(environment, workspace), LAYERS_DIR));
+          for (const digest of (await directories(join(workspaceDir(environment, workspace), PARENTS_DIR))).filter((name) => held.includes(name))) {
+            await rm(join(workspaceDir(environment, workspace), PARENTS_DIR, digest), { recursive: true, force: true });
           }
         }
       }
