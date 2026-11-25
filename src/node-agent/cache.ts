@@ -26,8 +26,10 @@
  * and its size, inode and modification time then. An image whose files are of those still
  * is taken as the one checked, without reading it again (stamped). An image whose pages file
  * a restore from the bucket wrote as it read it (stagePages) holds only the pages one image
- * refers to, which its stamp names (pagesFor): its pages file was checked page by page, not
- * by its SHA-256, and its other files are whole. A modification time is of
+ * refers to, which its stamp names (pagesFor), and only the files a restore of that image reads
+ * of it: its pages file, checked page by page, not by its SHA-256, and its other files whole,
+ * of which, where it was a layer of that image's, its pages metadata alone, as a restore reads
+ * nothing else of a layer. A modification time is of
  * the filesystem's granularity, so a file put in its place of the same size, on an inode used
  * again, within one tick of it, is not seen: what holds the image whole there is runsc's
  * verify of it as it is staged or prepared and the SHA-256 of each file as it is downloaded.
@@ -95,7 +97,8 @@ const Stamp = Schema.fromJsonString(Schema.Struct({
 /**
  * An image as its stamp records it: its files as checked, each as its manifest says it, and,
  * where its pages file holds only the pages the image `pagesFor` refers to, as a restore from
- * the bucket wrote it, that image's digest; null for a whole copy.
+ * the bucket wrote it, that image's digest, its files then only those a restore of that image
+ * read of it; null for a whole copy, of every file.
  */
 export interface StampedImage {
   readonly files: readonly CheckedFile[];
