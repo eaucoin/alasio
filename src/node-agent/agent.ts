@@ -113,7 +113,7 @@ import { quantityOf } from "../kube/quantity.ts";
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { currentTraceparent, meter, withAlasioSpan, withWaitSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
-import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, PAGE_BYTES, PAGES_FILE, type PagesMarks, type SnapshotCache, type StagedPages } from "./cache.ts";
+import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, PAGE_BYTES, PAGES_FILE, PAGES_METADATA_FILE, type PagesMarks, type SnapshotCache, type StagedPages, type StampedImage } from "./cache.ts";
 import { Restores } from "./guard.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
@@ -1182,6 +1182,15 @@ function etagsOf(layers: readonly Layer[]): Record<string, string> {
 /** Whether `found`, an image's files on the disk, are `layer`'s. */
 const sameFiles = (found: readonly ImageFile[], layer: Layer): boolean =>
   JSON.stringify(found) === JSON.stringify(layer.files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })));
+
+/**
+ * The files of `layer`, an image of a snapshot's chain, that the snapshot's restore reads:
+ * every one where it is the snapshot's own image (`own`); its pages and their metadata alone
+ * where it is a layer, as runsc reads nothing else of a layer, and its checkpoint gofer serves
+ * nothing else of one.
+ */
+const filesRead = (layer: Layer, own: boolean): Layer["files"] =>
+  layer.files.filter(({ path }) => own || path === PAGES_FILE || path === PAGES_METADATA_FILE);
 
 /**
  * The most memory the pod of `podTemplate` may hold, as its containers' limits say, which
@@ -2263,20 +2272,34 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * reads those pages.
    *
    * A copy whose pages file a restore from the bucket wrote holds only the pages its image
-   * referred to (pagesFor): intact for a snapshot whose chain, `chain`, holds that image, as
-   * each image saved after it refers in it to those pages alone; not for another, as one of
-   * a branch the workspace left.
+   * referred to (pagesFor), and only the files that restore read of it (filesRead): intact for
+   * a snapshot whose chain, `chain`, holds that image, as each image saved after it refers in it
+   * to those pages alone, and that reads no file of it the copy lacks, as one whose own image it
+   * is, where it was a layer, would its checkpoint state; not for another, as one of a branch the
+   * workspace left.
    */
   const intact = (ref: WorkspaceRef, layer: Layer, chain: readonly string[]): Effect.Effect<boolean, CacheError> =>
     Effect.gen(function*() {
       const { environment, workspace } = ref;
       if (!(yield* cache.holds(environment, workspace, layer.digest))) return false;
       const stamped = yield* cache.stamped(environment, workspace, layer.digest);
-      if (stamped !== null && sameFiles(stamped.files, layer) && (stamped.pagesFor === null || chain.includes(stamped.pagesFor))) return true;
+      if (stamped !== null && (stamped.pagesFor === null ? sameFiles(stamped.files, layer) : pagesCopyServes(stamped, layer, chain))) return true;
       yield* Effect.logWarning(`the node's cached copy of the image ${layer.digest} of ${prefixOf(ref)} is not what its manifest says, or has changed since it was checked: it is read again from the bucket`);
       yield* cache.drop(environment, workspace, layer.digest);
       return false;
     });
+
+  /**
+   * Whether `stamped`, a copy of `layer` whose pages file a restore wrote (pagesFor), serves a
+   * restore of the snapshot of `chain`: it holds that image's pages, each of its files is the
+   * manifest's, and it holds every file the restore reads of it (filesRead).
+   */
+  const pagesCopyServes = (stamped: StampedImage, layer: Layer, chain: readonly string[]): boolean => {
+    if (stamped.pagesFor === null || !chain.includes(stamped.pagesFor)) return false;
+    const manifest = new Map(layer.files.map(({ path, bytes, sha256 }) => [path, `${bytes} ${sha256}`]));
+    const held = new Map(stamped.files.map(({ path, bytes, sha256 }) => [path, `${bytes} ${sha256}`]));
+    return [...held].every(([path, file]) => manifest.get(path) === file) && filesRead(layer, chain[0] === layer.digest).every(({ path }) => held.has(path));
+  };
 
   /** Why this node cannot restore `manifest`, or null when it can. */
   const unrestorable = (manifest: Manifest): Effect.Effect<string | null, RunscError> =>
@@ -2471,7 +2494,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       manifest,
       Deferred.await(ended).pipe(
         Effect.timeoutOrElse({ duration: backgroundReadMs, orElse: () => Effect.logWarning(`the restore of ${prefixOf(ref)} from the bucket was not done within ${backgroundReadMs / 1000} s of its prepare: what it wrote of its images is not taken`) }),
-        Effect.andThen(Effect.forEach(manifest.layers, (layer) =>
+        Effect.andThen(Effect.forEach(manifest.layers, (layer, index) =>
           Effect.gen(function*() {
             const pages = staged.get(layer.digest);
             if (yield* exclusive([ref], intact(ref, layer, chainOf(manifest)))) {
@@ -2481,11 +2504,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
             if (pages !== undefined) {
               const why = pagesWrittenWhole(yield* cache.pagesMarks(pages), layer, manifest);
               if (why === null) {
-                const others = layer.files.filter(({ path }) => path !== PAGES_FILE);
+                // The other files the restore read of it, downloaded beside it: a layer's checkpoint state is not.
+                const read = filesRead(layer, index === 0);
+                const others = read.filter(({ path }) => path !== PAGES_FILE);
                 yield* cache.room(bytesOf([{ ...layer, files: others }]), spared).pipe(Effect.flatMap(logEvicted));
                 yield* receivedInto(ref, pages.directory, layer, others);
                 // A pages copy is stamped as such only where it is the one moved in: one held already keeps its own stamp.
-                yield* exclusive([ref], Effect.flatMap(cache.commitPages(pages), (moved) => (moved ? cache.stamp(ref.environment, ref.workspace, layer.digest, layer.files, manifest.layers[0]?.digest) : Effect.void)));
+                yield* exclusive([ref], Effect.flatMap(cache.commitPages(pages), (moved) => (moved ? cache.stamp(ref.environment, ref.workspace, layer.digest, read, manifest.layers[0]?.digest) : Effect.void)));
                 yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "cached" }));
                 return;
               }
