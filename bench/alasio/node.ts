@@ -18,7 +18,7 @@ import { FREE_LABEL } from "../../src/binder/names.ts";
 import { CONTAINERD, gvisorHandler, NODE_AGENT_TOKEN_VARIABLE } from "../../src/node-agent/names.ts";
 import { kube, nodeAgents, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
 import { gone } from "./alasio.ts";
-import { BENCH_DIR, COMMON, PROFILE, PROFILES, TOXIPROXY } from "./settings.ts";
+import { BENCH_DIR, COMMON, PROFILE, PROFILES, RELEASE_UNDER_TEST, TOXIPROXY } from "./settings.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -179,8 +179,12 @@ export async function bootLogs(node: string): Promise<void> {
   const unset = (process.env["BENCH_RUNSC_CONFIG"] ?? "").split(",").filter(Boolean).map((pair) => `sed -i '/^  ${pair.split(":")[0] ?? ""} = /d' `);
   for (const { release } of NODE_PINS.gvisor.releases) {
     const options = `${CONTAINERD}/${gvisorHandler(release)}.toml`;
+    // Spike: the flags to the release under test's options alone: the node agent gives each release's runsc its own
+    // options' flags, which another release may not know, failing every command of it.
+    const own = release === RELEASE_UNDER_TEST;
+    const added = own ? flags : [];
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
-    await onNode(node, `grep -q '^  debug-log' ${options} || { ${unset.map((sed) => `${sed}${options}; `).join("")}printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n${flags.join("")}' >> ${options}; }; tail -n ${4 + flags.length} ${options}`);
+    await onNode(node, `grep -q '^  debug-log' ${options} || { ${own ? unset.map((sed) => `${sed}${options}; `).join("") : ""}printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot"\\n${added.join("")}' >> ${options}; }; tail -n ${4 + added.length} ${options}`);
   }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));
