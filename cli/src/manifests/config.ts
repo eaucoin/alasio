@@ -354,6 +354,17 @@ const Snapshots = Schema.Struct({
    */
   restoreWritesCache: defaulted(Schema.Boolean, false),
   /**
+   * How a restore from the bucket reads it: `proxy`, through its node's agent, which signs each
+   * read for it (src/node-agent/store-proxy.ts); or `presigned`, under a gVisor release that can,
+   * straight from the store by a URL the agent presigns of each file it reads, holding no
+   * credentials, its reads followed by what its gofer counts, its node admitted to the bundled
+   * store's S3 port, as every node is, by its addresses (src/node-agent/store-urls.ts,
+   * store-admission.ts), sparing the agent the work of the proxy. Chosen here, at install time,
+   * and said by the agent's metric alasio.node_agent.restore_read_path; a restore never falls
+   * back from one to the other. `proxy` unless said.
+   */
+  restoreReads: defaulted(Schema.Literals(["proxy", "presigned"]), "proxy"),
+  /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
    * limit is at least that and its budget of what it holds written and not yet on the disk

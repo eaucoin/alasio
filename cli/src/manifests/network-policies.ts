@@ -13,6 +13,7 @@ import type { ApiServer } from "../api-server.ts";
 import { POOL_LABEL } from "../../../src/binder/names.ts";
 import { NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
+import { nodesAdmittedToStore, STORE_FROM_NODES_POLICY } from "./node-agent.ts";
 import { CODEX_LOGIN_PORT } from "../../../src/harness/names.ts";
 import { CODEX_LOGIN, CODEX_LOGIN_COMPONENT } from "./codex-login.ts";
 import { sessionsNamespace } from "./alasio.ts";
@@ -469,7 +470,25 @@ function nodeAgentPolicies(config: InstallConfig, apiServer: ApiServer | null): 
         ingress: [{ from: [NODE_AGENT], ports: [{ protocol: "TCP", port: 8333 }] }],
       })]
       : []),
+    ...(nodesAdmittedToStore(config) ? [storeFromNodesPolicy()] : []),
   ];
+}
+
+/**
+ * The bundled store's S3 port as the nodes reach it from their own networks, whose restores'
+ * checkpoint gofers read the snapshots bucket there straight from the store, by the URLs their
+ * agents presign (src/node-agent/store-urls.ts): its rule, of each address any node holds, is
+ * the node agents' to write, each keeping its own node's (src/node-agent/store-admission.ts),
+ * which no pod selector could name, as nodes join and go after `alasio up`; none here, so that
+ * the installation's applying it again leaves theirs, and a policy of no rule admits no one. A
+ * session's pod, of no node's address, is not among them; what a URL grants is the boundary,
+ * the port the store's own.
+ */
+function storeFromNodesPolicy(): NetworkPolicy {
+  return policy(STORE_FROM_NODES_POLICY, NAMESPACE, "seaweedfs", {
+    podSelector: { matchLabels: selectorLabels("seaweedfs") },
+    policyTypes: ["Ingress"],
+  });
 }
 
 /** Every environment's harness pools' pods (./harness-pools.ts), main's and branch environments', as peers. */
