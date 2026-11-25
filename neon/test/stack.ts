@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 
 import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1Deployment, V1EndpointSlice, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
+import { Effect } from "effect";
 import pg, { type QueryResultRow } from "pg";
 
 import { cpuMillis } from "../../cli/src/capacity.ts";
@@ -28,6 +29,7 @@ import { pageserverName, REPLICA_NAME } from "../../cli/src/manifests/neon.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { AGENTS, alasioOk, type Forward, inContainer, kube, lakeQuery, paths, reachability, ref, runCronJob } from "../../test/e2e/harness.ts";
+import { makeS3Bucket, presignedUrl } from "../../src/node-agent/s3.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SERVING_LABEL, SUSPEND_AFTER } from "../control/endpoints.ts";
@@ -1354,6 +1356,46 @@ export function neonStack(): void {
           ].join("\n"));
           assert.match(said, /^missing 0$/mu);
         } finally {
+          await onGateway(one, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+        }
+      });
+
+      test("the object store takes a URL the node agent presigns of an object, by Signature Version 4 in its query, for that object's GET alone, of a range and as of its ETag too, until it expires: the scope a restore reading by URLs relies on", async () => {
+        const one = (await gateways())[0] ?? assert.fail("no gateway runs");
+        const bucket = `presigned-${Date.now()}`;
+        const store = await kube.forward(NAMESPACE, componentName("seaweedfs"), 8333);
+        const signer = { region: "us-east-1", accessKeyId: E2E_S3.accessKey, secretAccessKey: E2E_S3.secretKey };
+        await onGateway(one, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null`);
+        try {
+          const objects = makeS3Bucket({ endpoint: store.base, bucket, ...signer });
+          const body = Buffer.from(randomUUID().repeat(64));
+          await Effect.runPromise(objects.putJson("main/fs-abc/layers/d1/pages.img", { body: body.toString("hex") }));
+          const etag = (await Effect.runPromise(objects.head("main/fs-abc/layers/d1/pages.img")))?.etag ?? assert.fail("the object is not there");
+          await Effect.runPromise(objects.putJson("main/fs-abc/layers/d2/pages.img", { other: true }));
+          const url = (key: string, method: "GET" | "HEAD" = "GET", at = new Date(), seconds = 60) => presignedUrl(store.base, bucket, key, method, signer, at, seconds);
+          const asked = async (to: string, init: RequestInit = {}) => {
+            const response = await fetch(to, init);
+            return { status: response.status, body: await response.text() };
+          };
+          const own = url("main/fs-abc/layers/d1/pages.img");
+          const whole = await asked(own);
+          assert.equal(whole.status, 200);
+          assert.deepEqual(JSON.parse(whole.body), { body: body.toString("hex") });
+          assert.deepEqual(await asked(own, { headers: { range: "bytes=0-7" } }), { status: 206, body: whole.body.slice(0, 8) });
+          assert.equal((await asked(own, { headers: { "if-match": etag, range: "bytes=0-7" } })).status, 206);
+          assert.equal((await asked(own, { headers: { "if-match": '"0123"' } })).status, 412);
+          // Its signature on another object, another method, the GET's URL for a HEAD: refused; a HEAD's own taken.
+          assert.equal((await asked(own.replace("/d1/", "/d2/"))).status, 403);
+          assert.equal((await asked(own, { method: "PUT", body: "written over" })).status, 403);
+          assert.equal((await asked(own, { method: "HEAD" })).status, 403);
+          assert.equal((await asked(url("main/fs-abc/layers/d1/pages.img", "HEAD"), { method: "HEAD" })).status, 200);
+          // Past its expiry: refused; within it, taken.
+          assert.equal((await asked(url("main/fs-abc/layers/d1/pages.img", "GET", new Date(Date.now() - 61_000), 60))).status, 403);
+          assert.equal((await asked(url("main/fs-abc/layers/d1/pages.img", "GET", new Date(Date.now() - 50_000), 60))).status, 200);
+          // Signed by a key the store does not hold: refused.
+          assert.equal((await asked(presignedUrl(store.base, bucket, "main/fs-abc/layers/d1/pages.img", "GET", { ...signer, secretAccessKey: "another" }, new Date(), 60))).status, 403);
+        } finally {
+          store.close();
           await onGateway(one, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
         }
       });
