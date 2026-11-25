@@ -170,6 +170,8 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
     "kubelet-arg": KUBELET_ARGS,
     "snapshotter": "",
     "pause-image": SANDBOX_IMAGE,
+    // Spike: k3s's debug log, containerd's with it, to place a cold restore's waits.
+    "debug": true,
   };
   return new Map([
     [CONFIG_YAML, `# k3s as alasio's cluster runs it: alasio up writes this file.\n${JSON.stringify(k3s)}\n`],
