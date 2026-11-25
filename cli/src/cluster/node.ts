@@ -170,9 +170,8 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
     "kubelet-arg": KUBELET_ARGS,
     "snapshotter": "",
     "pause-image": SANDBOX_IMAGE,
-    // Spike: k3s's debug log, containerd's with it, and its components' (kubelet's) at verbosity 4, to place a cold
-    // restore's waits: k3s's own flag, as kubelet's logging is set once.
-    "debug": true,
+    // Spike: k3s's components (kubelet) logging at verbosity 4, to place a cold restore's waits: k3s's own flag, as
+    // kubelet's logging is set once; not k3s's debug log, which its kubectl prints on the output the bench reads.
     "v": 4,
   };
   return new Map([
