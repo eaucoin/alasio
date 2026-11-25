@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spike: whether per-object presigned GET URLs serve a restore's reads: GET, ranged GET, HEAD, If-Match and expiry,
 # on SeaweedFS's S3 gateway and on another S3 store, for direct reads (M7 step 2).
-#   bench/presigned-urls.sh seaweedfs VERSION | minio
+#   bench/presigned-urls.sh seaweedfs VERSION | versitygw
 set -uo pipefail
 kind=$1; v=${2:-}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -15,7 +15,8 @@ EOF
   docker run -d --name s3 -p 8333:8333 -v "$data:/cfg" -v "$data/vol:/data" --entrypoint weed "chrislusf/seaweedfs:$v" server -dir=/data -s3 -s3.port=8333 -ip.bind=0.0.0.0 -s3.config=/cfg/s3.json >/dev/null
   end=http://127.0.0.1:8333
 else
-  docker run -d --name s3 -p 8333:9000 -e MINIO_ROOT_USER=ADMIN -e MINIO_ROOT_PASSWORD=adminsecret quay.io/minio/minio server /data >/dev/null
+  mkdir -p "$data/vol" && chmod 777 "$data/vol"
+  docker run -d --name s3 -p 8333:7070 -v "$data/vol:/data" versity/versitygw --access ADMIN --secret adminsecret posix /data >/dev/null
   end=http://127.0.0.1:8333
 fi
 for _ in $(seq 120); do [ "$(curl -s -o /dev/null -w '%{http_code}' $end/)" != 000 ] && break; sleep 1; done
