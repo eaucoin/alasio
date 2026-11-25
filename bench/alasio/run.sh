@@ -22,6 +22,8 @@ done) >"$BENCH_DIR/logs/cpu.log" &
   { sudo cat /proc/[0-9]*/stat 2>/dev/null || true; } | awk -v t="$t" '$2 == "(MainThread)" || $2 == "(node)" { print t, $1, $14 + $15 }' || true
 done) >"$BENCH_DIR/logs/node-cpu.log" &
 (while sleep 10; do echo "== $(date -u +%T)"; ps -eo pid,args --no-headers | awk '$2 ~ /node/' || true; done) >"$BENCH_DIR/logs/node-pids.log" &
+# Spike: the node's own counters of the store's port, and its nat table's OUTPUT, every minute.
+(while sleep 60; do echo "== $(date -u +%T)"; sudo iptables -L BENCH-STORE-OUT -v -x -n 2>&1; sudo iptables -L BENCH-STORE-IN -v -x -n 2>&1; sudo iptables -t nat -L OUTPUT -v -n 2>&1 | head -8; done) >"$BENCH_DIR/logs/iptables.log" &
 # The runner's writeback held to 256 MiB dirty, 64 MiB before it starts: a save of 3 GiB left gigabytes dirty on the
 # disk the store and the node's cache share with k3s, and the stall of the fsyncs behind them ended k3s ("Transaction
 # commit failed"). Said in logs/writeback.txt.
