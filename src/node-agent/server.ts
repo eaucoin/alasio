@@ -616,7 +616,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const current = yield* Config.String(GVISOR_RELEASE_VARIABLE);
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const loadingStallSeconds = yield* Config.Int(LOADING_STALL_SECONDS_VARIABLE);
-  const onePassSaves = yield* Config.Boolean(ONE_PASS_SAVES_VARIABLE).pipe(Config.withDefault(false));
+  const onePassSaves = yield* Config.Boolean(ONE_PASS_SAVES_VARIABLE).pipe(Config.withDefault(true));
   const testTimings = yield* Config.schema(LoadingSaveTestTimings, LOADING_SAVE_TEST_TIMINGS_VARIABLE).pipe(Config.option);
   const { loadWaitSeconds, ...loadingTimings } = Option.getOrElse(testTimings, (): typeof LoadingSaveTestTimings.Type => ({}));
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
