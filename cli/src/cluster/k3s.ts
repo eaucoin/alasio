@@ -242,10 +242,7 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     [`${CONTAINERD}/config-v3.toml.tmpl`, file([
       `{{ template "base" . }}`,
       "",
-      "# Spike: containerd's debug log, to place a cold restore's waits.",
-      "[debug]",
-      '  level = "debug"',
-      "",
+
       "# Images pulled through stargz-snapshotter's daemon (cli/src/cluster/stargz.ts), which mounts an eStargz layer",
       "# lazily: k3s, its snapshotter set to none, says nothing of the CRI's images, and alasio says it here, the",
       "# snapshot annotations the daemon reads passed.",
