@@ -10,23 +10,31 @@
  * what the node has left for them: the least of what /proc/meminfo says is available over
  * kubelet's soft eviction threshold, and what each cgroup above the pods (kubepods' and their
  * QoS classes') has under its memory.max, its clean page cache counted as room, as the kernel
- * reclaims it before it must kill (aboveRoom). Each bound sandbox's cgroup, the one its processes are
- * in (its pod sandbox's scope), it gives memory.oom.group, and limits to what it holds and its
- * share of that room, an equal share of each bound one's, SANDBOX_MEMORY_SLACK_BYTES at the least,
- * where that share is less than SANDBOX_MEMORY_LIMITED_BELOW_BYTES: so a sandbox that grows past
- * its share is ended by its own cgroup's OOM, whole, as the room it grows into is what the others
- * are kept from. Where each has more, none is limited, as none grows by as much between two looks,
- * and a limit costs what it holds: the kernel bounds what a cgroup may dirty of the page cache by
- * its limit, which slowed a sandbox's stop's save of 3 GiB by some 200 ms under a limit of GiBs. A
- * sandbox not bound, a pool's free pod or a standby, holds little and is left as kubelet makes it.
+ * reclaims it before it must kill (aboveRoom). Of each sandbox it guards the cgroup its processes
+ * are in, its pod sandbox's scope, the one cgroup of its pod's that holds any (sandboxCgroup); a
+ * sandbox whose pod has none such, or more, it leaves be, saying so, and never writes to its pod's
+ * own cgroup. Each bound sandbox's it gives memory.oom.group, and, where its equal share of that
+ * room is short of SANDBOX_MEMORY_LIMITED_BELOW_BYTES, limits to what it holds and its headroom:
+ * the room, up to SANDBOX_MEMORY_HEADROOM_BYTES, so more than its share, and never less than
+ * SANDBOX_MEMORY_SLACK_BYTES; of two that grow at once past the room, the guard ends one below. A
+ * sandbox that grows past its limit is ended by its own cgroup's OOM, whole. Where each one's
+ * share is more, none is limited, as none grows by as much between two looks, and a limit costs
+ * what it holds: the kernel bounds what a cgroup may dirty of the page cache by its limit, which
+ * slowed a sandbox's stop's save of 3 GiB by some 200 ms under a limit of GiBs. A sandbox not
+ * bound, a pool's free pod or a standby, holds little and is left as kubelet makes it. What it
+ * last set of each, and what it ended, it keeps (GuardRecords), for the gateway to tell a session
+ * that ran out of memory what it ran out of.
  *
  * Where the node nonetheless comes near its end, what is available over kubelet's hard eviction
- * threshold or under a cgroup above the pods less than SANDBOX_MEMORY_SLACK_BYTES (the shares'
- * least overlapping, as two sandboxes grow at once), the agent ends the sandbox of its node's
- * pods that holds the most, killing its pod's processes at once (cgroup.kill), before the
- * kernel must choose; the kernel's OOM killer is left for what comes faster than a look. A
- * sandbox ended so, or by its own cgroup's OOM, is one whose bayma ended: its pod's gateway
- * releases its binding as a broken sandbox's, and its session comes back from its last save.
+ * threshold or under a cgroup above the pods less than SANDBOX_MEMORY_SLACK_BYTES, the agent ends
+ * a sandbox only where sandboxes are the cause: the one that grew the most over the last
+ * GROWTH_WINDOW_MS, by GROWN_BYTES at least, its scope's processes killed at once (cgroup.kill);
+ * then none more for END_WINDOW_MS, nor while one ended is still there, its memory being freed,
+ * so the room is measured anew after each. Where none grew so, the pressure is another pod's (the
+ * folder instances', the platform's): it ends nothing, says so once a while and counts it, and
+ * leaves kubelet's eviction and the kernel to act. A sandbox ended, by the agent or by its own
+ * cgroup's OOM, is one whose bayma ended: its pod's gateway releases its binding as one that ran
+ * out of memory, and its session comes back from its last save.
  */
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -44,45 +52,77 @@ export const GUARD_MS = 250;
 const LIST_MS = 2_000;
 
 /**
- * The least a bound sandbox may grow by past what it holds, whatever is left: room for a turn's
- * allocations between two looks, and for a sandbox that writes and frees as it runs; and what
- * the node keeps left before the guard ends its largest sandbox.
+ * The least a limited sandbox may grow by past what it holds, whatever is left: room for a
+ * sandbox that writes and frees as it runs; and what the node keeps left before the guard ends a
+ * sandbox that grew into it.
  */
 export const SANDBOX_MEMORY_SLACK_BYTES = 256 * 1024 ** 2;
 
-/** The share of the room below which bound sandboxes are limited, as the module says: more than any grows by between two looks. */
+/**
+ * The share of the room below which bound sandboxes are limited, as the module says: more than
+ * any grows by between two looks.
+ */
 export const SANDBOX_MEMORY_LIMITED_BELOW_BYTES = 1024 ** 3;
+
+/**
+ * The headroom a limited sandbox has over what it holds while the room holds as much, whatever its
+ * share: a turn's sudden allocation of 1 GiB, as a REPL loading a dataset makes, is not ended
+ * while the node has room for it; the share of SANDBOX_MEMORY_LIMITED_BELOW_BYTES above which a
+ * sandbox is not limited at all, so a limit never leaves one less than that share would.
+ */
+export const SANDBOX_MEMORY_HEADROOM_BYTES = 1024 ** 3;
+
+/** How far back a sandbox's growth is measured, the one that grew most being the one ended. */
+export const GROWTH_WINDOW_MS = 10_000;
+
+/** By how much a sandbox must have grown over GROWTH_WINDOW_MS to be taken for the cause of its node's want of memory. */
+export const GROWN_BYTES = 256 * 1024 ** 2;
+
+/** How long after it ends a sandbox the guard ends none more: room for its memory to be freed and the node's to be measured anew. */
+export const END_WINDOW_MS = 10_000;
+
+/** How often the guard says that its node's want of memory is another pod's, while it lasts. */
+const FOREIGN_SAID_MS = 60_000;
 
 /** By how much a sandbox's limit must move before it is written again. */
 const LIMIT_STEP_BYTES = 16 * 1024 ** 2;
 
-/** A sandbox as the guard plans for it: its key, its pod's state, what its pod and its own cgroup hold. */
+/** A sandbox as the guard plans for it: its key, its pod's state, what its pod and its own cgroup hold, and by how much it grew over GROWTH_WINDOW_MS. */
 export interface Guarded {
   readonly key: string;
   readonly state: SandboxState;
   readonly bytes: number;
   readonly scopeBytes: number;
+  readonly grown: number;
 }
 
-/** What the guard does at a look: the limit of each bound sandbox's cgroup, by its key, null where it has none; and the sandbox it ends, if any. */
+/**
+ * What the guard does at a look: the limit of each bound sandbox's cgroup, by its key, null where
+ * it has none; the sandbox it ends, if any; and whether its node wants memory that no sandbox is
+ * the cause of.
+ */
 export interface GuardPlan {
   readonly limits: ReadonlyMap<string, number | null>;
   readonly end: string | null;
+  readonly foreign: boolean;
 }
 
 /**
  * What the guard does, as the module says, given `room`, what the node has left for its
  * sandboxes before kubelet evicts or a cgroup above them reaches its limit; `lastRoom`, what it
- * has left before kubelet evicts at once or that limit; `sandboxes`; and those it ended already,
- * while one of which is there it ends none.
+ * has left before kubelet evicts at once or that limit; `sandboxes`; whether one it ended is still
+ * there, or it ended one within END_WINDOW_MS (`ending`), while which it ends none.
  */
-export function guardPlan(room: number, lastRoom: number, sandboxes: readonly Guarded[], ended: ReadonlySet<string>): GuardPlan {
+export function guardPlan(room: number, lastRoom: number, sandboxes: readonly Guarded[], ending: boolean): GuardPlan {
   const bound = sandboxes.filter(({ state }) => state === "bound");
-  const share = Math.max(SANDBOX_MEMORY_SLACK_BYTES, Math.floor(Math.max(0, room) / Math.max(1, bound.length)));
-  const limits = new Map(bound.map(({ key, scopeBytes }) => [key, share < SANDBOX_MEMORY_LIMITED_BELOW_BYTES ? scopeBytes + share : null]));
-  // None while one ended is still there, its memory being freed (some 0.5 s for 2.5 GiB), which would end another for nothing.
-  if (lastRoom >= SANDBOX_MEMORY_SLACK_BYTES || sandboxes.some(({ key }) => ended.has(key))) return { limits, end: null };
-  return { limits, end: sandboxes.toSorted((a, b) => b.bytes - a.bytes)[0]?.key ?? null };
+  const share = Math.floor(Math.max(0, room) / Math.max(1, bound.length));
+  // No less than its share, which is less than SANDBOX_MEMORY_HEADROOM_BYTES where it is limited, and the room.
+  const headroom = Math.max(SANDBOX_MEMORY_SLACK_BYTES, Math.min(SANDBOX_MEMORY_HEADROOM_BYTES, room));
+  const limits = new Map(bound.map(({ key, scopeBytes }) => [key, share < SANDBOX_MEMORY_LIMITED_BELOW_BYTES ? scopeBytes + headroom : null]));
+  if (lastRoom >= SANDBOX_MEMORY_SLACK_BYTES) return { limits, end: null, foreign: false };
+  const grower = sandboxes.filter(({ grown }) => grown >= GROWN_BYTES).toSorted((a, b) => b.grown - a.grown)[0];
+  if (grower === undefined) return { limits, end: null, foreign: true };
+  return { limits, end: ending ? null : grower.key, foreign: false };
 }
 
 /** A file's text, or null where it cannot be read. */
@@ -93,16 +133,16 @@ const write = (path: string, value: string): Promise<boolean> => writeFile(path,
 
 /**
  * The cgroup a pod's sandbox's processes are in, under its pod's cgroup `pod`: the one cgroup of
- * the pod's with processes, its pod sandbox's scope; the pod's own where it holds them, or where
- * none does.
+ * the pod's with processes, its pod sandbox's scope; null where the pod holds processes of its
+ * own, or no cgroup of it does, or more than one, as then none is the sandbox's alone.
  */
-export async function sandboxCgroup(pod: string): Promise<string> {
+export async function sandboxCgroup(pod: string): Promise<string | null> {
   const held = async (dir: string) => ((await text(join(dir, "cgroup.procs"))) ?? "").trim() !== "";
-  if (await held(pod)) return pod;
+  if (await held(pod)) return null;
   const children = (await readdir(pod, { withFileTypes: true }).catch(() => [])).filter((entry) => entry.isDirectory()).map((entry) => join(pod, entry.name));
   const holding = [];
   for (const child of children) if (await held(child)) holding.push(child);
-  return holding.length === 1 ? (holding[0] ?? pod) : pod;
+  return holding.length === 1 ? (holding[0] ?? null) : null;
 }
 
 /** Of what the cgroup `dir` holds, its page cache the kernel reclaims as it nears its limit, clean: its active and inactive file pages, but those dirty or being written back. */
@@ -130,7 +170,15 @@ export async function aboveRoom(cgroups: string, pods: readonly string[], reclai
 }
 
 const ended = meter.createCounter("alasio.node_agent.sandboxes.ended", {
-  description: "The sandboxes the node agent ended, the largest on its node, as its node's memory came near its end",
+  description: "The sandboxes the node agent ended, the one that grew the most on its node, as its node's memory came near its end",
+  unit: "{sandbox}",
+});
+const spared = meter.createCounter("alasio.node_agent.memory.foreign_pressure", {
+  description: "The node agent's looks that found its node's memory near its end with no sandbox grown into it, the want another pod's, which it left to kubelet and the kernel",
+  unit: "{look}",
+});
+const unguarded = meter.createCounter("alasio.node_agent.sandboxes.unguarded", {
+  description: "The sandboxes the node agent left unguarded, as no one cgroup of their pod's held their processes",
   unit: "{sandbox}",
 });
 
@@ -140,53 +188,132 @@ const keyOf = ({ namespace, pod }: Pick<SandboxCgroup, "namespace" | "pod">): st
 /** How many MiB `bytes` is, for a log. */
 const mib = (bytes: number): string => `${Math.round(bytes / 1024 ** 2)} MiB`;
 
-/** What guardNodeMemory looks at the node with, and how often; and what each cgroup above the pods holds that the kernel reclaims (reclaimableIn unless given). */
+/**
+ * What the guard last did of a sandbox's: the limit in force since it last set its cgroup's, null
+ * for none of its own, its pod's limit alone then; and, where it ended it, what its pod held then;
+ * as the agent answers it (`GET /memory/guard`).
+ */
+export interface GuardRecord {
+  readonly namespace: string;
+  readonly pod: string;
+  readonly limitBytes: number | null;
+  readonly endedBytes: number | null;
+  readonly at: number;
+}
+
+/** How long the guard keeps what it did of a sandbox's after its pod has gone: as long as its gateway takes to release its binding, and more. */
+const RECORD_KEPT_MS = 10 * 60_000;
+
+/** What the guard did of the node's sandboxes, by their keys (GuardRecord), as the agent answers it. */
+export class GuardRecords {
+  readonly #records = new Map<string, GuardRecord>();
+
+  /** Notes what the guard did of the sandbox of `namespace`/`pod`, besides what it did before. */
+  note(namespace: string, pod: string, change: Partial<Pick<GuardRecord, "limitBytes" | "endedBytes">>): void {
+    const key = `${namespace}/${pod}`;
+    const before = this.#records.get(key) ?? { namespace, pod, limitBytes: null, endedBytes: null, at: 0 };
+    this.#records.set(key, { ...before, ...change, at: Date.now() });
+  }
+
+  /** What the guard did, of the sandboxes it did anything of within RECORD_KEPT_MS. */
+  all(): readonly GuardRecord[] {
+    for (const [key, record] of this.#records) if (Date.now() - record.at > RECORD_KEPT_MS) this.#records.delete(key);
+    return [...this.#records.values()];
+  }
+}
+
+/** What guardNodeMemory looks at the node with, and how often; what each cgroup above the pods holds that the kernel reclaims (reclaimableIn unless given); and where it keeps what it does. */
 export interface GuardOptions extends Pick<MemoryOptions, "runsc" | "nodeRoot" | "attachRoot"> {
   readonly everyMs?: number;
   readonly reclaimable?: (dir: string) => Promise<number>;
+  readonly records?: GuardRecords;
 }
 
-/** One look of the guard's, as the module says; the sandboxes it ended so far, by their pods' cgroups, kept and forgotten as they go. */
-export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimableIn }: GuardOptions, endedBefore: Set<string>): Effect.Effect<void> =>
+/** What the guard keeps from look to look: each sandbox's bytes as each look read them, by its key; when it last ended one, and the cgroups of those it ended, kept until they go; and when it last said its node's want was another pod's. */
+export interface GuardState {
+  readonly seen: Map<string, readonly { readonly at: number; readonly bytes: number }[]>;
+  readonly endedCgroups: Set<string>;
+  lastEndAt: number;
+  lastForeignAt: number;
+  readonly unguarded: Set<string>;
+}
+
+/** A guard's state before its first look. */
+export const newGuardState = (): GuardState => ({ seen: new Map(), endedCgroups: new Set(), lastEndAt: 0, lastForeignAt: 0, unguarded: new Set() });
+
+/** One look of the guard's, as the module says, with what it keeps from look to look. */
+export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimableIn, records = new GuardRecords() }: GuardOptions, state: GuardState): Effect.Effect<void> =>
   Effect.gen(function*() {
+    const now = Date.now();
     const cgroups = join(nodeRoot, "sys", "fs", "cgroup");
-    const sandboxes = (yield* sandboxesOf({ runsc, nodeRoot, attachRoot }, false)).filter((sandbox): sandbox is SandboxCgroup & { readonly cgroup: string } => sandbox.cgroup !== null);
-    // Those ended that are gone are forgotten, as a pod's cgroup goes with it.
-    for (const cgroup of endedBefore) if (!sandboxes.some((sandbox) => sandbox.cgroup === cgroup)) endedBefore.delete(cgroup);
+    const listed = (yield* sandboxesOf({ runsc, nodeRoot, attachRoot }, false)).filter((sandbox): sandbox is SandboxCgroup & { readonly cgroup: string } => sandbox.cgroup !== null);
+    // Each sandbox's own cgroup; one whose pod has none such left be, said once.
+    const sandboxes: (SandboxCgroup & { readonly cgroup: string; readonly scope: string })[] = [];
+    for (const sandbox of listed) {
+      const scope = yield* Effect.promise(() => sandboxCgroup(sandbox.cgroup));
+      if (scope === null) {
+        if (!state.unguarded.has(keyOf(sandbox))) {
+          state.unguarded.add(keyOf(sandbox));
+          unguarded.add(1);
+          yield* Effect.logWarning(`left the sandbox of ${keyOf(sandbox)} unguarded: no one cgroup of its pod's holds its processes`);
+        }
+        continue;
+      }
+      sandboxes.push({ ...sandbox, scope });
+    }
+    // What is gone is forgotten: an ended sandbox once its scope is, a sandbox's bytes once it is.
+    for (const cgroup of state.endedCgroups) if (!sandboxes.some(({ scope }) => scope === cgroup)) state.endedCgroups.delete(cgroup);
+    for (const key of state.seen.keys()) if (!sandboxes.some((sandbox) => keyOf(sandbox) === key)) state.seen.delete(key);
+    for (const key of state.unguarded) if (!listed.some((sandbox) => keyOf(sandbox) === key)) state.unguarded.delete(key);
     const available = meminfoOf(yield* Effect.promise(() => text(join(nodeRoot, "proc", "meminfo"))), "MemAvailable");
     const above = yield* Effect.promise(() => aboveRoom(cgroups, sandboxes.map(({ cgroup }) => cgroup), reclaimable));
     const room = Math.min(available === null ? Number.POSITIVE_INFINITY : available - NODE_MEMORY_SOFT_EVICTION_BYTES, above);
     const lastRoom = Math.min(available === null ? Number.POSITIVE_INFINITY : available - NODE_MEMORY_HARD_EVICTION_BYTES, above);
-    const scopes = new Map<string, string>();
     const guarded: Guarded[] = [];
     for (const sandbox of sandboxes) {
-      const scope = yield* Effect.promise(() => sandboxCgroup(sandbox.cgroup));
-      scopes.set(keyOf(sandbox), scope);
-      const scopeBytes = (yield* Effect.promise(() => numberIn(join(scope, "memory.current")))) ?? sandbox.bytes ?? 0;
-      guarded.push({ key: keyOf(sandbox), state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes });
+      const key = keyOf(sandbox);
+      const scopeBytes = (yield* Effect.promise(() => numberIn(join(sandbox.scope, "memory.current")))) ?? sandbox.bytes ?? 0;
+      const seen = [...(state.seen.get(key) ?? []).filter(({ at }) => now - at <= GROWTH_WINDOW_MS), { at: now, bytes: scopeBytes }];
+      state.seen.set(key, seen);
+      guarded.push({ key, state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes, grown: scopeBytes - Math.min(...seen.map(({ bytes }) => bytes)) });
     }
-    const endedKeys = new Set(sandboxes.filter(({ cgroup }) => endedBefore.has(cgroup)).map(keyOf));
-    const plan = guardPlan(room, lastRoom, guarded, endedKeys);
+    const ending = state.endedCgroups.size > 0 || now - state.lastEndAt < END_WINDOW_MS;
+    const plan = guardPlan(room, lastRoom, guarded, ending);
     for (const [key, limit] of plan.limits) {
-      const scope = scopes.get(key);
-      if (scope === undefined) continue;
-      const held = yield* Effect.promise(() => numberIn(join(scope, "memory.max")));
+      const sandbox = sandboxes.find((each) => keyOf(each) === key);
+      if (sandbox === undefined) continue;
+      const held = yield* Effect.promise(() => numberIn(join(sandbox.scope, "memory.max")));
       if (limit === null ? held !== null : held === null || Math.abs(held - limit) >= LIMIT_STEP_BYTES) {
-        yield* Effect.promise(() => write(join(scope, "memory.max"), limit === null ? "max\n" : `${limit}\n`));
+        if (yield* Effect.promise(() => write(join(sandbox.scope, "memory.max"), limit === null ? "max\n" : `${limit}\n`))) {
+          // The limit in force: its pod's own where that is the less, which kubelet set and the pod's own OOM then ends it at.
+          const pods = limit === null ? null : yield* Effect.promise(() => numberIn(join(sandbox.cgroup, "memory.max")));
+          records.note(sandbox.namespace, sandbox.pod, { limitBytes: limit === null ? null : Math.min(limit, pods ?? limit) });
+        }
       }
       // Set again as systemd may set it back, as it sets its units' cgroups' attributes.
-      if ((yield* Effect.promise(() => text(join(scope, "memory.oom.group"))))?.trim() !== "1") yield* Effect.promise(() => write(join(scope, "memory.oom.group"), "1\n"));
+      if ((yield* Effect.promise(() => text(join(sandbox.scope, "memory.oom.group"))))?.trim() !== "1") yield* Effect.promise(() => write(join(sandbox.scope, "memory.oom.group"), "1\n"));
+    }
+    if (plan.foreign) {
+      spared.add(1);
+      if (now - state.lastForeignAt >= FOREIGN_SAID_MS) {
+        state.lastForeignAt = now;
+        yield* Effect.logWarning(`its node has ${mib(Math.max(0, lastRoom))} left before kubelet evicts at once or its pods reach their limit, and no sandbox grew by ${mib(GROWN_BYTES)} in ${GROWTH_WINDOW_MS / 1000} s: another pod's want, left to kubelet's eviction and the kernel`);
+      }
+      return;
     }
     const end = sandboxes.find((sandbox) => keyOf(sandbox) === plan.end);
     if (end === undefined) return;
-    endedBefore.add(end.cgroup);
-    if (yield* Effect.promise(() => write(join(end.cgroup, "cgroup.kill"), "1\n"))) {
+    const grown = guarded.find(({ key }) => key === plan.end)?.grown ?? 0;
+    state.endedCgroups.add(end.scope);
+    state.lastEndAt = now;
+    if (yield* Effect.promise(() => write(join(end.scope, "cgroup.kill"), "1\n"))) {
       ended.add(1, { "alasio.sandbox.state": end.state });
+      records.note(end.namespace, end.pod, { endedBytes: end.bytes ?? 0 });
       yield* Effect.logWarning(
-        `ended the sandbox of ${keyOf(end)} (${end.state}), the largest on its node at ${mib(end.bytes ?? 0)}, as its node had ${mib(Math.max(0, lastRoom))} left before kubelet evicts at once or its pods reach their limit`,
+        `ended the sandbox of ${keyOf(end)} (${end.state}) at ${mib(end.bytes ?? 0)}, grown by ${mib(grown)} in ${GROWTH_WINDOW_MS / 1000} s, the most on its node, as its node had ${mib(Math.max(0, lastRoom))} left before kubelet evicts at once or its pods reach their limit`,
       );
     } else {
-      yield* Effect.logWarning(`could not end the sandbox of ${keyOf(end)}, the largest on its node, as its pod's cgroup takes no kill`);
+      yield* Effect.logWarning(`could not end the sandbox of ${keyOf(end)}, the one grown the most on its node, as its cgroup takes no kill`);
     }
   });
 
@@ -195,8 +322,10 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimab
  * scope is open: what each cgroup holds read at every look; its sandboxes listed by runsc every
  * LIST_MS at most; and what the cgroups above the pods hold that the kernel reclaims (their
  * memory.stat) every LIST_MS at most, and at the next look once one has reached its limit since
- * (its memory.events' max), as the kernel then reclaims its page cache, which a count read before
- * would overstate its room by. A cgroup's memory.stat has the kernel gather its counts from every
+ * (its memory.events' max), as the kernel then reclaims its page cache for the limit, which a count
+ * read before would overstate its room by. Page cache the kernel reclaims for the node's own want
+ * a count up to LIST_MS old overstates too, the room under the node's (MemAvailable) read at every
+ * look then the lesser. A cgroup's memory.stat has the kernel gather its counts from every
  * processor as it is read: every look's, the pods' and those above, slowed a stop's save of 3 GiB
  * by some 250 ms (memory files' save 380 to 628 ms at the median).
  */
@@ -214,8 +343,8 @@ export const guardNodeMemory = (options: GuardOptions): Effect.Effect<void, neve
       read.set(dir, { at: Date.now(), reached, bytes });
       return bytes;
     };
-    const endedBefore = new Set<string>();
-    yield* guardOnce({ ...options, runsc: { containers }, reclaimable: reclaimableNow }, endedBefore).pipe(
+    const state = newGuardState();
+    yield* guardOnce({ ...options, runsc: { containers }, reclaimable: reclaimableNow }, state).pipe(
       Effect.catchDefect((defect) => Effect.logWarning(`the node's memory could not be guarded: ${String(defect)}`)),
       Effect.repeat(Schedule.spaced(options.everyMs ?? GUARD_MS)),
       Effect.forkScoped,

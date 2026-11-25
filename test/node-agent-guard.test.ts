@@ -1,7 +1,8 @@
 /**
  * The node agent's guard of its node's memory (src/node-agent/guard.ts): each bound sandbox's
- * cgroup limited to what it holds and its share of what the node has left, killing as a group;
- * and the largest sandbox ended as the node comes near its end; on a stand-in of runsc and of the
+ * cgroup limited to what it holds and its headroom of what the node has left, killing as a group;
+ * the sandbox that grew the most ended as the node comes near its end, and none where none grew,
+ * the want another pod's; never its pod's own cgroup written to; on a stand-in of runsc and of the
  * node's cgroups and /proc/meminfo.
  */
 import assert from "node:assert/strict";
@@ -12,7 +13,21 @@ import { test } from "node:test";
 
 import { Effect, Exit, Scope } from "effect";
 
-import { aboveRoom, type Guarded, guardNodeMemory, guardOnce, guardPlan, SANDBOX_MEMORY_LIMITED_BELOW_BYTES, SANDBOX_MEMORY_SLACK_BYTES, sandboxCgroup } from "../src/node-agent/guard.ts";
+import {
+  aboveRoom,
+  END_WINDOW_MS,
+  GROWN_BYTES,
+  type Guarded,
+  guardNodeMemory,
+  guardOnce,
+  guardPlan,
+  GuardRecords,
+  newGuardState,
+  SANDBOX_MEMORY_HEADROOM_BYTES,
+  SANDBOX_MEMORY_LIMITED_BELOW_BYTES,
+  SANDBOX_MEMORY_SLACK_BYTES,
+  sandboxCgroup,
+} from "../src/node-agent/guard.ts";
 import { NODE_MEMORY_SOFT_EVICTION_BYTES, RUNSC_ROOT } from "../src/node-agent/names.ts";
 import { makeRunsc } from "../src/node-agent/runsc.ts";
 import { fakeReleases } from "./support/fake-runsc.ts";
@@ -21,49 +36,63 @@ const RELEASE = "20261102.0-eaucoin.10";
 const MIB = 1024 ** 2;
 const GIB = 1024 ** 3;
 
-/** A sandbox as the guard plans for it, its pod's and its own cgroup's holding the same. */
-const sandbox = (key: string, state: Guarded["state"], bytes: number): Guarded => ({ key, state, bytes, scopeBytes: bytes });
+/** A sandbox as the guard plans for it, its pod's and its own cgroup's holding the same, grown by `grown` over the guard's window. */
+const sandbox = (key: string, state: Guarded["state"], bytes: number, grown = 0): Guarded => ({ key, state, bytes, scopeBytes: bytes, grown });
 
-test("each bound sandbox may grow by an equal share of what the node has left, the slack at the least, unlimited where its share is ample, and those not bound are left as they are", () => {
+test("each bound sandbox may grow by what the node has left, up to 1 GiB, the slack at the least, unlimited where its share is ample, and those not bound are left as they are", () => {
   const sandboxes = [sandbox("a", "bound", 3 * GIB), sandbox("b", "bound", GIB), sandbox("free", "free", 30 * MIB), sandbox("standby", "standby", 20 * MIB)];
   // Each one's share no less than SANDBOX_MEMORY_LIMITED_BELOW_BYTES: none limited.
-  const roomy = guardPlan(2 * SANDBOX_MEMORY_LIMITED_BELOW_BYTES, 6 * GIB, sandboxes, new Set());
+  const roomy = guardPlan(2 * SANDBOX_MEMORY_LIMITED_BELOW_BYTES, 6 * GIB, sandboxes, false);
   assert.deepEqual([...roomy.limits], [["a", null], ["b", null]]);
   assert.equal(roomy.end, null);
-  const less = guardPlan(GIB, 6 * GIB, sandboxes, new Set());
-  assert.deepEqual([...less.limits], [["a", 3.5 * GIB], ["b", 1.5 * GIB]]);
+  // Each one's share less, 768 MiB: limited, but each may still take a sudden 1 GiB the node has room for.
+  const less = guardPlan(1.5 * GIB, 6 * GIB, sandboxes, false);
+  assert.deepEqual([...less.limits], [["a", 3 * GIB + SANDBOX_MEMORY_HEADROOM_BYTES], ["b", GIB + SANDBOX_MEMORY_HEADROOM_BYTES]]);
+  assert.equal(SANDBOX_MEMORY_HEADROOM_BYTES, GIB);
+  // Less left than that: what is left.
+  assert.equal(guardPlan(0.5 * GIB, 6 * GIB, sandboxes, false).limits.get("a"), 3.5 * GIB);
   // Little left: the slack, so that a sandbox that frees as it writes is not ended by its own cgroup.
-  const tight = guardPlan(100 * MIB, SANDBOX_MEMORY_SLACK_BYTES, sandboxes, new Set());
+  const tight = guardPlan(100 * MIB, SANDBOX_MEMORY_SLACK_BYTES, sandboxes, false);
   assert.deepEqual([...tight.limits], [["a", 3 * GIB + SANDBOX_MEMORY_SLACK_BYTES], ["b", GIB + SANDBOX_MEMORY_SLACK_BYTES]]);
   assert.equal(tight.end, null);
   // None left, as kubelet's soft eviction threshold is passed: the slack still.
-  assert.equal(guardPlan(-GIB, SANDBOX_MEMORY_SLACK_BYTES, sandboxes, new Set()).limits.get("a"), 3 * GIB + SANDBOX_MEMORY_SLACK_BYTES);
+  assert.equal(guardPlan(-GIB, SANDBOX_MEMORY_SLACK_BYTES, sandboxes, false).limits.get("a"), 3 * GIB + SANDBOX_MEMORY_SLACK_BYTES);
 });
 
-test("the largest sandbox, bound or not, is ended as the node comes near its end, and none more while one ended is there, its memory being freed", () => {
-  const sandboxes = [sandbox("b", "bound", GIB), sandbox("a", "bound", 3 * GIB), sandbox("free", "free", 30 * MIB)];
-  assert.equal(guardPlan(0, SANDBOX_MEMORY_SLACK_BYTES - 1, sandboxes, new Set()).end, "a");
-  assert.equal(guardPlan(0, -GIB, sandboxes, new Set(["a"])).end, null);
-  // Gone, another is ended where the node is still near its end.
-  assert.equal(guardPlan(0, -GIB, sandboxes.filter(({ key }) => key !== "a"), new Set(["a"])).end, "b");
-  assert.equal(guardPlan(0, -GIB, [], new Set()).end, null);
+test("as the node comes near its end, the sandbox that grew the most is ended, not the largest, and none more while one ended is there or was just ended", () => {
+  const sandboxes = [sandbox("a", "bound", 3 * GIB, 100 * MIB), sandbox("b", "bound", GIB, 512 * MIB), sandbox("c", "bound", 2 * GIB, GROWN_BYTES), sandbox("free", "free", 30 * MIB)];
+  const plan = guardPlan(0, SANDBOX_MEMORY_SLACK_BYTES - 1, sandboxes, false);
+  assert.deepEqual([plan.end, plan.foreign], ["b", false]);
+  assert.deepEqual([guardPlan(0, -GIB, sandboxes, true).end, guardPlan(0, -GIB, sandboxes, true).foreign], [null, false]);
+  // Room enough before kubelet evicts at once: none, however much one grew.
+  assert.deepEqual([guardPlan(0, SANDBOX_MEMORY_SLACK_BYTES, sandboxes, false).end, guardPlan(0, SANDBOX_MEMORY_SLACK_BYTES, sandboxes, false).foreign], [null, false]);
 });
 
-test("a sandbox's processes are found in the one cgroup of its pod's that holds them, its pod sandbox's scope, or in its pod's own", async () => {
+test("as the node comes near its end with no sandbox grown into it, the want another pod's, none is ended, however large", () => {
+  const sandboxes = [sandbox("a", "bound", 6 * GIB, GROWN_BYTES - 1), sandbox("b", "bound", GIB), sandbox("free", "free", 30 * MIB)];
+  const plan = guardPlan(-GIB, -GIB, sandboxes, false);
+  assert.deepEqual([plan.end, plan.foreign], [null, true]);
+  // Its limits still set, as for any want.
+  assert.equal(plan.limits.get("a"), 6 * GIB + SANDBOX_MEMORY_SLACK_BYTES);
+  assert.deepEqual([guardPlan(0, -GIB, [], false).end, guardPlan(0, -GIB, [], false).foreign], [null, true]);
+});
+
+test("a sandbox's processes are found in the one cgroup of its pod's that holds them, its pod sandbox's scope; none where its pod's own holds any, or none of its cgroups does, or more than one", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-guard-scope-"));
   try {
     const pod = join(root, "kubepods-burstable-pod1a2b.slice");
     for (const scope of ["cri-containerd-0a.scope", "cri-containerd-1b.scope"]) mkdirSync(join(pod, scope), { recursive: true });
     writeFileSync(join(pod, "cgroup.procs"), "");
     writeFileSync(join(pod, "cri-containerd-0a.scope", "cgroup.procs"), "");
+    writeFileSync(join(pod, "cri-containerd-1b.scope", "cgroup.procs"), "");
+    assert.equal(await sandboxCgroup(pod), null);
     writeFileSync(join(pod, "cri-containerd-1b.scope", "cgroup.procs"), "101\n102\n");
     assert.equal(await sandboxCgroup(pod), join(pod, "cri-containerd-1b.scope"));
     writeFileSync(join(pod, "cgroup.procs"), "100\n");
-    assert.equal(await sandboxCgroup(pod), pod);
+    assert.equal(await sandboxCgroup(pod), null);
     writeFileSync(join(pod, "cgroup.procs"), "");
     writeFileSync(join(pod, "cri-containerd-0a.scope", "cgroup.procs"), "103\n");
-    // Two that hold processes: none is the sandbox's alone, and its pod is limited whole.
-    assert.equal(await sandboxCgroup(pod), pod);
+    assert.equal(await sandboxCgroup(pod), null);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -141,45 +170,84 @@ test("a look limits each bound sandbox's scope to what it holds and its share, k
     const a = node.pod("sandboxes-none-0aaa", "aaaa-0001", 2 * GIB, true);
     const b = node.pod("sandboxes-none-1bbb", "bbbb-0002", GIB, true);
     const free = node.pod("sandboxes-none-2ccc", "cccc-0003", 30 * MIB, false);
-    await Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, new Set()));
+    const records = new GuardRecords();
+    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot, records }, newGuardState()));
+    await look();
     const scope = (pod: string, file: string) => node.read(join(pod, "cri-containerd-pause.scope", file));
-    assert.deepEqual([scope(a, "memory.max"), scope(a, "memory.oom.group")], [String(2 * GIB - MIB + 0.75 * GIB), "1"]);
-    assert.deepEqual([scope(b, "memory.max"), scope(b, "memory.oom.group")], [String(GIB - MIB + 0.75 * GIB), "1"]);
+    // Each one's share 768 MiB: each may grow by 1 GiB, the room holding as much.
+    assert.deepEqual([scope(a, "memory.max"), scope(a, "memory.oom.group")], [String(2 * GIB - MIB + GIB), "1"]);
+    assert.deepEqual([scope(b, "memory.max"), scope(b, "memory.oom.group")], [String(GIB - MIB + GIB), "1"]);
     assert.deepEqual([scope(free, "memory.max"), scope(free, "memory.oom.group")], ["max", "0"]);
-    // Where the node's memory available is the least: 1 GiB over the soft eviction threshold.
-    node.memory(GIB + NODE_MEMORY_SOFT_EVICTION_BYTES, 5 * GIB, 16 * GIB);
-    await Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, new Set()));
+    // What it set kept for the gateway to say.
+    assert.deepEqual(records.all().map(({ pod, limitBytes, endedBytes }) => [pod, limitBytes, endedBytes]), [["sandboxes-none-0aaa", 3 * GIB - MIB, null], ["sandboxes-none-1bbb", 2 * GIB - MIB, null]]);
+    // Where the node's memory available is the least: 512 MiB over the soft eviction threshold.
+    node.memory(0.5 * GIB + NODE_MEMORY_SOFT_EVICTION_BYTES, 5 * GIB, 16 * GIB);
+    await look();
     assert.equal(scope(a, "memory.max"), String(2 * GIB - MIB + 0.5 * GIB));
     // Room enough that each one's share is ample: no limit, killing as a group still.
     node.memory(9 * GIB, 5 * GIB, 16 * GIB);
-    await Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, new Set()));
+    await look();
     assert.deepEqual([scope(a, "memory.max"), scope(a, "memory.oom.group"), scope(b, "memory.max")], ["max", "1", "max"]);
-    // None ended while there is room.
-    assert.deepEqual([a, b, free].map((pod) => node.read(join(pod, "cgroup.kill"))), [null, null, null]);
+    assert.equal(records.all().find(({ pod }) => pod === "sandboxes-none-0aaa")?.limitBytes, null);
+    // None ended while there is room, and nothing written to a pod's own cgroup.
+    assert.deepEqual([a, b, free].flatMap((pod) => [node.read(join(pod, "cgroup.kill")), node.read(join(pod, "cri-containerd-pause.scope", "cgroup.kill")), node.read(join(pod, "memory.max"))]), Array(9).fill(null));
   } finally {
     node.done();
   }
 });
 
-test("as the node's pods come near their limit, the look ends the largest sandbox's pod whole, and the next only once it is gone", async () => {
+test("as the node's pods come near their limit with no sandbox grown, the want another pod's, the looks end none; once one grows, they end its scope's processes whole, it alone, and none more for a while", async () => {
   const node = guardedNode();
   try {
     node.memory(9 * GIB, 8 * GIB - 100 * MIB, 8 * GIB);
     const a = node.pod("sandboxes-none-0aaa", "aaaa-0001", 5 * GIB, true);
     const b = node.pod("sandboxes-none-1bbb", "bbbb-0002", GIB, true);
-    const ended = new Set<string>();
-    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, ended));
+    const records = new GuardRecords();
+    const state = newGuardState();
+    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot, records }, state));
+    const kills = () => [a, b].flatMap((pod) => [node.read(join(pod, "cgroup.kill")), node.read(join(pod, "cri-containerd-pause.scope", "cgroup.kill"))]);
+    for (let each = 0; each < 3; each += 1) await look();
+    assert.deepEqual(kills(), [null, null, null, null]);
+    // The smaller grows by 512 MiB: it alone ended, by its scope, its pod's own cgroup not written to.
+    writeFileSync(join(b, "cri-containerd-pause.scope", "memory.current"), `${1.5 * GIB}\n`);
     await look();
-    assert.deepEqual([node.read(join(a, "cgroup.kill")), node.read(join(b, "cgroup.kill"))], ["1", null]);
+    assert.deepEqual(kills(), [null, null, null, "1"]);
+    assert.equal(records.all().find(({ pod }) => pod === "sandboxes-none-1bbb")?.endedBytes, GIB);
     // Its memory not yet freed at the next look, it is not ended again, nor another for it.
-    rmSync(join(a, "cgroup.kill"));
+    rmSync(join(b, "cri-containerd-pause.scope", "cgroup.kill"));
     await look();
-    assert.deepEqual([node.read(join(a, "cgroup.kill")), node.read(join(b, "cgroup.kill"))], [null, null]);
-    // Gone, with the node still near its end: the next largest.
-    node.releases.died("sandboxes-none-0aaa-pause");
-    node.releases.died("sandboxes-none-0aaa-bayma");
+    assert.deepEqual(kills(), [null, null, null, null]);
+    // Gone, the larger grown since, with the node still near its end: none while the room is measured anew.
+    node.releases.died("sandboxes-none-1bbb-pause");
+    node.releases.died("sandboxes-none-1bbb-bayma");
+    writeFileSync(join(a, "cri-containerd-pause.scope", "memory.current"), `${6 * GIB}\n`);
     await look();
-    assert.equal(node.read(join(b, "cgroup.kill")), "1");
+    assert.deepEqual(kills(), [null, null, null, null]);
+    // Once that while is over, it is ended.
+    state.lastEndAt -= END_WINDOW_MS;
+    await look();
+    assert.deepEqual(kills(), [null, "1", null, null]);
+  } finally {
+    node.done();
+  }
+});
+
+test("a sandbox whose pod's own cgroup holds processes is left unguarded: nothing written to its pod's cgroup nor its scope, however it grows", async () => {
+  const node = guardedNode();
+  try {
+    node.memory(9 * GIB, 8 * GIB - 100 * MIB, 8 * GIB);
+    const a = node.pod("sandboxes-none-0aaa", "aaaa-0001", 5 * GIB, true);
+    writeFileSync(join(a, "cgroup.procs"), "4243\n");
+    const state = newGuardState();
+    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, state));
+    await look();
+    writeFileSync(join(a, "cri-containerd-pause.scope", "memory.current"), `${6 * GIB}\n`);
+    await look();
+    assert.deepEqual(
+      ["cgroup.kill", "memory.max", "memory.oom.group", "cri-containerd-pause.scope/cgroup.kill", "cri-containerd-pause.scope/memory.oom.group"].map((file) => node.read(join(a, file))),
+      [null, null, null, null, "0"],
+    );
+    assert.equal(node.read(join(a, "cri-containerd-pause.scope", "memory.max")), "max");
   } finally {
     node.done();
   }
