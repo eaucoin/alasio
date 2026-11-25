@@ -15,7 +15,7 @@ EOF
   docker run -d --name s3 -p 8333:8333 -v "$data:/cfg" -v "$data/vol:/data" --entrypoint weed "chrislusf/seaweedfs:$v" server -dir=/data -s3 -s3.port=8333 -ip.bind=0.0.0.0 -s3.config=/cfg/s3.json >/dev/null
   end=http://127.0.0.1:8333
 else
-  docker run -d --name s3 -p 8333:9000 -e MINIO_ROOT_USER=ADMIN -e MINIO_ROOT_PASSWORD=adminsecret minio/minio server /data >/dev/null
+  docker run -d --name s3 -p 8333:9000 -e MINIO_ROOT_USER=ADMIN -e MINIO_ROOT_PASSWORD=adminsecret quay.io/minio/minio server /data >/dev/null
   end=http://127.0.0.1:8333
 fi
 for _ in $(seq 120); do [ "$(curl -s -o /dev/null -w '%{http_code}' $end/)" != 000 ] && break; sleep 1; done
