@@ -2525,6 +2525,50 @@ test("a pages file a restore did not write whole, as its marks say, or of anothe
     })
   ));
 
+test("a restore's pages copy of a layer holds only what a restore reads of a layer, its pages and their metadata, its checkpoint state not downloaded; intact for a snapshot it is a layer of, not for one whose own image it is", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      // Restored on another node, its next snapshot there a delta of it: a chain of two images.
+      const there = yield* node("node-2");
+      const { manifest } = yield* preparing(there.agent, workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
+      yield* fetched(there, base);
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      const [own, layer] = delta.layers;
+      assert.ok(own && layer);
+      // Restored from the bucket on a third node, whose gofer writes both pages files whole.
+      const third = yield* node("node-3", { restoresWithPagesCacheSince: RELEASE });
+      const asked = s3.requests.length;
+      const prepared = yield* preparing(third.agent, workspace);
+      assert.equal(prepared.source, "bucket");
+      for (const [image, path] of [[own, "pages.img"], [layer, `layers/${layer.digest}/pages.img`]] as const) {
+        writtenByGofer(join(prepared.imagePath, "pages-cache", path), s3.objects.get(`main/fs-abc/layers/${image.digest}/pages.img`)!, own.digest);
+      }
+      yield* third.agent.resume(resumeRequest(delta.snapshot));
+      yield* cached(third, delta);
+      yield* Effect.sleep("200 millis");
+      const layers = join(third.cacheDir, "main", "fs-abc", "layers");
+      assert.deepEqual(readdirSync(join(layers, own.digest)).sort(), ["checkpoint.img", "pages.img", "pages_meta.img"]);
+      assert.deepEqual(readdirSync(join(layers, layer.digest)).sort(), ["pages.img", "pages_meta.img"]);
+      assert.deepEqual(s3.requests.slice(asked).filter((each) => each.startsWith(`GET main/fs-abc/layers/${layer.digest}/`)), [`GET main/fs-abc/layers/${layer.digest}/pages_meta.img`]);
+      assert.equal(stampOf(third, layer.digest).pagesFor, own.digest);
+      // Its snapshot, of which it is a layer, is restored from the cache.
+      assert.equal((yield* preparing(third.agent, workspace)).source, "cache");
+      // One whose own image it is would read its checkpoint state, which it lacks: dropped, though stamped for that image.
+      yield* third.cache.stamp("main", "fs-abc", layer.digest, filesOfStamp(third, layer.digest), layer.digest);
+      const ofBase = yield* third.agent.prepare({ ...workspace, manifest: base });
+      assert.equal(ofBase.source, "bucket");
+      assert.ok(!existsSync(join(layers, layer.digest)));
+    })
+  ));
+
+/** The files the stamp of the image `digest` of fs-abc in a node's cache records, as the manifest says them. */
+const filesOfStamp = (node: Node, digest: string) =>
+  (JSON.parse(readFileSync(join(node.cacheDir, "main", "fs-abc", "stamps", `${digest}.json`), "utf8")) as { readonly files: readonly { readonly path: string; readonly bytes: number; readonly sha256: string }[] }).files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 }));
+
 test("a pages copy is stamped as such only where its commit moved it in: one committed whole meanwhile keeps its own stamp", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
