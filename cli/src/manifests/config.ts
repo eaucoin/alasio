@@ -346,7 +346,8 @@ const Snapshots = Schema.Struct({
    * and said by the agent's metric alasio.node_agent.restore_read_path; a restore never falls
    * back from one to the other. `proxy` unless said.
    */
-  restoreReads: defaulted(Schema.Literals(["proxy", "presigned"]), "proxy"),
+  // Spike: presigned for the bench, which installs alasio's defaults.
+  restoreReads: defaulted(Schema.Literals(["proxy", "presigned"]), "presigned"),
   /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
