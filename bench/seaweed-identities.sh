@@ -13,12 +13,12 @@ EOF
 for mode in static filer; do
   echo "=== $v, admin in a static -s3.config: $([ $mode = static ] && echo yes || echo no)"
   docker rm -f sw >/dev/null 2>&1
-  args=(server -dir=/tmp/data -s3 -s3.port=8333 -ip=sw -ip.bind=0.0.0.0)
+  mkdir -p "$data/vol-$mode"; args=(server -dir=/data -s3 -s3.port=8333 -ip=sw -ip.bind=0.0.0.0)
   [ $mode = static ] && args+=(-s3.config=/cfg/s3.json)
-  docker run -d --name sw --network "$net" -p 8333:8333 -v "$data:/cfg" --entrypoint weed "chrislusf/seaweedfs:$v" "${args[@]}" >/dev/null
+  docker run -d --name sw --network "$net" -p 8333:8333 -v "$data:/cfg" -v "$data/vol-$mode:/data" --entrypoint weed "chrislusf/seaweedfs:$v" "${args[@]}" >/dev/null
   for _ in $(seq 120); do [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/)" != 000 ] && break; sleep 1; done
   sleep 5
-  echo "gateway answers $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/)"; docker logs sw 2>&1 | tail -n 5
+  echo "gateway answers $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/)"; docker logs sw 2>&1 | grep -vE "^\s+/|^goroutine|^github.com|^main\.|^\s*$" | tail -n 25
   shell() { printf '%s\n' "$1" | docker run --rm -i --network "$net" --entrypoint weed "chrislusf/seaweedfs:$v" shell -master=sw:9333 -filer=sw:8888 2>&1 | tail -n 8; }
   [ $mode = filer ] && shell 's3.configure -user=admin -access_key=ADMIN -secret_key=adminsecret -actions=Admin,Read,Write,List,Tagging -apply'
   sleep 2
