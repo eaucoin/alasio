@@ -1,25 +1,23 @@
 name: bench
 run-name: ${{ inputs.label || 'bench' }}
 
-# Spike: whether SeaweedFS's S3 gateway takes runtime identities scoped to one key prefix (bench/seaweed-identities.sh).
+# Spike: per-object presigned GET URLs on SeaweedFS's S3 gateway and another S3 store (bench/presigned-urls.sh).
 on:
   workflow_dispatch:
     inputs:
       label:
         type: string
-        default: "seaweed identities"
+        default: "presigned urls"
 
 permissions:
   contents: read
 
 jobs:
-  identities:
+  presigned:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        version: ["4.48"]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: bench/seaweed-identities.sh ${{ matrix.version }}
+      - run: bench/presigned-urls.sh seaweedfs 4.48
+      - run: bench/presigned-urls.sh seaweedfs 4.54
+      - run: bench/presigned-urls.sh minio
