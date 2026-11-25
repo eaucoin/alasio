@@ -254,3 +254,25 @@ export async function shapeAgents(): Promise<void> {
     if (Date.now() > deadline) throw new Error("the node agents did not come back within 300 s of their restart");
   }
 }
+
+/**
+ * Spike: waits, where BENCH_SETTLE is set, until the node has gone quiet: its disks writing less than 5 MB/s and its
+ * CPUs busier than one core no more, for 5 s in a row, 180 s at the most; what it waited, and the last second's
+ * readings. To tell what a cold restore's wait owes to the store and the disk still taking the chain's saves.
+ */
+export async function settle(node: string): Promise<{ readonly settleS: number; readonly said: string }> {
+  const started = Date.now();
+  const said = await onNode(node, [
+    "disk() { awk '$3 ~ /^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+)$/ { s += $10 } END { print s }' /proc/diskstats; }",
+    "cpu() { awk '/^cpu / { print $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9 }' /proc/stat; }",
+    "d0=$(disk); set -- $(cpu); b0=$1; t0=$2; quiet=0; i=0",
+    "while [ $i -lt 180 ]; do sleep 1; i=$((i+1)); d1=$(disk); set -- $(cpu); b1=$1; t1=$2",
+    "  mb=$(( (d1 - d0) * 512 / 1000000 )); busy=$(( 400 * (b1 - b0) / (t1 - t0 + 1) ))",
+    "  d0=$d1; b0=$b1; t0=$t1",
+    "  if [ $mb -lt 5 ] && [ $busy -lt 100 ]; then quiet=$((quiet+1)); else quiet=0; fi",
+    "  [ $quiet -ge 5 ] && break",
+    "done",
+    "echo \"settled after ${i}s: ${mb} MB/s written, ${busy} % of a core busy (of 400)\"",
+  ].join("\n"));
+  return { settleS: (Date.now() - started) / 1000, said: said.trim() };
+}
