@@ -114,6 +114,7 @@ import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { currentTraceparent, meter, withAlasioSpan, withWaitSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
+import { Restores } from "./guard.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts";
 import { makeLoading } from "./loading.ts";
@@ -834,6 +835,8 @@ export interface NodeAgentOptions {
    * from, which collection keeps while the compaction's manifest is the workspace's latest.
    */
   readonly compacted: (ref: WorkspaceRef, compacted: { readonly from: string; readonly manifest: Manifest }) => Effect.Effect<void, { readonly message: string }>;
+  /** Where each sandbox resumed is noted as restored until it has read its images, for the guard of the node's memory (./guard.ts Restores); none unless given. */
+  readonly restores?: Restores;
 }
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
@@ -1203,7 +1206,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -2747,6 +2750,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
+      // Restored as its pod is made, before it runs: from images of the bytes its prepare read, until it has read them.
+      const preparedFrom = prepared.get(prefixOf(request));
+      restores.restoring(request.namespace, request.pod, preparedFrom?.snapshot === request.snapshot ? preparedFrom.bytes : null);
       const running = yield* runningPod(request).pipe(step("alasio.node_agent.resume.pod_running", request));
       const waited = yield* policiesInForce({ ...request, ...running }).pipe(
         Effect.tap((took) => Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": took })),
@@ -2755,6 +2761,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(running.containerIds, (id) => ofPod(id, request.namespace, request.pod)).pipe(step("alasio.node_agent.resume.containers", request));
       const from = yield* restoredFrom(request);
+      if (preparedFrom?.snapshot !== request.snapshot) restores.restoring(request.namespace, request.pod, from.bytes);
       // Taken live or by a release, of the generation of bayma's state it caught: refused where bayma has moved on since.
       const caughtBy = from.live ?? from.caught;
       if (caughtBy !== undefined) yield* holdsStill(from, caughtBy, containers);
@@ -2773,6 +2780,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.forEach(running.containerIds, (id, index) => runsc.restored(containers[index]?.release ?? "", id), { discard: true }).pipe(
         Effect.catch((error) => Effect.logWarning(`runsc did not say when the restore of ${prefixOf(request)} has read its image, so the agent's compactions yield to it no more: ${error.message}`)),
         Effect.andThen(loading.end(prefixOf(request))),
+        Effect.tap(() => Effect.sync(() => restores.read(request.namespace, request.pod))),
         Effect.flatMap((yielded) => (yielded === null ? Effect.void : Effect.annotateCurrentSpan({ "alasio.loading.yield_ms": yielded }))),
         withAlasioSpan("alasio.node_agent.loading", { attributes: spanAttributes(request), parent: null, links: resumedIn === null ? [] : [resumedIn] }),
         withLogScope("node-agent"),
@@ -2781,7 +2789,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return [waited, running] as const;
     }).pipe(
       // Not resumed, as it failed or its request went, it reads nothing more.
-      Effect.onError(() => loading.end(prefixOf(request))),
+      Effect.onError(() => Effect.andThen(Effect.sync(() => restores.read(request.namespace, request.pod)), loading.end(prefixOf(request)))),
       // Its gofer read its options as its pod's containers started, the restore's token among them.
       Effect.ensuring(goferOptionsGone(request)),
       // Ready as kubelet's probe would find it, before it is answered.

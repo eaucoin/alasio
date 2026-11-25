@@ -17,12 +17,14 @@ import {
   aboveRoom,
   END_WINDOW_MS,
   GROWN_BYTES,
+  GROWTH_WINDOW_MS,
   type Guarded,
   guardNodeMemory,
   guardOnce,
   guardPlan,
   GuardRecords,
   newGuardState,
+  Restores,
   SANDBOX_MEMORY_HEADROOM_BYTES,
   SANDBOX_MEMORY_LIMITED_BELOW_BYTES,
   SANDBOX_MEMORY_SLACK_BYTES,
@@ -230,6 +232,47 @@ test("as the node's pods come near their limit with no sandbox grown, the want a
   } finally {
     node.done();
   }
+});
+
+test("as the node's pods come near their limit, a sandbox filling its memory from its image as it is restored is not ended, the want another pod's; growth past what its restore brings in is", async () => {
+  const node = guardedNode();
+  try {
+    node.memory(9 * GIB, 8 * GIB - 100 * MIB, 8 * GIB);
+    const a = node.pod("sandboxes-none-0aaa", "aaaa-0001", 100 * MIB, true);
+    const b = node.pod("sandboxes-none-1bbb", "bbbb-0002", 100 * MIB, false);
+    const restores = new Restores();
+    // A restore's pod, from images of 2 GiB together; a standby, its image's bytes not known.
+    restores.restoring("alasio-sessions", "sandboxes-none-0aaa", 2 * GIB);
+    restores.restoring("alasio-sessions", "sandboxes-none-1bbb", null);
+    const state = newGuardState();
+    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot, restores }, state));
+    const kills = () => [a, b].flatMap((pod) => [node.read(join(pod, "cgroup.kill")), node.read(join(pod, "cri-containerd-pause.scope", "cgroup.kill"))]);
+    await look();
+    // Each filled from its image: the one to its image's bytes and its sandbox's own, the other by 3 GiB.
+    writeFileSync(join(a, "cri-containerd-pause.scope", "memory.current"), `${2 * GIB + SANDBOX_MEMORY_SLACK_BYTES}\n`);
+    writeFileSync(join(b, "cri-containerd-pause.scope", "memory.current"), `${3 * GIB}\n`);
+    for (let each = 0; each < 3; each += 1) await look();
+    assert.deepEqual(kills(), [null, null, null, null]);
+    // Past it by GROWN_BYTES: the restored one's own growth, it alone ended.
+    writeFileSync(join(a, "cri-containerd-pause.scope", "memory.current"), `${2 * GIB + SANDBOX_MEMORY_SLACK_BYTES + GROWN_BYTES}\n`);
+    await look();
+    assert.deepEqual(kills(), [null, "1", null, null]);
+  } finally {
+    node.done();
+  }
+});
+
+test("a sandbox is counted as restored from when the agent says so until GROWTH_WINDOW_MS after it has read its images, and forgotten where it never does", () => {
+  const restores = new Restores();
+  const now = Date.now();
+  assert.equal(restores.floorOf("alasio-sessions/a", now), null);
+  restores.restoring("alasio-sessions", "a", GIB);
+  restores.restoring("alasio-sessions", "b", null);
+  assert.deepEqual([restores.floorOf("alasio-sessions/a", now), restores.floorOf("alasio-sessions/b", now)], [GIB + SANDBOX_MEMORY_SLACK_BYTES, Number.POSITIVE_INFINITY]);
+  restores.read("alasio-sessions", "a");
+  assert.equal(restores.floorOf("alasio-sessions/a", Date.now() + GROWTH_WINDOW_MS - 1_000), GIB + SANDBOX_MEMORY_SLACK_BYTES);
+  assert.equal(restores.floorOf("alasio-sessions/a", Date.now() + GROWTH_WINDOW_MS + 1_000), null);
+  assert.equal(restores.floorOf("alasio-sessions/b", Date.now() + 11 * 60_000), null);
 });
 
 test("a sandbox whose pod's own cgroup holds processes is left unguarded: nothing written to its pod's cgroup nor its scope, however it grows", async () => {

@@ -185,7 +185,7 @@ import {
 } from "./agent.ts";
 import { convergeAttachments } from "./attachments.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
-import { guardNodeMemory, GuardRecords } from "./guard.ts";
+import { guardNodeMemory, GuardRecords, Restores } from "./guard.ts";
 import { makeHostCommands } from "./host.ts";
 import { makeJuicefs } from "./juicefs.ts";
 import { makeWorkspaces, Released, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
@@ -648,6 +648,8 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   // What workspace storage holds, as the node's mount counts it, where the agent works with it.
   if (juicefs) yield* observeStorageUsage(WORKSPACES_ROOT);
   const workspaces = yield* makeWorkspaces({ host, runsc, juicefs });
+  // The node's sandboxes being restored, as the agent and its standbys' shims restore them, for the guard of its memory.
+  const restores = new Restores();
   const agent = yield* makeNodeAgent({
     node,
     nodeRoot: NODE_ROOT,
@@ -665,13 +667,14 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     pods: podChanges(kube),
     onePassSaves,
     compacted: workspaces.setCompacted,
+    restores,
   });
   // What the node's memory holds, its sandboxes' and the budget of what is held ahead, as gauges and as its API answers it.
   const memory = { runsc, nodeRoot: NODE_ROOT, attachRoot: ATTACH_ROOT };
   yield* observeNodeMemory(memory);
   const guard = new GuardRecords();
-  yield* guardNodeMemory({ ...memory, records: guard });
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, memory: nodeMemory(memory), guard });
+  yield* guardNodeMemory({ ...memory, records: guard, restores });
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces, standbys: makeStandbyRestores({ restores }), memory: nodeMemory(memory), guard });
   // What is attached on the node, kept to the pods the cluster has on it.
   yield* convergeAttachments({ node, workspaces }).pipe(Effect.provide(KubeClient.layer));
   // As it stops, before its API does: its restores' reads of the bucket done first.

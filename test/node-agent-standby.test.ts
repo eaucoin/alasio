@@ -16,6 +16,7 @@ import { after, before, test } from "node:test";
 
 import { Effect } from "effect";
 
+import { GROWTH_WINDOW_MS, Restores } from "../src/node-agent/guard.ts";
 import { makeStandbyRestores, type StandbyRestoreRequest } from "../src/node-agent/standby.ts";
 
 /** The shims' directory, made as mkdtemp makes one, this user's, which only it may write to; the shims' user, this one. */
@@ -73,6 +74,18 @@ test("a restore into a standby whose pod has one shim, as shims grouped are, ask
   const restored = await Effect.runPromise(restoresIn().restore(request("pool-restore-0000002")));
   assert.deepEqual(restored.containers, ["c-pause", "c-bayma"]);
   assert.equal(asked.length, 1);
+});
+
+test("a standby is noted as restored while its shims restore it, from images of bytes not known, for the guard of its node's memory, until GROWTH_WINDOW_MS after they have", async () => {
+  const asked: string[] = [];
+  await shim("sessions.pool-restore-0000011.sock", 200, ["c-pause"], asked);
+  await shim("sessions.pool-restore-0000011.bayma.sock", 200, ["c-bayma"], asked);
+  const restores = new Restores();
+  await Effect.runPromise(makeStandbyRestores({ directory: sockets, owner, restores }).restore(request("pool-restore-0000011")));
+  assert.equal(asked.length, 2);
+  // Restored, its growth counted as none for a window after, as its growth is measured over one; then as any sandbox's.
+  assert.equal(restores.floorOf("sessions/pool-restore-0000011", Date.now()), Number.POSITIVE_INFINITY);
+  assert.equal(restores.floorOf("sessions/pool-restore-0000011", Date.now() + GROWTH_WINDOW_MS + 1000), null);
 });
 
 test("a restore into a standby of an image that is not one of its workspace's in the snapshot cache is refused, no shim asked", async () => {

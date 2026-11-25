@@ -65,6 +65,7 @@ import {
   type WorkspaceRef,
 } from "../src/node-agent/agent.ts";
 import { LAYERS_DIR, makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
+import { GROWTH_WINDOW_MS, Restores, SANDBOX_MEMORY_SLACK_BYTES } from "../src/node-agent/guard.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
 import type { NodeMemory } from "../src/node-agent/memory.ts";
@@ -272,6 +273,8 @@ interface NodeOptions {
   readonly cache?: (cache: SnapshotCache) => SnapshotCache;
   /** Whether its agent's checkpoints upload their images in one pass (NodeAgentOptions onePassSaves). */
   readonly onePassSaves?: boolean;
+  /** Where its agent notes each sandbox it restores (NodeAgentOptions restores), one of its own unless given. */
+  readonly restores?: Restores;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -279,7 +282,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -314,6 +317,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         ...(loadingSave === undefined ? {} : { loadingSave }),
         pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
         ...(onePassSaves === undefined ? {} : { onePassSaves }),
+        ...(restores === undefined ? {} : { restores }),
       });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod, compacted };
     });
@@ -1987,6 +1991,30 @@ test("a restore whose prepare fails, that is not resumed, that is abandoned, who
           Effect.ensuring(Effect.sync(() => void (here.host.ipv4 = rules))),
         );
       yield* compactedBeside(prepareOther.pipe(Effect.flatMap(({ snapshot }) => interrupted(snapshot))), 5);
+    })
+  ));
+
+test("a sandbox resumed is noted as restored from its images' bytes, and SANDBOX_MEMORY_SLACK_BYTES beside them, for the guard of its node's memory, until GROWTH_WINDOW_MS after runsc says it has read them", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const restores = new Restores();
+      const here = yield* node("node-1", { restores });
+      const runscDir = here.releases.dirOf(RELEASE);
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      yield* here.agent.checkpoint(request("fs-abc"));
+      const { manifest } = yield* preparing(here.agent, workspace);
+      yield* here.agent.spend(workspace, manifest.snapshot);
+      const { namespace, pod } = resumeRequest(manifest.snapshot);
+      const key = `${namespace}/${pod}`;
+      // Resumed, it reads its images until runsc says it has read them: restored, however long that takes.
+      writeFileSync(join(runscDir, "hold-wait"), "");
+      yield* here.agent.resume(resumeRequest(manifest.snapshot));
+      assert.equal(restores.floorOf(key, Date.now()), manifest.bytes + SANDBOX_MEMORY_SLACK_BYTES);
+      yield* Effect.sleep("300 millis");
+      assert.equal(restores.floorOf(key, Date.now() + GROWTH_WINDOW_MS + 1000), manifest.bytes + SANDBOX_MEMORY_SLACK_BYTES);
+      // Read: restored no more once its growth is measured over a window after it.
+      rmSync(join(runscDir, "hold-wait"));
+      yield* Effect.sync(() => restores.floorOf(key, Date.now() + GROWTH_WINDOW_MS + 1000)).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (floor) => floor === null }));
     })
   ));
 

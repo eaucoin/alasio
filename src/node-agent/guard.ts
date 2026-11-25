@@ -28,11 +28,12 @@
  * Where the node nonetheless comes near its end, what is available over kubelet's hard eviction
  * threshold or under a cgroup above the pods less than SANDBOX_MEMORY_SLACK_BYTES, the agent ends
  * a sandbox only where sandboxes are the cause: the one that grew the most over the last
- * GROWTH_WINDOW_MS, by GROWN_BYTES at least, its scope's processes killed at once (cgroup.kill);
- * then none more for END_WINDOW_MS, nor while one ended is still there, its memory being freed,
- * so the room is measured anew after each. Where none grew so, the pressure is another pod's (the
- * folder instances', the platform's): it ends nothing, says so once a while and counts it, and
- * leaves kubelet's eviction and the kernel to act. A sandbox ended, by the agent or by its own
+ * GROWTH_WINDOW_MS, by GROWN_BYTES at least, of one being restored past what its restore brings in
+ * (Restores), its scope's processes killed at once (cgroup.kill); then none more for
+ * END_WINDOW_MS, nor while one ended is still there, its memory being freed, so the room is
+ * measured anew after each. Where none grew so, the pressure is another pod's (the folder
+ * instances', the platform's): it ends nothing, says so once a while and counts it, and leaves
+ * kubelet's eviction and the kernel to act. A sandbox ended, by the agent or by its own
  * cgroup's OOM, is one whose bayma ended: its pod's gateway releases its binding as one that ran
  * out of memory, and its session comes back from its last save.
  */
@@ -222,11 +223,56 @@ export class GuardRecords {
   }
 }
 
-/** What guardNodeMemory looks at the node with, and how often; what each cgroup above the pods holds that the kernel reclaims (reclaimableIn unless given); and where it keeps what it does. */
+/**
+ * The node's sandboxes being restored, by their pods' keys, as the agent restores them (./agent.ts
+ * resume, ./standby.ts): what their restores bring in, their images' bytes together, null where it
+ * is not known; and when each had read its images, or ended, null while it reads them. What a
+ * sandbox fills its memory with from its image is not what its node wants memory for: the guard
+ * counts of a sandbox's growth while it restores only what is past its image, and
+ * SANDBOX_MEMORY_SLACK_BYTES beside it for its sandbox's own; of one whose image's bytes are not
+ * known, none. And for GROWTH_WINDOW_MS after, as its growth is measured over as long. One that has
+ * not read its images within RECORD_KEPT_MS is forgotten, as a restore whose pod went is.
+ */
+export class Restores {
+  readonly #restores = new Map<string, { readonly bytes: number | null; readonly since: number; readonly readAt: number | null }>();
+
+  /** Notes that the sandbox of `namespace`/`pod` is restored from images of `bytes` together, null where not known. */
+  restoring(namespace: string, pod: string, bytes: number | null): void {
+    this.#restores.set(`${namespace}/${pod}`, { bytes, since: Date.now(), readAt: null });
+  }
+
+  /** Notes that the restore of the sandbox of `namespace`/`pod` has read its images, or ended. */
+  read(namespace: string, pod: string): void {
+    const restore = this.#restores.get(`${namespace}/${pod}`);
+    if (restore !== undefined) this.#restores.set(`${namespace}/${pod}`, { ...restore, readAt: Date.now() });
+  }
+
+  /**
+   * What the guard counts the sandbox of the key `key` as holding at the least, as the class says:
+   * what its restore brings in, and SANDBOX_MEMORY_SLACK_BYTES; Infinity where that is not known;
+   * null where it is not being restored.
+   */
+  floorOf(key: string, now: number): number | null {
+    const restore = this.#restores.get(key);
+    if (restore === undefined) return null;
+    if (restore.readAt === null ? now - restore.since > RECORD_KEPT_MS : now - restore.readAt > GROWTH_WINDOW_MS) {
+      this.#restores.delete(key);
+      return null;
+    }
+    return restore.bytes === null ? Number.POSITIVE_INFINITY : restore.bytes + SANDBOX_MEMORY_SLACK_BYTES;
+  }
+}
+
+/**
+ * What guardNodeMemory looks at the node with, and how often; what each cgroup above the pods
+ * holds that the kernel reclaims (reclaimableIn unless given); where it keeps what it does; and the
+ * sandboxes being restored (none unless given).
+ */
 export interface GuardOptions extends Pick<MemoryOptions, "runsc" | "nodeRoot" | "attachRoot"> {
   readonly everyMs?: number;
   readonly reclaimable?: (dir: string) => Promise<number>;
   readonly records?: GuardRecords;
+  readonly restores?: Restores;
 }
 
 /** What the guard keeps from look to look: each sandbox's bytes as each look read them, by its key; when it last ended one, and the cgroups of those it ended, kept until they go; and when it last said its node's want was another pod's. */
@@ -242,7 +288,7 @@ export interface GuardState {
 export const newGuardState = (): GuardState => ({ seen: new Map(), endedCgroups: new Set(), lastEndAt: 0, lastForeignAt: 0, unguarded: new Set() });
 
 /** One look of the guard's, as the module says, with what it keeps from look to look. */
-export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimableIn, records = new GuardRecords() }: GuardOptions, state: GuardState): Effect.Effect<void> =>
+export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimableIn, records = new GuardRecords(), restores = new Restores() }: GuardOptions, state: GuardState): Effect.Effect<void> =>
   Effect.gen(function*() {
     const now = Date.now();
     const cgroups = join(nodeRoot, "sys", "fs", "cgroup");
@@ -275,7 +321,9 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimab
       const scopeBytes = (yield* Effect.promise(() => numberIn(join(sandbox.scope, "memory.current")))) ?? sandbox.bytes ?? 0;
       const seen = [...(state.seen.get(key) ?? []).filter(({ at }) => now - at <= GROWTH_WINDOW_MS), { at: now, bytes: scopeBytes }];
       state.seen.set(key, seen);
-      guarded.push({ key, state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes, grown: scopeBytes - Math.min(...seen.map(({ bytes }) => bytes)) });
+      // Of one being restored, what is past what its restore brings in alone.
+      const least = Math.max(Math.min(...seen.map(({ bytes }) => bytes)), restores.floorOf(key, now) ?? 0);
+      guarded.push({ key, state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes, grown: Math.max(0, scopeBytes - least) });
     }
     const ending = state.endedCgroups.size > 0 || now - state.lastEndAt < END_WINDOW_MS;
     const plan = guardPlan(room, lastRoom, guarded, ending);

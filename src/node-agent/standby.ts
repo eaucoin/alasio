@@ -29,6 +29,7 @@ import { Clock, Effect, Schema } from "effect";
 import { NAME, SNAPSHOT_CACHE_DIR, SNAPSHOT_ID, STANDBY_SOCKETS } from "../kube/sandbox-shape.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
+import { Restores } from "./guard.ts";
 
 const Name = Schema.String.check(Schema.isPattern(NAME));
 
@@ -130,14 +131,19 @@ export interface StandbyRestores {
 /** A container's name, as the shim names a container's own socket after one (`<namespace>.<pod>.<container>.sock`). */
 const CONTAINER = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/u;
 
-/** Where the shims of a node's standbys listen: their directory, STANDBY_SOCKETS unless given, and their user's id, root's unless given. */
+/**
+ * Where the shims of a node's standbys listen: their directory, STANDBY_SOCKETS unless given, and
+ * their user's id, root's unless given; and where each standby is noted as restored while its shims
+ * restore it, for the guard of the node's memory (./guard.ts Restores), none unless given.
+ */
 export interface StandbySockets {
   readonly directory?: string;
   readonly owner?: number;
+  readonly restores?: Restores;
 }
 
 /** The standby restores of the node whose shims listen as `sockets` says; see the module. */
-export const makeStandbyRestores = ({ directory = STANDBY_SOCKETS, owner = 0 }: StandbySockets = {}): StandbyRestores => {
+export const makeStandbyRestores = ({ directory = STANDBY_SOCKETS, owner = 0, restores = new Restores() }: StandbySockets = {}): StandbyRestores => {
   /**
    * The sockets of the standby `namespace`/`pod`, as the module says: its own, then each of its containers' that has a shim
    * of its own, by name; or why it takes no restore.
@@ -182,7 +188,9 @@ export const makeStandbyRestores = ({ directory = STANDBY_SOCKETS, owner = 0 }: 
       const found = yield* socketsOf(request.namespace, request.pod);
       const started = yield* Clock.currentTimeMillis;
       const body = JSON.stringify({ imagePath: request.imagePath, paused: true });
-      const restored = yield* Effect.forEach(found, (socket) => ask(request, socket, body));
+      // Its shims read its image into it as they restore it: none of its growth meanwhile is its node's want.
+      restores.restoring(request.namespace, request.pod, null);
+      const restored = yield* Effect.forEach(found, (socket) => ask(request, socket, body)).pipe(Effect.ensuring(Effect.sync(() => restores.read(request.namespace, request.pod))));
       const containers = restored.flatMap((one) => one.containers);
       const milliseconds = restored.flatMap((one) => one.milliseconds);
       yield* Effect.annotateCurrentSpan({ "alasio.standby.containers": containers.length, "alasio.standby.restore_ms": (yield* Clock.currentTimeMillis) - started });
