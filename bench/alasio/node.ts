@@ -67,9 +67,10 @@ export async function podMemory(node: string, uid: string): Promise<{ readonly p
 export async function storeBytes(node: string): Promise<{ readonly sent: number; readonly received: number }> {
   const listed = await onNode(node, `nsenter --target ${await agentPid(node)} --net sh -c 'iptables -L ${STORE_CHAIN} -v -x -n'`);
   const bytes = (direction: string) => Number(listed.split("\n").find((line) => line.includes(`/* ${direction} */`))?.trim().split(/\s+/u)[1] ?? NaN);
-  // Spike: and what the node's own toxiproxy read, as a restore's checkpoint gofer reading by URLs reaches the store
-  // through it on the emulated profiles: its answers from the store, and the gofer's requests, small beside them.
-  const own = Number((await onNode(node, `pid=$(pgrep -f 'toxiproxy-serve[r] -host 127.0.0.1 -port 8475' | head -n 1); [ -n "$pid" ] && awk '/^rchar:/ { print $2 }' /proc/$pid/io || echo 0`)).trim() || 0);
+  // Spike: and what the node itself received from the store's pods' S3 port, as a restore's checkpoint gofer reading
+  // by URLs reaches them, through the node's toxiproxy on the emulated profiles, straight on the local one: counted in
+  // the mangle table, which kube-router's rewrites of the filter table leave be, not what lo carries.
+  const own = Number((await onNode(node, `iptables -t mangle -L ${STORE_CHAIN}-IN -v -x -n`)).split("\n").find((line) => line.includes("/* received */"))?.trim().split(/\s+/u)[1] ?? NaN);
   return { sent: bytes("sent"), received: bytes("received") + own };
 }
 
@@ -83,6 +84,10 @@ export async function countStore(node: string): Promise<void> {
     `${inNetns} iptables -A ${STORE_CHAIN} ! -i lo -s ${address} -p tcp --sport 8333 -m comment --comment received`,
     `${inNetns} iptables -I OUTPUT -j ${STORE_CHAIN}`,
     `${inNetns} iptables -I INPUT -j ${STORE_CHAIN}`,
+    // Spike: the node's own (storeBytes).
+    `iptables -t mangle -N ${STORE_CHAIN}-IN`,
+    `iptables -t mangle -A ${STORE_CHAIN}-IN ! -i lo -p tcp --sport 8333 -m comment --comment received`,
+    `iptables -t mangle -I INPUT -j ${STORE_CHAIN}-IN`,
   ].join(" && "));
 }
 
