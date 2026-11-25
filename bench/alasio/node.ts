@@ -66,11 +66,11 @@ export async function podMemory(node: string, uid: string): Promise<{ readonly p
  */
 export async function storeBytes(node: string): Promise<{ readonly sent: number; readonly received: number }> {
   const listed = await onNode(node, `nsenter --target ${await agentPid(node)} --net sh -c 'iptables -L ${STORE_CHAIN} -v -x -n'`);
-  // Spike: and the node's own, as a restore's checkpoint gofer reading by URLs sends and receives them.
-  const own = await onNode(node, `iptables -L ${STORE_CHAIN}-OUT -v -x -n; iptables -L ${STORE_CHAIN}-IN -v -x -n`);
-  const bytes = (direction: string) =>
-    [listed, own].reduce((sum, each) => sum + Number(each.split("\n").find((line) => line.includes(`/* ${direction} */`))?.trim().split(/\s+/u)[1] ?? NaN), 0);
-  return { sent: bytes("sent"), received: bytes("received") };
+  const bytes = (direction: string) => Number(listed.split("\n").find((line) => line.includes(`/* ${direction} */`))?.trim().split(/\s+/u)[1] ?? NaN);
+  // Spike: and what the node's own toxiproxy read, as a restore's checkpoint gofer reading by URLs reaches the store
+  // through it on the emulated profiles: its answers from the store, and the gofer's requests, small beside them.
+  const own = Number((await onNode(node, `pid=$(pgrep -f 'toxiproxy-serve[r] -host 127.0.0.1 -port 8475' | head -n 1); [ -n "$pid" ] && awk '/^rchar:/ { print $2 }' /proc/$pid/io || echo 0`)).trim() || 0);
+  return { sent: bytes("sent"), received: bytes("received") + own };
 }
 
 /** Counts, in the agent's network namespace on `node`, what it sends to the store's Service and receives from it (storeBytes). */
@@ -83,14 +83,6 @@ export async function countStore(node: string): Promise<void> {
     `${inNetns} iptables -A ${STORE_CHAIN} ! -i lo -s ${address} -p tcp --sport 8333 -m comment --comment received`,
     `${inNetns} iptables -I OUTPUT -j ${STORE_CHAIN}`,
     `${inNetns} iptables -I INPUT -j ${STORE_CHAIN}`,
-    // Spike: the node's own, to the store's pods' S3 port and back, not what lo carries: the toxiproxy's of the node's on
-    // the emulated profiles, past kube-proxy's rule of the Service, or a gofer's on the local one.
-    `iptables -N ${STORE_CHAIN}-OUT`,
-    `iptables -A ${STORE_CHAIN}-OUT ! -o lo -p tcp --dport 8333 -m comment --comment sent`,
-    `iptables -N ${STORE_CHAIN}-IN`,
-    `iptables -A ${STORE_CHAIN}-IN ! -i lo -p tcp --sport 8333 -m comment --comment received`,
-    `iptables -I OUTPUT -j ${STORE_CHAIN}-OUT`,
-    `iptables -I INPUT -j ${STORE_CHAIN}-IN`,
   ].join(" && "));
 }
 
