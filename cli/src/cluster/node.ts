@@ -210,7 +210,8 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
         `sort -r ${SERVED} | xargs -r -n 1 umount -l`,
         `rm -f ${SERVED}`,
       ].join("; ")}'`,
-      `ExecStart=${BIN}/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=${STARGZ_CONFIG} --root=${STARGZ_ROOT}`,
+      // Spike: the daemon's debug log, to time a cold restore's app container's rootfs mount.
+      `ExecStart=${BIN}/containerd-stargz-grpc --log-level=debug --address=${STARGZ_SOCKET} --config=${STARGZ_CONFIG} --root=${STARGZ_ROOT}`,
       "# The containers listed before it started stopped at once, once it serves, as no hook of theirs can run on what",
       "# serves nothing, so kubelet starts each again on the layers it mounted anew; what it costs, the containers on",
       "# those mounts started again, they could read nothing anyway. Each step bounded, and the unit started however",
