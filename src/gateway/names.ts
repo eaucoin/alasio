@@ -255,6 +255,12 @@ export const GatewayConfig = Schema.Struct({
   /** Where bound pods' bayma exports its telemetry, the session telemetry receiver's Service, by its name and port; none where none runs. */
   receiver: Schema.NullOr(Schema.Struct({ host: Schema.String, port: Schema.Number })),
   /**
+   * The NetworkPolicy that admits the cluster's nodes to the bundled store, by its namespace and
+   * name, which the gateway alone writes (./store-admission.ts); none where restores do not read
+   * the store from the nodes' networks.
+   */
+  storeFromNodes: Schema.NullOr(Schema.Struct({ namespace: Schema.String, name: Schema.String })),
+  /**
    * Folder conversations' instances (./folders.ts): the namespace they run in, the template of
    * their pods, as `alasio up` renders it of the host profile, the directory under which each
    * keeps its state, and how long an idle one is kept; none where the installation has no

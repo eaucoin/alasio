@@ -26,6 +26,7 @@ import type {
   V1PersistentVolumeClaim,
   V1PodDisruptionBudget,
   V1PodSpec,
+  V1PolicyRule,
   V1PriorityClass,
   V1Role,
   V1RoleBinding,
@@ -55,7 +56,7 @@ import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHIN
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { oneAtATime } from "../src/manifests/volume-lock.ts";
 import { goferOf, restoresIntoStandby, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
-import { admitting } from "../../src/node-agent/store-admission.ts";
+import { admitting } from "../../src/gateway/store-admission.ts";
 import { hostPathOf, readUnder } from "../../src/node-agent/volume.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
@@ -190,6 +191,19 @@ function one<T extends KubernetesObject>(objects: readonly KubernetesObject[], k
   const found = all<T>(objects, kind).filter((object) => object.metadata?.name === name);
   assert.equal(found.length, 1, `one ${kind} ${name}`);
   return found[0] as T;
+}
+
+/** The rules of every Role and ClusterRole bound to alasio's ServiceAccount `account` among `objects`, by a RoleBinding or a ClusterRoleBinding. */
+function rulesBoundTo(objects: readonly KubernetesObject[], account: string): V1PolicyRule[] {
+  const bindings = objects.filter(({ kind }) => kind === "RoleBinding" || kind === "ClusterRoleBinding") as V1RoleBinding[];
+  return bindings
+    .filter(({ subjects }) => (subjects ?? []).some(({ kind, name, namespace }) => kind === "ServiceAccount" && name === account && namespace === "alasio"))
+    .flatMap(({ metadata, roleRef }) =>
+      // A Role of the binding's own namespace, or a ClusterRole.
+      objects
+        .filter((object) => object.kind === roleRef.kind && object.metadata?.name === roleRef.name && (roleRef.kind === "ClusterRole" || object.metadata?.namespace === metadata?.namespace))
+        .flatMap((role) => (role as V1Role).rules ?? [])
+    );
 }
 
 /** The first container of a Deployment's or StatefulSet's pod. */
@@ -2727,12 +2741,12 @@ describe("node agents", () => {
     assert.deepEqual(all(install(external("http://minio.lan:9000")), "NetworkPolicy").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs-snapshots"), []);
   });
 
-  test("admit the nodes to the bundled store's S3 port, where restores read it by URLs, by the addresses their agents keep in a policy they alone may write, of host addresses alone, and no session's pod; nothing of it where restores read through the agents, or the store is an operator's", () => {
+  test("admit the nodes to the bundled store's S3 port, where restores read it by URLs, by the addresses the sandbox gateway keeps in a policy it alone may write, of host addresses alone, and no session's pod, which the agents may read and nothing more, as no rule of theirs writes any NetworkPolicy; nothing of it where restores read through the agents, or the store is an operator's", () => {
     const presigned = { sessions: { snapshots: { restoreReads: "presigned" } } };
     const objects = install(presigned);
     const name = "alasio-seaweedfs-from-nodes";
     const policy = one<NetworkPolicyObject>(objects, "NetworkPolicy", name);
-    // Of no rule as installed, so that installing again leaves the agents' be, and a rule of no peer admits no one.
+    // Of no rule as installed, so that installing again leaves the gateway's be, and a rule of no peer admits no one.
     assert.deepEqual(policy.spec, {
       podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs" } },
       policyTypes: ["Ingress"],
@@ -2743,24 +2757,35 @@ describe("node agents", () => {
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     assert.equal(admits(policies, session, store, 8333), false);
     assert.equal(admits(policies, agent, store, 8333), true);
-    // What the agents write: each of their nodes' addresses, a host's block alone, which no session's pod is of.
+    // What the gateway writes: each node's addresses, a host's block alone, which no session's pod is of.
     const written = admitting(policy, { "node-1": ["10.42.0.0", "10.42.0.1", "172.18.0.2"], "node-2": ["fd00:42:1::1"] }) as NetworkPolicyObject;
     const blocks = (written.spec.ingress ?? []).flatMap(({ from = [] }) => from.map(({ ipBlock }) => ipBlock?.cidr));
     assert.deepEqual(blocks, ["10.42.0.0/32", "10.42.0.1/32", "172.18.0.2/32", "fd00:42:1::1/128"]);
     assert.deepEqual(written.spec.ingress?.map(({ ports }) => ports), [[{ protocol: "TCP", port: 8333 }]]);
-    // That policy alone, read and written, and the nodes, read, by the agents' account.
-    const role = one<V1Role>(objects, "Role", "alasio-node-agent-store-admission");
-    assert.deepEqual(role.rules, [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [name], verbs: ["get", "update"] }]);
-    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-node-agent-store-admission").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
-    for (const kind of ["RoleBinding", "ClusterRoleBinding"]) {
-      assert.deepEqual(one<V1RoleBinding>(objects, kind, "alasio-node-agent-store-admission").subjects, [{ kind: "ServiceAccount", name: "alasio-node-agent", namespace: "alasio" }]);
+    // That policy alone, read and written, and the nodes, listed, by the gateway's account, which it names.
+    const gatewayAccount = [{ kind: "ServiceAccount", name: "alasio-sandbox-gateway", namespace: "alasio" }];
+    assert.deepEqual(one<V1Role>(objects, "Role", "alasio-sandbox-gateway-store-admission").rules, [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [name], verbs: ["get", "update"] }]);
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-sandbox-gateway-store-admission").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["list"] }]);
+    for (const kind of ["RoleBinding", "ClusterRoleBinding"]) assert.deepEqual(one<V1RoleBinding>(objects, kind, "alasio-sandbox-gateway-store-admission").subjects, gatewayAccount);
+    const gatewayConfigOf = (installed: readonly KubernetesObject[]) => JSON.parse(one<V1ConfigMap>(installed, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}") as { readonly storeFromNodes: unknown };
+    assert.deepEqual(gatewayConfigOf(objects).storeFromNodes, { namespace: "alasio", name });
+    // That policy alone, read, by the agents' account, which writes no NetworkPolicy, by any role bound to it.
+    assert.deepEqual(one<V1Role>(objects, "Role", "alasio-node-agent-store-admission").rules, [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [name], verbs: ["get"] }]);
+    assert.deepEqual(one<V1RoleBinding>(objects, "RoleBinding", "alasio-node-agent-store-admission").subjects, [{ kind: "ServiceAccount", name: "alasio-node-agent", namespace: "alasio" }]);
+    assert.deepEqual(objects.filter(({ kind, metadata }) => kind === "ClusterRole" && metadata?.name === "alasio-node-agent-store-admission"), []);
+    const agentRules = rulesBoundTo(objects, "alasio-node-agent");
+    assert.ok(agentRules.some(({ resources }) => resources?.includes("networkpolicies")));
+    for (const rule of agentRules) {
+      const policies = (rule.apiGroups ?? []).some((group) => group === "networking.k8s.io" || group === "*") && (rule.resources ?? []).some((resource) => resource === "networkpolicies" || resource === "*");
+      if (policies) assert.deepEqual(rule.verbs.filter((verb) => !["get", "list", "watch"].includes(verb)), [], `the node agents may ${rule.verbs.join(", ")} ${JSON.stringify(rule)}`);
     }
     // Through the agents, or an operator's store: none of it.
     const external = { objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } };
     for (const file of [{}, { sessions: { snapshots: { restoreReads: "proxy" } } }, { ...presigned, ...external }, { ...presigned, networkPolicies: { enabled: false } }]) {
       const none = install(file);
       assert.deepEqual(all(none, "NetworkPolicy").filter(({ metadata }) => metadata?.name === name), []);
-      assert.deepEqual(none.filter(({ metadata }) => metadata?.name === "alasio-node-agent-store-admission"), []);
+      assert.deepEqual(none.filter(({ metadata }) => metadata?.name === "alasio-node-agent-store-admission" || metadata?.name === "alasio-sandbox-gateway-store-admission"), []);
+      assert.equal(gatewayConfigOf(none).storeFromNodes, null);
     }
   });
 
@@ -3828,6 +3853,8 @@ describe("the sandbox service", () => {
       nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", daemonSet: "alasio-node-agent", port: 8484, release: VERSION },
       // Where bound pods' bayma exports its telemetry: the receiver's Service.
       receiver: { host: "alasio-receiver.alasio.svc.cluster.local", port: 4318 },
+      // Restores read through the node agents: no policy of the nodes' to keep.
+      storeFromNodes: null,
       // No folder workspaces, of no host profile.
       folders: null,
       // Conversations' harnesses in pools of their own, main's in its namespace, of no folder conversations.

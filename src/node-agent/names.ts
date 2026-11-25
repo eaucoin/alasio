@@ -38,6 +38,8 @@ export const storeSocket = (runDir: string): string => `${runDir}/store.sock`;
 export const storeTokensFile = (runDir: string): string => `${runDir}/tokens.json`;
 /** The file a node agent keeps the restores it follows the reads of by their gofers' counts in (./gofer-reads.ts), on its node, in `runDir`. */
 export const goferReadsFile = (runDir: string): string => `${runDir}/gofer-reads.json`;
+/** The directory a node agent keeps the URLs of each restore it follows the reads of in, a file of each's own, which its gofer reads them from (./gofer-reads.ts), on its node's tmpfs, in `runDir`. */
+export const goferUrlsDir = (runDir: string): string => `${runDir}/urls`;
 /** The URL a restore's gofer names the store by through STORE_SOCKET, which it signs: no host's, as the socket alone is dialled. */
 export const STORE_SOCKET_ENDPOINT = "http://alasio-node-agent";
 
@@ -359,10 +361,18 @@ export const RESTORES_BY_URL_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_BY_URL_SIN
 
 /**
  * The variable that gives the node agent, as `<namespace>/<name>`, the NetworkPolicy that admits
- * the nodes to the bundled store's S3 port, which it keeps its node's addresses in
- * (./store-admission.ts): where the installation's restores read it by URLs; none otherwise.
+ * the nodes to the bundled store's S3 port, which the sandbox gateway writes
+ * (../gateway/store-admission.ts) and each agent reads, waiting for its node to be admitted
+ * before it prepares a restore by URLs (./store-admission.ts): where the installation's restores
+ * read it by URLs; none otherwise.
  */
 export const STORE_FROM_NODES_POLICY_VARIABLE = "ALASIO_STORE_FROM_NODES_POLICY";
+
+/**
+ * The annotation of that policy, its writer's (../gateway/store-admission.ts), that says the
+ * addresses it admits of each node, as JSON: `{ "<node>": ["<address>", ...] }`.
+ */
+export const NODE_ADDRESSES_ANNOTATION = "alasio.dev/node-addresses";
 
 /**
  * Whether gVisor's `release` records a sandbox's working set as a live checkpoint resumes it,

@@ -5,7 +5,8 @@
  * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), and, of the versions a
  * test gives it, ListObjectVersions and DeleteObjects, every
  * request's Signature Version 4 checked against the credentials it is given, in its
- * Authorization header or in its query, as a presigned URL's is, before its expiry, with every
+ * Authorization header or in its query, as a presigned URL's is, from its date to its expiry, by
+ * a clock a test may set behind (clockBehindMs), with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
  * asked is recorded in order, a request can be made to fail, and its gets and heads to wait,
  * as they would on a network.
@@ -70,6 +71,8 @@ export interface FakeS3 {
   readonly mostGetting: () => number;
   /** How long it waits before it answers a head of an object, as a store's first byte takes. */
   headDelayMs: number;
+  /** How far its clock runs behind the test's, in milliseconds, as a store's may: what it takes a presigned URL's date and expiry by. */
+  clockBehindMs: number;
   /** The most heads of objects it has answered at once, since it was last forgotten. */
   readonly mostHeading: () => number;
   /** Forgets the most heads it has answered at once, counting anew from those it answers now. */
@@ -97,9 +100,10 @@ const amzTime = (value: string): number => {
 /**
  * Why a request signed in its query (a presigned URL), of `method` at `url`, sent to `host`, is
  * refused, as S3 refuses one: not signed by the keys it is given, for its method, path, query and
- * host, its host the one header it signs; or past its expiry; null where it is not.
+ * host, its host the one header it signs; or, by the store's clock, `now`, before its date or past
+ * its expiry; null where it is not.
  */
-function queryRefusal(method: string, url: URL, host: string, { region, ...credentials }: S3Credentials & { readonly region: string }): string | null {
+function queryRefusal(method: string, url: URL, host: string, { region, ...credentials }: S3Credentials & { readonly region: string }, now: number): string | null {
   const query = Object.fromEntries(url.searchParams);
   const { "X-Amz-Signature": signature = "", ...signedQuery } = query;
   if (query["X-Amz-Algorithm"] !== "AWS4-HMAC-SHA256") return "the request is not signed with Signature Version 4";
@@ -109,7 +113,8 @@ function queryRefusal(method: string, url: URL, host: string, { region, ...crede
   const expires = Number(query["X-Amz-Expires"]);
   const at = amzTime(query["X-Amz-Date"] ?? "");
   if (!Number.isInteger(expires) || expires < 1 || expires > 7 * 24 * 60 * 60 || Number.isNaN(at)) return "the request's date or expiry is not one";
-  if (Date.now() > at + expires * 1000) return "the request has expired";
+  if (now < at) return "the request is not valid yet";
+  if (now > at + expires * 1000) return "the request has expired";
   const expected = queryAuthSignature({ method, path: url.pathname, query: signedQuery, host }, { region, service: "s3" }, credentials);
   return signature === expected ? null : "the signature is not the request's";
 }
@@ -162,7 +167,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     const payloadHash = inQuery ? UNSIGNED_PAYLOAD : String(request.headers["x-amz-content-sha256"] ?? "");
     let headers: Record<string, string> = {};
     if (inQuery) {
-      const refused = queryRefusal(method, url, String(request.headers.host ?? ""), { region, accessKeyId, secretAccessKey });
+      const refused = queryRefusal(method, url, String(request.headers.host ?? ""), { region, accessKeyId, secretAccessKey }, Date.now() - fake.clockBehindMs);
       if (refused !== null) return error(response, 403, "AccessDenied", refused);
       headers = { host: String(request.headers.host ?? "") };
     } else {
@@ -418,6 +423,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     holdPut: () => null,
     mostGetting: () => mostGetting,
     headDelayMs: 0,
+    clockBehindMs: 0,
     mostHeading: () => mostHeading,
     forgetMostHeading: () => void (mostHeading = heading),
     close: () => new Promise((resolve) => server.close(() => resolve())),

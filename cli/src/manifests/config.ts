@@ -342,7 +342,7 @@ const Snapshots = Schema.Struct({
    * straight from the store by a URL the agent presigns of each file it reads, holding no
    * credentials, its reads followed by what its gofer counts, its node admitted to the bundled
    * store's S3 port, as every node is, by its addresses (src/node-agent/store-urls.ts,
-   * store-admission.ts), sparing the agent the work of the proxy. Chosen here, at install time,
+   * src/gateway/store-admission.ts), sparing the agent the work of the proxy. Chosen here, at install time,
    * and said by the agent's metric alasio.node_agent.restore_read_path; a restore never falls
    * back from one to the other. `proxy` unless said.
    */

@@ -130,8 +130,8 @@ import {
   STORE_SOCKET_ENDPOINT,
 } from "./names.ts";
 import { type ListedContainer, type ReleaseNotInstalled, type Runsc, RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
-import { PRESIGNED_MAX_SECONDS, type S3Bucket, S3Error } from "./s3.ts";
-import { PREPARED_FOR_MS, type StoreProxy, type StoreToken, type Transport } from "./store-proxy.ts";
+import { type S3Bucket, S3Error } from "./s3.ts";
+import { type StoreProxy, type StoreToken, type Transport } from "./store-proxy.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
 
 /** An environment's or a workspace's name: a DNS label, as their namespaces' names are. */
@@ -751,11 +751,15 @@ export interface NodeAgentOptions {
   /**
    * The bucket as the checkpoint gofer of a restore under a release that reads by URLs
    * (restoresByUrl) reads it, from the node: straight from the store, by a URL of each file it
-   * reads, which `presign` gives, signed by the agent's keys, at the store's endpoint as the node
-   * reaches it; its reads followed by what its gofer counts (./gofer-reads.ts).
+   * reads, signed by the agent's keys, at the store's endpoint as the node reaches it, signed anew
+   * as long as its reads are followed, by what its gofer counts (./gofer-reads.ts).
    */
   readonly goferReads: GoferReads;
-  readonly presign: (key: string, expiresSeconds: number) => Effect.Effect<string, S3Error>;
+  /**
+   * Ends once the node is admitted to the store its restores by URLs read, which each such
+   * prepare waits on first (./store-admission.ts); at once unless told.
+   */
+  readonly admitted?: Effect.Effect<void>;
   /** The first gVisor release that reads a restore's files by presigned URLs (restoresByUrl); none where empty, each restore then read through storeProxy. */
   readonly restoresByUrlSince: string;
   readonly host: HostCommands;
@@ -803,7 +807,7 @@ export interface NodeAgentOptions {
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
 export const GOFER_OPTIONS_FILE = "s3_opts.json";
-/** The file, beside the gofer's options of a restore that reads the bucket by URLs, its gofer counts the bytes of pages it read in (served_file). */
+/** The file, beside the gofer's options of a restore that reads the bucket by URLs, its gofer counts the bytes of pages it read in (served_file), as `served-<nonce>`, a name of its restore's own. */
 export const SERVED_FILE = "served";
 /**
  * How many reads of an image's pages the checkpoint gofer serves at once, each of 16 MiB on a
@@ -1080,7 +1084,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, goferReads, presign, restoresByUrlSince, host, restoresFromBucketSince, savesWithLoadWaitSince, restoresWithETagsSince, restoresWithPagesCacheSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, goferReads, admitted = Effect.void, restoresByUrlSince, host, restoresFromBucketSince, savesWithLoadWaitSince, restoresWithETagsSince, restoresWithPagesCacheSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1801,7 +1805,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         // In the agent's scope, so that it ends whole, its following ended and said, though the save it bounds ends
         // meanwhile, as one does once its loading has failed.
         const ending = yield* Effect.gen(function*() {
-          const ended = yield* runsc.failLoad(release, request.containerId, `alasio bounds the save of ${holder} as its restore loads: ${why}`).pipe(Effect.result);
+          // Asked once more where it fails, as a call that did not reach the sandbox may next time.
+          const ended = yield* runsc.failLoad(release, request.containerId, `alasio bounds the save of ${holder} as its restore loads: ${why}`).pipe(Effect.retry({ times: 1 }), Effect.result);
           if (ended._tag === "Failure") {
             return yield* Effect.logError(`could not end the loading of the restore of ${holder} from the bucket, as ${why}, ${reading.served}${of} bytes of its pages read, so its save waits on the store: ${ended.failure.message}`);
           }
@@ -2129,16 +2134,17 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /**
    * The checkpoint gofer's options for the image `own` of the workspace's, as goferOptions says,
-   * read straight from the store by `urls`, a URL presigned by the agent's keys of each file the
-   * restore reads, by the path its gofer serves it at (presignedUrls), the gofer holding no
+   * read straight from the store by the URLs in `urlsFile`, one presigned by the agent's keys of
+   * each file the restore reads, by the path its gofer serves it at (objectsRead), which the agent
+   * signs anew as long as it follows its reads (./gofer-reads.ts), the gofer holding no
    * credentials; the bytes of pages it read counted in `servedFile`, where given (served_file).
    */
-  const goferUrlOptions = (ref: WorkspaceRef, own: string, urls: Readonly<Record<string, string>>, servedFile: string | null, pagesRetry: boolean, etags: Readonly<Record<string, string>> | null): string =>
+  const goferUrlOptions = (ref: WorkspaceRef, own: string, urlsFile: string, servedFile: string | null, pagesRetry: boolean, etags: Readonly<Record<string, string>> | null): string =>
     JSON.stringify({
       bucket: storeProxy.bucket,
       object_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/${own}/`,
       layers_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/`,
-      urls,
+      urls_file: urlsFile,
       ...(servedFile === null ? {} : { served_file: servedFile }),
       read_parallel: GOFER_READ_PARALLEL,
       ...(pagesRetry ? { pages_retry: "while-running" } : {}),
@@ -2146,24 +2152,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
 
   /**
-   * How long the URLs of a restore that reads the bucket by them last: as long as it may be
-   * prepared and then read in the background (PREPARED_FOR_MS and backgroundReadMs), as a token
-   * through the proxy lasts but for its restore's asking; at most what S3 lets one last. A URL
-   * cannot be revoked: its restore's loading is ended on the node (boundWhileLoading), and its
-   * URLs lapse then.
+   * The object of each file of `manifest`'s images that its restore reads (filesRead), by the
+   * path its gofer serves it at: its own image's by their own, its layers' under
+   * `layers/<digest>/`, as runsc names a layer's files.
    */
-  const urlSeconds = Math.min(PRESIGNED_MAX_SECONDS, Math.ceil((PREPARED_FOR_MS + backgroundReadMs) / 1000));
-
-  /**
-   * A URL of each file of `manifest`'s images that its restore reads (filesRead), presigned for
-   * GET by the agent's keys for urlSeconds, by the path its gofer serves it at: its own image's
-   * by their own, its layers' under `layers/<digest>/`, as runsc names a layer's files.
-   */
-  const presignedUrls = (ref: WorkspaceRef, manifest: Manifest): Effect.Effect<Record<string, string>, S3Error> =>
-    Effect.forEach(manifest.layers.flatMap((layer, index) => filesRead(layer, index === 0).map(({ path }) => ({ layer, index, path }))), ({ layer, index, path }) =>
-      Effect.map(presign(layerKey(ref, layer.digest, path), urlSeconds), (url) => [index === 0 ? path : `${LAYERS_DIR}/${layer.digest}/${path}`, url] as const)).pipe(
-        Effect.map((entries) => Object.fromEntries(entries)),
-      );
+  const objectsRead = (ref: WorkspaceRef, manifest: Manifest): Record<string, string> =>
+    Object.fromEntries(manifest.layers.flatMap((layer, index) => filesRead(layer, index === 0).map(({ path }) => [index === 0 ? path : `${LAYERS_DIR}/${layer.digest}/${path}`, layerKey(ref, layer.digest, path)] as const)));
 
   /**
    * Removes the checkpoint gofer's options file of each snapshot prepared of the workspace,
@@ -2463,16 +2457,17 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         let staged: ReadonlyMap<string, StagedPages> = new Map();
         if (imagePath === null && restoresByUrl(release, restoresByUrlSince)) {
           // Straight from the store, by a URL of each file it reads, signed by the agent's keys: its gofer holds none, its
-          // reads followed by what it counts beside its options.
-          const servedFile = join(cache.remote(environment, workspace, snapshot), SERVED_FILE);
-          const urls = yield* presignedUrls(ref, manifest).pipe(step("alasio.node_agent.prepare.urls", ref));
+          // reads followed by what it counts beside its options, in a file of this restore's own, as a gofer of an earlier
+          // restore of the snapshot may count in the directory made anew yet. The node admitted to the store first.
+          yield* admitted.pipe(step("alasio.node_agent.prepare.admitted", ref));
+          const servedFile = join(cache.remote(environment, workspace, snapshot), `${SERVED_FILE}-${randomBytes(8).toString("hex")}`);
+          const { reader: following, urlsFile } = yield* goferReads.follow(prefixOf(ref), servedFile, objectsRead(ref, manifest)).pipe(step("alasio.node_agent.prepare.urls", ref));
           const etags = checked ? etagsOf(manifest.layers) : null;
           const pagesRetry = gofer?.pagesRetry ?? false;
-          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferUrlOptions(ref, own.digest, urls, servedFile, pagesRetry, etags)).pipe(
+          imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferUrlOptions(ref, own.digest, urlsFile, servedFile, pagesRetry, etags)).pipe(
             step("alasio.node_agent.prepare.gofer", ref),
           );
-          const following = goferReads.follow(prefixOf(ref), servedFile);
-          yield* expectPages(ref, snapshot, following, release, goferUrlOptions(ref, own.digest, urls, null, pagesRetry, etags));
+          yield* expectPages(ref, snapshot, following, release, goferUrlOptions(ref, own.digest, urlsFile, null, pagesRetry, etags));
           reader = following;
           readPath = "presigned";
         } else if (imagePath === null) {
@@ -2504,7 +2499,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         yield* Effect.annotateCurrentSpan({ ...(readPath === null ? {} : { "alasio.snapshot.read_path": readPath }), "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.prepare_ms": preparedMs });
         yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
         return { manifest, imagePath, source };
-      }),
+      }).pipe(
+        // Failed, it is read by no restore: what it would have read the bucket by is done with, its token revoked or its
+        // URLs signed no more and removed, and its gofer's options too, which hold them, as before it began.
+        Effect.onError(() => Effect.sync(() => reads.revoke(prefixOf(ref))).pipe(Effect.andThen(goferOptionsGone(ref)))),
+      ),
       "alasio.node_agent.prepare.lock",
     ).pipe(
       // Prepared for no restore, it reads nothing.
