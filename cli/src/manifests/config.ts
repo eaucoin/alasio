@@ -335,7 +335,8 @@ const Snapshots = Schema.Struct({
    * the session's next one (src/node-agent/agent.ts fetchLater); off unless said, as it slows
    * the restore's loading on a node whose cache and store share a disk.
    */
-  restoreWritesCache: defaulted(Schema.Boolean, false),
+  // Spike: on for the bench, which installs alasio's defaults.
+  restoreWritesCache: defaulted(Schema.Boolean, true),
   /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
