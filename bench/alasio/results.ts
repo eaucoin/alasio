@@ -14,6 +14,9 @@ import { ALASIO_UNDER_TEST, BAYMA_UNDER_TEST, BENCH_DIR, HOST, PROFILE, PROFILES
 /** The metrics a result has, null unless measured. */
 export const METRICS = [
   "save_total_ms", "unavailable_ms", "pause_reported_ms", "slowdown", "precopy_passes", "precopy_bytes", "image_bytes", "uploaded_bytes", "first_exec_ms", "verify_ms", "resident_ms", "resident_how", "memory_peak_bytes", "memory_bytes", "workload_rss_bytes",
+  // Of the restored sandbox's memory, as its node's agent reads it (src/node-agent/memory.ts): its MemoryFile's, its
+  // application's memory with its page cache and tmpfs, and the rest, its Sentry's, gofer's and shims'; and the agent's own.
+  "memory_file_bytes", "sandbox_overhead_bytes", "node_agent_memory_bytes",
   // The mechanism's own splits, from runsc's boot log; the product's, from alasio's spans; what moved, from the node's counters.
   "kernel_save_ms", "memory_save_ms", "overall_save_ms", "durable_store_ms", "store_sent_bytes", "uploaded_over_needed",
   "restore_kernel_load_ms", "restore_memory_load_ms", "restore_to_running_ms", "runsc_resume_ms", "policy_wait_ms", "probe_exec_ms", "orchestration_ms",
