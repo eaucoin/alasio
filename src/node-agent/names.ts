@@ -36,6 +36,8 @@ export const NODE_AGENT_RUN_DIR_VARIABLE = "ALASIO_NODE_AGENT_RUN_DIR";
 export const storeSocket = (runDir: string): string => `${runDir}/store.sock`;
 /** The file a node agent keeps its restores' tokens in, on its node, in `runDir` (NODE_AGENT_RUN_DIR). */
 export const storeTokensFile = (runDir: string): string => `${runDir}/tokens.json`;
+/** The file a node agent keeps the restores it follows the reads of by their gofers' counts in (./gofer-reads.ts), on its node, in `runDir`. */
+export const goferReadsFile = (runDir: string): string => `${runDir}/gofer-reads.json`;
 /** The URL a restore's gofer names the store by through STORE_SOCKET, which it signs: no host's, as the socket alone is dialled. */
 export const STORE_SOCKET_ENDPOINT = "http://alasio-node-agent";
 
@@ -339,6 +341,28 @@ export const restoresWithPagesCache = (release: string, since: string): boolean 
 
 /** The variable that gives the node agent the first gVisor release that writes a restore's pages files through to the node's cache (restoresWithPagesCache). */
 export const RESTORES_WITH_PAGES_CACHE_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE";
+
+/**
+ * Whether gVisor's `release` reads a restore's files from the bucket by URLs presigned for each
+ * (s3 options' `urls`), holding no credentials, and counts the bytes of pages it read in a file
+ * (`served_file`), so that the node agent follows its reads without being on their path
+ * (./gofer-reads.ts), and ends its loading on demand (runsc fail-load). One at or past `since`,
+ * the first release that does, as cluster/node/pins.json says it (gvisor.restoresByUrlSince),
+ * where the installation reads restores so (sessions.snapshots.restoreReads "presigned") and gives
+ * the node agent it (RESTORES_BY_URL_SINCE_VARIABLE); none where `since` names none, every
+ * restore from the bucket then read through the agent's proxy (./store-proxy.ts).
+ */
+export const restoresByUrl = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that reads a restore's files by presigned URLs (restoresByUrl). */
+export const RESTORES_BY_URL_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_BY_URL_SINCE";
+
+/**
+ * The variable that gives the node agent, as `<namespace>/<name>`, the NetworkPolicy that admits
+ * the nodes to the bundled store's S3 port, which it keeps its node's addresses in
+ * (./store-admission.ts): where the installation's restores read it by URLs; none otherwise.
+ */
+export const STORE_FROM_NODES_POLICY_VARIABLE = "ALASIO_STORE_FROM_NODES_POLICY";
 
 /**
  * Whether gVisor's `release` records a sandbox's working set as a live checkpoint resumes it,

@@ -238,6 +238,8 @@ export interface SnapshotCache {
    * The workspace is used now.
    */
   readonly prepareRemote: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError>;
+  /** The directory prepareRemote prepares the snapshot of the workspace in, and answers. */
+  readonly remote: (environment: string, workspace: string, snapshot: string) => string;
   /** Removes the options file `name` of each snapshot prepared of the workspace from the bucket, as prepareRemote wrote it. */
   readonly unprepareRemote: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
   /**
@@ -547,6 +549,11 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         // Owner-only from its making: it holds the restore's token.
         await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
+    },
+
+    remote: (environment, workspace, snapshot) => {
+      checked(environment, workspace, snapshot);
+      return join(workspaceDir(environment, workspace), snapshot);
     },
 
     remoteCopy: (environment, workspace, snapshot, name, options) => {

@@ -55,6 +55,7 @@ import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHIN
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { oneAtATime } from "../src/manifests/volume-lock.ts";
 import { goferOf, restoresIntoStandby, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { admitting } from "../../src/node-agent/store-admission.ts";
 import { hostPathOf, readUnder } from "../../src/node-agent/volume.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { environmentAccess } from "../src/manifests/log.ts";
@@ -234,6 +235,7 @@ describe("configuration", () => {
       loadingStallWait: "90s",
       nodeCache: "5Gi",
       restoreWritesCache: false,
+      restoreReads: "proxy",
       nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
   });
@@ -2627,6 +2629,7 @@ describe("node agents", () => {
       ALASIO_GVISOR_RESTORES_WITH_ETAGS_SINCE: "20261102.0-eaucoin.11",
       // None unless the config says so.
       ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE: "",
+      ALASIO_GVISOR_RESTORES_BY_URL_SINCE: "",
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
       ALASIO_LOADING_STALL_SECONDS: "90",
@@ -2644,6 +2647,16 @@ describe("node agents", () => {
     // A restore's pages written through to the node's cache from the release that can, where the config says so alone.
     assert.equal(env({ sessions: { snapshots: { restoreWritesCache: true } } })["ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE"], "20261102.0-eaucoin.11");
     assert.equal(env({ sessions: { snapshots: { restoreWritesCache: false } } })["ALASIO_GVISOR_RESTORES_WITH_PAGES_CACHE_SINCE"], "");
+    // A restore read straight from the store by URLs from the release that can, where the config says so alone, its node
+    // admitted to the bundled store by the policy it is given; an operator's store admits its readers itself.
+    const presigned = env({ sessions: { snapshots: { restoreReads: "presigned" } } });
+    assert.equal(presigned["ALASIO_GVISOR_RESTORES_BY_URL_SINCE"], NODE_PINS.gvisor.restoresByUrlSince);
+    assert.equal(presigned["ALASIO_STORE_FROM_NODES_POLICY"], "alasio/alasio-seaweedfs-from-nodes");
+    assert.equal(env({ sessions: { snapshots: { restoreReads: "proxy" } } })["ALASIO_GVISOR_RESTORES_BY_URL_SINCE"], "");
+    assert.equal(env({ sessions: { snapshots: { restoreReads: "proxy" } } })["ALASIO_STORE_FROM_NODES_POLICY"], undefined);
+    const operators = env({ sessions: { snapshots: { restoreReads: "presigned" } }, objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } });
+    assert.equal(operators["ALASIO_GVISOR_RESTORES_BY_URL_SINCE"], NODE_PINS.gvisor.restoresByUrlSince);
+    assert.equal(operators["ALASIO_STORE_FROM_NODES_POLICY"], undefined);
     // Without a collector, it exports nothing.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
   });
@@ -2712,6 +2725,43 @@ describe("node agents", () => {
     assert.deepEqual(egress(external("https://s3.example.com")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 443 }] }, metadata]);
     assert.deepEqual(egress(external("http://minio.lan:9000")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 9000 }] }, metadata]);
     assert.deepEqual(all(install(external("http://minio.lan:9000")), "NetworkPolicy").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs-snapshots"), []);
+  });
+
+  test("admit the nodes to the bundled store's S3 port, where restores read it by URLs, by the addresses their agents keep in a policy they alone may write, of host addresses alone, and no session's pod; nothing of it where restores read through the agents, or the store is an operator's", () => {
+    const presigned = { sessions: { snapshots: { restoreReads: "presigned" } } };
+    const objects = install(presigned);
+    const name = "alasio-seaweedfs-from-nodes";
+    const policy = one<NetworkPolicyObject>(objects, "NetworkPolicy", name);
+    // Of no rule as installed, so that installing again leaves the agents' be, and a rule of no peer admits no one.
+    assert.deepEqual(policy.spec, {
+      podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs" } },
+      policyTypes: ["Ingress"],
+    });
+    const store = { namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs" } };
+    const session = { namespace: "alasio-sessions", namespaceLabels: { "kubernetes.io/metadata.name": "alasio-sessions" }, labels: { "alasio.dev/workload": "session" } };
+    const agent = { ...store, labels: { ...store.labels, "app.kubernetes.io/component": "node-agent" } };
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    assert.equal(admits(policies, session, store, 8333), false);
+    assert.equal(admits(policies, agent, store, 8333), true);
+    // What the agents write: each of their nodes' addresses, a host's block alone, which no session's pod is of.
+    const written = admitting(policy, { "node-1": ["10.42.0.0", "10.42.0.1", "172.18.0.2"], "node-2": ["fd00:42:1::1"] }) as NetworkPolicyObject;
+    const blocks = (written.spec.ingress ?? []).flatMap(({ from = [] }) => from.map(({ ipBlock }) => ipBlock?.cidr));
+    assert.deepEqual(blocks, ["10.42.0.0/32", "10.42.0.1/32", "172.18.0.2/32", "fd00:42:1::1/128"]);
+    assert.deepEqual(written.spec.ingress?.map(({ ports }) => ports), [[{ protocol: "TCP", port: 8333 }]]);
+    // That policy alone, read and written, and the nodes, read, by the agents' account.
+    const role = one<V1Role>(objects, "Role", "alasio-node-agent-store-admission");
+    assert.deepEqual(role.rules, [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [name], verbs: ["get", "update"] }]);
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-node-agent-store-admission").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }]);
+    for (const kind of ["RoleBinding", "ClusterRoleBinding"]) {
+      assert.deepEqual(one<V1RoleBinding>(objects, kind, "alasio-node-agent-store-admission").subjects, [{ kind: "ServiceAccount", name: "alasio-node-agent", namespace: "alasio" }]);
+    }
+    // Through the agents, or an operator's store: none of it.
+    const external = { objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } };
+    for (const file of [{}, { sessions: { snapshots: { restoreReads: "proxy" } } }, { ...presigned, ...external }, { ...presigned, networkPolicies: { enabled: false } }]) {
+      const none = install(file);
+      assert.deepEqual(all(none, "NetworkPolicy").filter(({ metadata }) => metadata?.name === name), []);
+      assert.deepEqual(none.filter(({ metadata }) => metadata?.name === "alasio-node-agent-store-admission"), []);
+    }
   });
 
   test("are reached by the sandbox gateway, not alasio, which watches no pod", () => {
