@@ -38,17 +38,20 @@ export const RUNS = Number(process.env["BENCH_RUNS"] || 20);
  * - `mixed-release`, `mixed-saves`, `mixed-fill`, `mixed-all`: as shipped, each restore beside a
  *   load of other sessions' (./mixed.ts): a release and its compaction, two live saves, a cache
  *   fill after a cold restore, or all of them;
+ * - `cold-save`: as `whole`, its release a whole image, which its cold restore restores; then the
+ *   session saved live as soon as every page of it is resident, before its node has fetched that
+ *   image whole (phase `save-after-cold`);
  * - `turn-replay`: turns replayed from a message at the webhook to their first exec, against the
  *   session in each tier (./turns.ts), in place of the save and restore phases.
  */
 export const VARIANT = variable("BENCH_VARIANT");
 const CHAIN = /^chain-([1-9][0-9]*)$/u.exec(VARIANT);
 const MIXED = /^mixed-(release|saves|fill|all)$/u.exec(VARIANT);
-if (!["as-shipped", "kept-cache", "whole", "restored", "trace", "turn-replay"].includes(VARIANT) && !CHAIN && !MIXED) {
+if (!["as-shipped", "kept-cache", "whole", "restored", "trace", "cold-save", "turn-replay"].includes(VARIANT) && !CHAIN && !MIXED) {
   throw new Error(`BENCH_VARIANT is ${VARIANT}: no variant of the benchmark's (./settings.ts VARIANT)`);
 }
 /** The live saves a run takes before its release. */
-export const LIVE_SAVES = VARIANT === "whole" ? 0 : CHAIN ? Number(CHAIN[1]) - 1 : 1;
+export const LIVE_SAVES = VARIANT === "whole" || VARIANT === "cold-save" ? 0 : CHAIN ? Number(CHAIN[1]) - 1 : 1;
 /** The load a mixed variant's restores run beside, or null. */
 export const MIXED_LOAD = (MIXED?.[1] ?? null) as "release" | "saves" | "fill" | "all" | null;
 /** Whether the node's page cache is dropped before the warm restore: kept by `kept-cache` alone. */

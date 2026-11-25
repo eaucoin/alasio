@@ -26,7 +26,7 @@ export type Metrics = Partial<Record<(typeof METRICS)[number], number | string |
 /** The checks of a phase that restores nothing. */
 export const NO_CHECKS = { marker: null, memory: null, children: null, file: null, socket: null, running: null, notice: null };
 
-export type Phase = "exec-running" | "save-live" | "save-stop" | "restore-warm" | "restore-cold" | "turn-replay";
+export type Phase = "exec-running" | "save-live" | "save-stop" | "restore-warm" | "restore-cold" | "save-after-cold" | "turn-replay";
 /** A replayed turn's session's tier as its message came: running (T0), released with its image on the node (T3), or in the store alone (T4); frozen (T1) and reclaimed (T2) are not tiers alasio has. */
 export type Tier = "T0" | "T3" | "T4";
 

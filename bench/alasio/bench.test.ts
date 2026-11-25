@@ -16,7 +16,11 @@
  *    in the `kept-cache` variant);
  * 5. restore-cold: the workspace put back as it was at the release (a JuiceFS clone through the
  *    node agent), its snapshot made current again and its release record written again, and every
- *    node's cache of it removed, with the page cache, then restored as warm, from the bucket.
+ *    node's cache of it removed, with the page cache, then restored as warm, from the bucket;
+ * 6. save-after-cold, in the `cold-save` variant alone, whose release is a whole image as `whole`'s
+ *    is: the node agent's live checkpoint of the session restored cold, asked as save-live is as
+ *    soon as every page of it is resident, before its node has fetched the restored image whole,
+ *    again while it is deferred or its restore reads the bucket still.
  *
  * The emulated store profiles put toxiproxy in each node agent's network namespace, the only client
  * of the snapshots bucket (bench/common/store/shape.ts). The sandboxes' boot logs (runsc's, which
@@ -98,7 +102,7 @@ interface Held {
  * alasio's spans of it are read from the lake, which fill what the spans say of each.
  */
 async function runOnce(fixture: string, sizeMib: number, run: number, runId: string): Promise<void> {
-  const phases: readonly Phase[] = ["exec-running", "save-live", "save-stop", "restore-warm", "restore-cold"];
+  const phases: readonly Phase[] = ["exec-running", "save-live", "save-stop", "restore-warm", "restore-cold", ...(VARIANT === "cold-save" ? ["save-after-cold" as const] : [])];
   const runStarted = Date.now();
   const k3s = await k3sReady();
   // k3s ended and was started again since the run before, which that run may have passed through: what its journal says of it.
@@ -225,11 +229,19 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     const cacheRemoved = await coldCaches(workspace);
     const coldStandby = await standbyFor(node, standbyArm(run));
     const coldBeside = load === null ? null : await load.beside("cold");
-    const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
+    // In cold-save, saved live as soon as every page is resident, before the node has fetched the restored image whole.
+    const afterCold = VARIANT === "cold-save" ? () => savedAfterCold(workspace, sessionId, fixture, sizeMib, run) : null;
+    const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold", afterCold ?? undefined);
     hold({
       fixture, sizeMib, run, phase: "restore-cold", ...restoreOutcome(cold, "bucket"), metrics: cold.metrics, correctness: cold.probed.correctness,
       details: { ...cold.details, standby_before: coldStandby, cache_removed: cacheRemoved, mixed: coldBeside === null ? null : await coldBeside() },
     }, cold.window.fromMs, cold.window.toMs);
+    if (afterCold !== null) {
+      const saved = cold.during;
+      if (saved === null) throw new Error("the cold restore did not save it after");
+      hold(saved.result, saved.fromMs, saved.toMs);
+      if (!saved.result.ok) throw new Error(saved.result.failure ?? "the live checkpoint after the cold restore failed");
+    }
     await endUnsaved(workspace, cold.pod);
     phase = "done";
   } catch (error) {
@@ -257,6 +269,43 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
 }
 
 /**
+ * The live save of the session restored cold, asked as soon as every page of it is resident, as its node's agent begins to
+ * fetch the restored image whole (save-after-cold): asked again while it is deferred or its restore reads the bucket still,
+ * as the gateway asks a live save again.
+ * A delta of the restored image, or its whole memory again.
+ */
+async function savedAfterCold(workspace: string, sessionId: string, fixture: string, sizeMib: number, run: number): Promise<{ readonly result: Result; readonly fromMs: number; readonly toMs: number }> {
+  const { node, request } = await checkpointRequest(workspace);
+  const heldBefore = await bucketBytes(node, workspace);
+  await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
+  const fromMs = Date.now();
+  const sentBefore = (await storeBytes(node)).sent;
+  const again = (failed: string) => failed.includes("is deferred, the pages it saves still loading") || failed.includes("is not saved live while its restore from the bucket reads it still");
+  let deferred = 0;
+  let checkpointed = await liveCheckpoint(node, request);
+  while ("failed" in checkpointed && again(checkpointed.failed) && deferred < 20) {
+    deferred += 1;
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    checkpointed = await liveCheckpoint(node, request);
+  }
+  const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
+  const metrics = { unavailable_ms: gaps.max_gap_ms, slowdown: gaps.slowdown, uploaded_bytes: (await bucketBytes(node, workspace)) - heldBefore, store_sent_bytes: (await storeBytes(node)).sent - sentBefore };
+  if ("failed" in checkpointed) {
+    return { result: { fixture, sizeMib, run, phase: "save-after-cold", ok: false, failure: `save-after-cold: the node agent's live checkpoint failed: ${checkpointed.failed}`, metrics, details: { t0_wall_ms: fromMs, deferred } }, fromMs, toMs: Date.now() };
+  }
+  const [own, parent] = checkpointed.manifest.layers;
+  return {
+    result: {
+      fixture, sizeMib, run, phase: "save-after-cold", ok: true, failure: null,
+      metrics: { ...metrics, save_total_ms: checkpointed.ms, pause_reported_ms: checkpointed.manifest.pauseMs, image_bytes: own?.files.reduce((sum, { bytes }) => sum + bytes, 0) ?? null },
+      details: { snapshot: checkpointed.manifest.snapshot, chain: checkpointed.manifest.layers.length, parent: parent?.digest ?? null, deferred, t0_wall_ms: fromMs, end_wall_ms: Date.now() },
+    },
+    fromMs,
+    toMs: Date.now(),
+  };
+}
+
+/**
  * Writes a run's phases' lines, once the lake has alasio's spans of each phase that passed, or
  * three minutes have gone: each filled with what its spans say, and its spans written beside.
  */
@@ -264,7 +313,7 @@ async function written(held: readonly Held[], workspace: string, others: readonl
   const passed = held.filter(({ result }) => result.ok);
   const expected = workspace === "" ? [] : passed.flatMap(({ result, fromMs }) => {
     const from = BigInt(Math.round(fromMs * 1e6)) - 1_000_000_000n;
-    if (result.phase === "save-live" || result.phase === "save-stop") return [hasSpan("alasio.node_agent.checkpoint", workspace, from)];
+    if (result.phase === "save-live" || result.phase === "save-stop" || result.phase === "save-after-cold") return [hasSpan("alasio.node_agent.checkpoint", workspace, from)];
     if (result.phase === "restore-warm" || result.phase === "restore-cold") return [hasSpan("alasio.sandbox.ready", workspace, from), hasSpan("alasio.node_agent.resume", workspace, from)];
     return [];
   });
@@ -276,7 +325,7 @@ async function written(held: readonly Held[], workspace: string, others: readonl
     });
   const key = sessionKey(workspace);
   for (const { result, fromMs, toMs } of held) {
-    const fromSpans = result.phase === "save-live" ? { durable_store_ms: liveDurableMs(spans, workspace, fromMs - 1000) }
+    const fromSpans = result.phase === "save-live" || result.phase === "save-after-cold" ? { durable_store_ms: liveDurableMs(spans, workspace, fromMs - 1000) }
       : result.phase === "save-stop" ? { durable_store_ms: releaseDurableMs(spans, workspace, key, fromMs - 1000) }
       : result.phase === "restore-warm" || result.phase === "restore-cold" ? restoreSpanMetrics(spans, workspace, fromMs, result.metrics)
       : {};
