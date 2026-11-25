@@ -17,7 +17,7 @@ import { test } from "node:test";
 
 import { Effect, Exit, Fiber } from "effect";
 
-import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
+import { makeS3Bucket, PRESIGNED_MAX_SECONDS, presignedUrl, queryAuthSignature, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { startFakeS3 } from "./support/fake-s3.ts";
 
 /** The credentials and scope of AWS's test suite (aws-sig-v4-test-suite, as botocore keeps it in tests/unit/auth/aws4_testsuite). */
@@ -56,7 +56,69 @@ test("requests are signed as AWS's Signature Version 4 test suite signs them", (
   );
 });
 
+test("a request signed in its query is signed as AWS's example of a presigned URL is", () => {
+  // Amazon S3's "Authenticating Requests: Using Query Parameters", its GET of examplebucket's test.txt.
+  assert.equal(
+    queryAuthSignature(
+      {
+        method: "GET",
+        path: "/test.txt",
+        query: {
+          "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+          "X-Amz-Credential": "AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request",
+          "X-Amz-Date": "20130524T000000Z",
+          "X-Amz-Expires": "86400",
+          "X-Amz-SignedHeaders": "host",
+        },
+        host: "examplebucket.s3.amazonaws.com",
+      },
+      { region: "us-east-1", service: "s3" },
+      { accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" },
+    ),
+    "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+  );
+});
+
 const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
+
+/** The status of `method` of `url`, with `headers`, and the body it was answered with. */
+const fetched = async (url: string, method = "GET", headers: Record<string, string> = {}): Promise<{ readonly status: number; readonly body: Buffer }> => {
+  const response = await fetch(url, { method, headers });
+  return { status: response.status, body: Buffer.from(await response.arrayBuffer()) };
+};
+
+test("a presigned URL of an object grants its method of that object alone, of a range and as of an ETag too, until it expires, and no request that sends a header of the store's it does not sign", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  try {
+    const object = Buffer.from("0123456789abcdef".repeat(256));
+    s3.objects.set("main/fs-abc/layers/d1/pages.img", object);
+    s3.objects.set("main/fs-abc/layers/d2/pages.img", object);
+    const signer = { region: "us-east-1", ...CREDENTIALS };
+    const url = presignedUrl(s3.endpoint, "snapshots", "main/fs-abc/layers/d1/pages.img", "GET", signer, new Date(), 60);
+    // It signs nothing of the agent's but its host: no credential's secret in it.
+    assert.ok(!url.includes(encodeURIComponent(CREDENTIALS.secretAccessKey)) && !url.includes(CREDENTIALS.secretAccessKey));
+    assert.deepEqual(await fetched(url), { status: 200, body: object });
+    assert.deepEqual(await fetched(url, "GET", { range: "bytes=16-31" }), { status: 206, body: object.subarray(16, 32) });
+    const etag = `"${createHash("md5").update(object).digest("hex")}"`;
+    assert.equal((await fetched(url, "GET", { "if-match": etag, range: "bytes=0-15" })).status, 206);
+    assert.equal((await fetched(url, "GET", { "if-match": '"0123"' })).status, 412);
+    // Another object, another method, a header of the store's: refused.
+    assert.equal((await fetched(url.replace("/d1/", "/d2/"))).status, 403);
+    assert.equal((await fetched(url, "PUT")).status, 403);
+    assert.equal((await fetched(url, "HEAD")).status, 403);
+    assert.equal((await fetched(presignedUrl(s3.endpoint, "snapshots", "main/fs-abc/layers/d1/pages.img", "HEAD", signer, new Date(), 60), "HEAD")).status, 200);
+    assert.equal((await fetched(url, "GET", { "x-amz-content-sha256": "UNSIGNED-PAYLOAD" })).status, 403);
+    // Signed by another key, or past its expiry: refused.
+    assert.equal((await fetched(presignedUrl(s3.endpoint, "snapshots", "main/fs-abc/layers/d1/pages.img", "GET", { ...signer, secretAccessKey: "another" }, new Date(), 60))).status, 403);
+    assert.equal((await fetched(presignedUrl(s3.endpoint, "snapshots", "main/fs-abc/layers/d1/pages.img", "GET", signer, new Date(Date.now() - 61_000), 60))).status, 403);
+    assert.equal((await fetched(presignedUrl(s3.endpoint, "snapshots", "main/fs-abc/layers/d1/pages.img", "GET", signer, new Date(Date.now() - 59_000), 60))).status, 200);
+    // S3 takes none past 7 days.
+    assert.throws(() => presignedUrl(s3.endpoint, "snapshots", "k", "GET", signer, new Date(), PRESIGNED_MAX_SECONDS + 1), RangeError);
+    assert.throws(() => presignedUrl(s3.endpoint, "snapshots", "k", "GET", signer, new Date(), 0), RangeError);
+  } finally {
+    await s3.close();
+  }
+});
 
 test("the bucket takes files and JSON, gives them back, says what it holds, copies within itself, lists a prefix across pages, and deletes, as of an ETag too, every request signed", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, pageSize: 2 });

@@ -4,7 +4,8 @@
  * ListObjectsV2, multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
  * CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads), and, of the versions a
  * test gives it, ListObjectVersions and DeleteObjects, every
- * request's Signature Version 4 checked against the credentials it is given, with every
+ * request's Signature Version 4 checked against the credentials it is given, in its
+ * Authorization header or in its query, as a presigned URL's is, before its expiry, with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
  * asked is recorded in order, a request can be made to fail, and its gets and heads to wait,
  * as they would on a network, and the whole of it to go away and come back.
@@ -13,7 +14,7 @@ import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { type ListedVersion, type S3Credentials, sigV4Authorization, UNSIGNED_PAYLOAD } from "../../src/node-agent/s3.ts";
+import { type ListedVersion, queryAuthSignature, type S3Credentials, sigV4Authorization, UNSIGNED_PAYLOAD } from "../../src/node-agent/s3.ts";
 
 /** A running stand-in. */
 export interface FakeS3 {
@@ -91,6 +92,32 @@ const AUTHORIZATION = /^AWS4-HMAC-SHA256 Credential=[^/]+\/\d{8}\/[^/]+\/s3\/aws
 
 const escapeXml = (text: string): string => text.replace(/[&<>"']/gu, (char) => `&#${char.charCodeAt(0)};`);
 
+/** A time as Signature Version 4 writes it, `YYYYMMDDTHHMMSSZ`, as milliseconds since the epoch, or NaN. */
+const amzTime = (value: string): number => {
+  const parts = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/u.exec(value);
+  return parts ? Date.UTC(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]), Number(parts[4]), Number(parts[5]), Number(parts[6])) : Number.NaN;
+};
+
+/**
+ * Why a request signed in its query (a presigned URL), of `method` at `url`, sent to `host`, is
+ * refused, as S3 refuses one: not signed by the keys it is given, for its method, path, query and
+ * host, its host the one header it signs; or past its expiry; null where it is not.
+ */
+function queryRefusal(method: string, url: URL, host: string, { region, ...credentials }: S3Credentials & { readonly region: string }): string | null {
+  const query = Object.fromEntries(url.searchParams);
+  const { "X-Amz-Signature": signature = "", ...signedQuery } = query;
+  if (query["X-Amz-Algorithm"] !== "AWS4-HMAC-SHA256") return "the request is not signed with Signature Version 4";
+  const [keyId, day, scopeRegion, service, terminal] = (query["X-Amz-Credential"] ?? "").split("/");
+  if (keyId !== credentials.accessKeyId || scopeRegion !== region || service !== "s3" || terminal !== "aws4_request" || day !== query["X-Amz-Date"]?.slice(0, 8)) return "the request is signed by no key of the store's";
+  if (query["X-Amz-SignedHeaders"] !== "host") return "the request signs other headers than its host";
+  const expires = Number(query["X-Amz-Expires"]);
+  const at = amzTime(query["X-Amz-Date"] ?? "");
+  if (!Number.isInteger(expires) || expires < 1 || expires > 7 * 24 * 60 * 60 || Number.isNaN(at)) return "the request's date or expiry is not one";
+  if (Date.now() > at + expires * 1000) return "the request has expired";
+  const expected = queryAuthSignature({ method, path: url.pathname, query: signedQuery, host }, { region, service: "s3" }, credentials);
+  return signature === expected ? null : "the signature is not the request's";
+}
+
 function error(response: ServerResponse, status: number, code: string, message: string): void {
   response.writeHead(status, { "content-type": "application/xml" }).end(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${escapeXml(message)}</Message></Error>`);
 }
@@ -133,18 +160,29 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     const url = new URL(request.url ?? "/", "http://s3");
     const body = await bodyOf(request);
     const authorization = request.headers.authorization ?? "";
-    const signed = AUTHORIZATION.exec(authorization);
-    const payloadHash = String(request.headers["x-amz-content-sha256"] ?? "");
-    if (!signed) return error(response, 403, "AccessDenied", "the request is not signed");
-    const headers = Object.fromEntries((signed[1] ?? "").split(";").map((name) => [name, String(request.headers[name] ?? "")]));
-    const expected = sigV4Authorization(
-      { method, path: url.pathname, query: Object.fromEntries(url.searchParams), headers, payloadHash },
-      { region, service: "s3" },
-      { accessKeyId, secretAccessKey },
-    );
-    if (authorization !== expected) return error(response, 403, "SignatureDoesNotMatch", "the signature is not the request's");
+    // Signed in its query, as a presigned URL is, or in its Authorization header.
+    const inQuery = url.searchParams.has("X-Amz-Signature");
+    const signed = inQuery ? null : AUTHORIZATION.exec(authorization);
+    const payloadHash = inQuery ? UNSIGNED_PAYLOAD : String(request.headers["x-amz-content-sha256"] ?? "");
+    let headers: Record<string, string> = {};
+    if (inQuery) {
+      const refused = queryRefusal(method, url, String(request.headers.host ?? ""), { region, accessKeyId, secretAccessKey });
+      if (refused !== null) return error(response, 403, "AccessDenied", refused);
+      headers = { host: String(request.headers.host ?? "") };
+    } else {
+      if (!signed) return error(response, 403, "AccessDenied", "the request is not signed");
+      headers = Object.fromEntries((signed[1] ?? "").split(";").map((name) => [name, String(request.headers[name] ?? "")]));
+      const expected = sigV4Authorization(
+        { method, path: url.pathname, query: Object.fromEntries(url.searchParams), headers, payloadHash },
+        { region, service: "s3" },
+        { accessKeyId, secretAccessKey },
+      );
+      if (authorization !== expected) return error(response, 403, "SignatureDoesNotMatch", "the signature is not the request's");
+    }
     const unsigned = Object.keys(request.headers).find((name) => name.startsWith("x-amz-") && !(name in headers));
     if (unsigned !== undefined) return error(response, 403, "AccessDenied", `the header ${unsigned} is not signed`);
+    // What a presigned URL is given: the query its signature signs, the X-Amz parameters of it not the object's.
+    for (const name of [...url.searchParams.keys()]) if (inQuery && name.startsWith("X-Amz-")) url.searchParams.delete(name);
     if (payloadHash !== UNSIGNED_PAYLOAD && payloadHash !== createHash("sha256").update(body).digest("hex")) {
       return error(response, 400, "XAmzContentSHA256Mismatch", "the payload is not the one signed");
     }

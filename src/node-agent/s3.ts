@@ -314,6 +314,48 @@ export function sigV4Authorization(request: SigningRequest, scope: SigningScope,
   return `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 }
 
+/** The most S3 lets a presigned URL last: 7 days. */
+export const PRESIGNED_MAX_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * The signature of a request signed in its query, as Signature Version 4's query authentication
+ * signs one (a presigned URL's `X-Amz-Signature`): of its method, its path, encoded as it is
+ * sent, its query but the signature, every parameter of it `X-Amz-Date` and `X-Amz-Credential`
+ * among them, and its host, the one header it signs, its payload unsigned.
+ */
+export function queryAuthSignature(request: { readonly method: string; readonly path: string; readonly query: Readonly<Record<string, string>>; readonly host: string }, scope: SigningScope, credentials: S3Credentials): string {
+  const time = request.query["X-Amz-Date"] ?? "";
+  const credentialScope = `${time.slice(0, 8)}/${scope.region}/${scope.service}/aws4_request`;
+  const canonicalRequest = [request.method, request.path, canonicalQuery(request.query), `host:${request.host}`, "", "host", UNSIGNED_PAYLOAD].join("\n");
+  const stringToSign = ["AWS4-HMAC-SHA256", time, credentialScope, sha256Hex(canonicalRequest)].join("\n");
+  const signingKey = hmac(hmac(hmac(hmac(`AWS4${credentials.secretAccessKey}`, time.slice(0, 8)), scope.region), scope.service), "aws4_request");
+  return createHmac("sha256", signingKey).update(stringToSign).digest("hex");
+}
+
+/**
+ * The URL of the object `key` of `bucket`, path-style at `endpoint` (`http(s)://host[:port]`, as
+ * whoever is given it reaches the store), presigned for `method` with `credentials` by Signature
+ * Version 4's query authentication, as S3's presigned URLs are, at `at`, for `expiresSeconds`
+ * (at most PRESIGNED_MAX_SECONDS): it grants that request of that object alone, until then,
+ * signing its host alone, so that a request of it may add a range and an If-Match, which the
+ * store does not check against the signature, and sends no `x-amz-*` header, which it would.
+ */
+export function presignedUrl(endpoint: string, bucket: string, key: string, method: "GET" | "HEAD", { region, ...credentials }: S3Credentials & { readonly region: string }, at: Date, expiresSeconds: number): string {
+  if (!Number.isInteger(expiresSeconds) || expiresSeconds < 1 || expiresSeconds > PRESIGNED_MAX_SECONDS) throw new RangeError(`a presigned URL lasts 1 s to ${PRESIGNED_MAX_SECONDS} s, not ${expiresSeconds}`);
+  const base = new URL(endpoint);
+  const path = `${base.pathname.replace(/\/+$/u, "")}/${uriEncode(bucket)}/${key.split("/").map(uriEncode).join("/")}`;
+  const time = amzDate(at);
+  const query: Record<string, string> = {
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": `${credentials.accessKeyId}/${time.slice(0, 8)}/${region}/s3/aws4_request`,
+    "X-Amz-Date": time,
+    "X-Amz-Expires": String(expiresSeconds),
+    "X-Amz-SignedHeaders": "host",
+  };
+  const signature = queryAuthSignature({ method, path, query, host: base.host }, { region, service: "s3" }, credentials);
+  return `${base.protocol}//${base.host}${path}?${canonicalQuery({ ...query, "X-Amz-Signature": signature })}`;
+}
+
 /** A time as Signature Version 4 writes it: `YYYYMMDDTHHMMSSZ`. */
 function amzDate(at: Date): string {
   return at.toISOString().replace(/[-:]|\.\d{3}/gu, "");
