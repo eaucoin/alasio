@@ -193,6 +193,7 @@ import {
   ATTACH_ROOT,
   BACKGROUND_READ_SECONDS_VARIABLE,
   CONTAINERD,
+  DELTA_AFTER_COLD_RESTORE_VARIABLE,
   GVISOR_RELEASES,
   HOLDINGS_WAIT_MS,
   LOADING_SAVE_TEST_TIMINGS_VARIABLE,
@@ -607,8 +608,10 @@ const CONDITIONS_TRIES = Schedule.min([Schedule.exponential("1 second"), Schedul
  * NODE_AGENT_RUN_DIR_VARIABLE says), how long a resumed restore may read it there
  * (BACKGROUND_READ_SECONDS_VARIABLE), and how long a release's save of a sandbox whose
  * restore reads it still may see no byte of it served (LOADING_STALL_SECONDS_VARIABLE; and, for
- * a test alone, LOADING_SAVE_TEST_TIMINGS_VARIABLE), and whether a checkpoint uploads its image
- * in one pass (ONE_PASS_SAVES_VARIABLE; no unless given). What a
+ * a test alone, LOADING_SAVE_TEST_TIMINGS_VARIABLE), whether a checkpoint uploads its image
+ * in one pass (ONE_PASS_SAVES_VARIABLE; yes unless given), and whether a restore from the bucket
+ * keeps its image's pages metadata for the next checkpoint's delta
+ * (DELTA_AFTER_COLD_RESTORE_VARIABLE; no unless given). What a
  * stopped agent left half written in the cache is removed first; what is attached on the node
  * is kept to the pods the cluster has on it (./attachments.ts), which it reads as its
  * ServiceAccount, of no other right. Once it serves, the bucket's store is proved to honour
@@ -627,6 +630,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const loadingStallSeconds = yield* Config.Int(LOADING_STALL_SECONDS_VARIABLE);
   const onePassSaves = yield* Config.Boolean(ONE_PASS_SAVES_VARIABLE).pipe(Config.withDefault(true));
+  const deltaAfterColdRestore = yield* Config.Boolean(DELTA_AFTER_COLD_RESTORE_VARIABLE).pipe(Config.withDefault(false));
   const testTimings = yield* Config.schema(LoadingSaveTestTimings, LOADING_SAVE_TEST_TIMINGS_VARIABLE).pipe(Config.option);
   const { loadWaitSeconds, ...loadingTimings } = Option.getOrElse(testTimings, (): typeof LoadingSaveTestTimings.Type => ({}));
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
@@ -666,6 +670,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     ...(loadWaitSeconds === undefined ? {} : { loadWait: { waitSeconds: loadWaitSeconds } }),
     pods: podChanges(kube),
     onePassSaves,
+    deltaAfterColdRestore,
     compacted: workspaces.setCompacted,
     restores,
   });

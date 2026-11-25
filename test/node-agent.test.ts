@@ -275,6 +275,8 @@ interface NodeOptions {
   readonly onePassSaves?: boolean;
   /** Where its agent notes each sandbox it restores (NodeAgentOptions restores), one of its own unless given. */
   readonly restores?: Restores;
+  /** Whether its agent's restores from the bucket keep their image's pages metadata for the next delta (NodeAgentOptions deltaAfterColdRestore). */
+  readonly deltaAfterColdRestore?: boolean;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -282,7 +284,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, deltaAfterColdRestore, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -318,6 +320,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         pods: pods ?? (() => Stream.suspend(() => Stream.make(pod.gone ? null : restoredPod(pod)))),
         ...(onePassSaves === undefined ? {} : { onePassSaves }),
         ...(restores === undefined ? {} : { restores }),
+        ...(deltaAfterColdRestore === undefined ? {} : { deltaAfterColdRestore }),
       });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted, pod, compacted };
     });
@@ -613,8 +616,8 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its image
       const [image] = first.layers;
       assert.ok(image);
       const directory = join(here.cacheDir, "main", "fs-abc", "layers", image.digest);
-      // Its digest is its pages metadata's, as runsc's is.
-      assert.equal(image.digest, sha256(readFileSync(join(directory, "pages_meta.img"))));
+      // Its digest is its pages metadata's but for the page hashes after it, as runsc's is.
+      assert.equal(image.digest, sha256(readFileSync(join(directory, "pages_meta.img"), "utf8").split("\n")[0] ?? ""));
       const { pauseMs, uploadMs, takenAt, snapshot, ...rest } = first;
       assert.match(snapshot, new RegExp(`^${SNAPSHOT_ID}$`, "u"));
       assert.ok(pauseMs >= 0 && uploadMs >= 0 && Date.parse(takenAt) <= Date.now());
@@ -3224,6 +3227,81 @@ test("a sandbox restored from the bucket, checkpointed as its pod stops while it
     })
   ));
 
+test("a sandbox restored from the bucket where its node's agent is told to keep its image's pages metadata is checkpointed as a delta of that image before the image is fetched into the cache: runsc reads of its parent only that file, kept apart from the cache's images, and removed once the image is fetched; the delta restores on another node", () =>
+  added("alasio.node_agent.parents", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+        const [image] = base.layers;
+        assert.ok(image);
+        const there = yield* node("node-2", { quietMs: 100, deltaAfterColdRestore: true });
+        // Its image's fetch held, but for its pages metadata, which the restore keeps as it begins.
+        let gotten = () => {};
+        const held = new Promise<void>((resolve) => (gotten = resolve));
+        s3.holdGet = (key) => (key.includes(image.digest) && !key.endsWith("/pages_meta.img") ? held : null);
+        const { manifest } = yield* preparing(there.agent, workspace);
+        yield* there.agent.resume(resumeRequest(manifest.snapshot));
+        const parent = join(there.cacheDir, "main", "fs-abc", "parents", image.digest);
+        for (const deadline = Date.now() + 10_000; !existsSync(join(parent, "pages_meta.img")); yield* Effect.sleep("20 millis")) assert.ok(Date.now() < deadline, "its pages metadata was not kept");
+        assert.deepEqual(readdirSync(parent), ["pages_meta.img"]);
+        assert.ok(!existsSync(join(there.cacheDir, "main", "fs-abc", "layers", image.digest)));
+        const released = yield* there.agent.checkpoint(request("fs-abc"));
+        // A delta of the image, of what it wrote since, runsc given the pages metadata alone as its parent.
+        assert.deepEqual(released.layers.slice(1), [image]);
+        const [checkpointed] = there.releases.calls(RELEASE).filter((args) => args.includes("checkpoint"));
+        assert.ok(checkpointed?.includes(`--parent-image-path=${parent}`), JSON.stringify(checkpointed));
+        gotten();
+        // The image fetched whole after all, its pages metadata kept apart gone with it.
+        yield* fetched(there, base);
+        for (const deadline = Date.now() + 10_000; existsSync(parent); yield* Effect.sleep("20 millis")) assert.ok(Date.now() < deadline, "its pages metadata was kept beside the whole image");
+        // The delta restores on another node, from the bucket, its parent the image restored before.
+        const third = yield* node("node-3");
+        const prepared = yield* preparing(third.agent, workspace);
+        assert.equal(prepared.manifest.snapshot, released.snapshot);
+        yield* third.agent.resume(resumeRequest(released.snapshot));
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.parent.outcome=kept": 1 })));
+
+test("a restore from the bucket whose image's pages metadata is not what its manifest says keeps none, said and counted, and its sandbox's next checkpoint is whole, as one whose node's agent is not told to keep it is", () =>
+  added("alasio.node_agent.parents", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const base = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+        const [image] = base.layers;
+        assert.ok(image);
+        const metadata = `main/fs-abc/layers/${image.digest}/pages_meta.img`;
+        const kept = s3.objects.get(metadata);
+        assert.ok(kept);
+        for (const told of [true, false]) {
+          // Its image's fetch held throughout; the pages metadata the bucket answers of the same size, but not the image's,
+          // as the restore has looked at its images in the bucket.
+          let gotten = () => {};
+          const held = new Promise<void>((resolve) => (gotten = resolve));
+          const other = Buffer.from(kept);
+          other[other.length - 1] = other[other.length - 1] === 0x20 ? 0x21 : 0x20;
+          s3.holdGet = (key) => {
+            if (told && key === metadata) s3.objects.set(metadata, other);
+            return key.includes(image.digest) && !key.endsWith("/pages_meta.img") ? held : null;
+          };
+          const there = yield* node(`node-${told ? "told" : "untold"}`, { quietMs: 100, deltaAfterColdRestore: told });
+          const { manifest } = yield* preparing(there.agent, workspace);
+          yield* there.agent.resume(resumeRequest(manifest.snapshot));
+          // Kept nowhere, once it has been tried, where it was.
+          for (const deadline = Date.now() + 10_000; told && !s3.requests.some((each) => each.startsWith("GET") && each.includes(metadata)); yield* Effect.sleep("20 millis")) assert.ok(Date.now() < deadline, "its pages metadata was not read");
+          yield* Effect.sleep("200 millis");
+          assert.ok(!existsSync(join(there.cacheDir, "main", "fs-abc", "parents", image.digest)), String(told));
+          const released = yield* there.agent.checkpoint(request("fs-abc"));
+          assert.equal(released.layers.length, 1, String(told));
+          s3.objects.set(metadata, kept);
+          gotten();
+        }
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.parent.outcome=SnapshotCorrupt": 1 })));
+
 test("only a release that restores straight from the bucket is given the bucket: a snapshot of one before is fetched into the cache first, and restored from there", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -3681,6 +3759,44 @@ test("the node's cache keeps within its budget, evicting the least recently used
       utimesSync(cache.workspace("main", "fs-old"), longAgo, longAgo);
       assert.deepEqual(names(yield* none.evict(spares("fs-old"))), []);
       assert.deepEqual(names(yield* none.evict(sparesNone)), ["fs-old"]);
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the node's cache keeps an image's pages metadata apart from its images, as no image of it: only while it does not hold the image whole, removed as it commits the image, discarded but where kept, and one half written removed by the next agent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-cache-"));
+  try {
+    await Effect.runPromise(Effect.gen(function*() {
+      const cache = makeSnapshotCache({ root, budget: 1024 ** 3, graceMs: 0 });
+      const keep = (digest: string) =>
+        Effect.gen(function*() {
+          writeFileSync(join(yield* cache.stageParent("main", "fs-abc", digest), "pages_meta.img"), digest);
+          yield* cache.keepParent("main", "fs-abc", digest);
+        });
+      yield* keep(D1);
+      const kept = yield* cache.parent("main", "fs-abc", D1);
+      assert.equal(kept, join(root, "main", "fs-abc", "parents", D1));
+      assert.deepEqual(readdirSync(kept ?? ""), ["pages_meta.img"]);
+      assert.equal(yield* cache.holds("main", "fs-abc", D1), false);
+      assert.deepEqual((yield* cache.list).map(({ images }) => images), [[]]);
+      // Committed whole, its pages metadata kept apart goes; and none is kept of an image held whole.
+      yield* cacheImage(cache, "fs-abc", D1, 0);
+      assert.equal(yield* cache.parent("main", "fs-abc", D1), null);
+      yield* keep(D1);
+      assert.equal(yield* cache.parent("main", "fs-abc", D1), null);
+      // Discarded but where kept.
+      yield* keep(D2);
+      assert.equal(yield* cache.discard("main", "fs-abc", [D1]), true);
+      assert.equal(yield* cache.parent("main", "fs-abc", D2), null);
+      yield* keep(D2);
+      assert.equal(yield* cache.discard("main", "fs-abc", [D2]), true);
+      assert.notEqual(yield* cache.parent("main", "fs-abc", D2), null);
+      // One half written, as a stopped agent left it, removed as the next starts.
+      yield* cache.stageParent("main", "fs-abc", D1);
+      yield* cache.clean;
+      assert.deepEqual(readdirSync(join(root, "main", "fs-abc", "parents")), [D2]);
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });

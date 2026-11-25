@@ -295,6 +295,12 @@ export const LOADING_STALL_SECONDS_VARIABLE = "ALASIO_LOADING_STALL_SECONDS";
 export const ONE_PASS_SAVES_VARIABLE = "ALASIO_ONE_PASS_SAVES";
 
 /**
+ * The variable saying whether a node agent's restores from the bucket keep their image's pages metadata in the cache, for the
+ * restored sandbox's next checkpoint's delta (./agent.ts NodeAgentOptions deltaAfterColdRestore): `true` or `false`.
+ */
+export const DELTA_AFTER_COLD_RESTORE_VARIABLE = "ALASIO_DELTA_AFTER_COLD_RESTORE";
+
+/**
  * The variable that gives a node agent, for a test alone, the timings LOADING_SAVE_FLOOR_SECONDS,
  * LOADING_STALL_SECONDS and how often it looks at a restore's reads, as JSON
  * ({"floorMs","stallMs","pollMs"}): shorter than an installation may set them, as the end-to-end

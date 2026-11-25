@@ -14,6 +14,13 @@
  * whole and its digest known, so what the cache holds is always whole; what a stopped agent
  * left half written is removed as the next one starts.
  *
+ * Beside the images, in `<root>/<environment>/<workspace>/parents/<digest>/`, the pages
+ * metadata alone of an image the cache does not hold whole, as a restore from the bucket keeps
+ * it: all a delta of that image needs of it, runsc reading of a parent image only its digest,
+ * from that file. Kept apart from the images, so that what `layers/` holds is whole still; written
+ * as an image is, in a directory beside them whose name begins with ".", then moved; removed as
+ * the cache comes to hold that image whole.
+ *
  * Beside the images, in `<root>/<environment>/<workspace>/stamps/<digest>.json`, each
  * image's stamp: its files as they were checked as they were written, each by its SHA-256,
  * and its size, inode and modification time then. An image whose files are of those still
@@ -55,6 +62,12 @@ export const LAYERS_DIR = "layers";
 
 /** The directory, under the cache's root and of no workspace, of the copies of options runsc inspects a snapshot in the bucket by (remoteCopy), and of the chains it verifies as the cache stages them (chainCopy): its name begins with ".", as no workspace's environment does. */
 const INSPECT_DIR = ".inspect";
+
+/** The directory of the pages metadata the cache keeps of images it does not hold whole, each in one named by its image's digest. */
+export const PARENTS_DIR = "parents";
+
+/** The file of an image's pages metadata, whose SHA-256 is its digest, as runsc names it. */
+export const PAGES_METADATA_FILE = "pages_meta.img";
 
 /** The directory of a workspace's images' stamps, each named by its image's digest. */
 export const STAMPS_DIR = "stamps";
@@ -113,7 +126,10 @@ export interface SnapshotCache {
   readonly stage: (environment: string, workspace: string, name: string) => Effect.Effect<string, CacheError>;
   /** Removes the image staged as `name`, as a save that failed left it. */
   readonly unstage: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
-  /** Moves the image staged as `name` where an image of `digest` is, the workspace used now; one there already is kept, the staged one removed. */
+  /**
+   * Moves the image staged as `name` where an image of `digest` is, the workspace used now; one there already is kept, the
+   * staged one removed. The pages metadata kept of it apart (keepParent) is removed, as the image's own is there.
+   */
   readonly commit: (environment: string, workspace: string, name: string, digest: string) => Effect.Effect<void, CacheError>;
   /**
    * Records the image `digest` of the workspace as `files`, its files as they were checked
@@ -127,6 +143,18 @@ export interface SnapshotCache {
    * its files is read.
    */
   readonly stamped: (environment: string, workspace: string, digest: string) => Effect.Effect<readonly CheckedFile[] | null, CacheError>;
+  /**
+   * Where the pages metadata of the image `digest` of the workspace is written until it is kept
+   * (keepParent), `PAGES_METADATA_FILE` in it, emptied first: none of the workspace's images.
+   */
+  readonly stageParent: (environment: string, workspace: string, digest: string) => Effect.Effect<string, CacheError>;
+  /**
+   * Keeps the pages metadata staged of the image `digest` (stageParent), what a delta of that
+   * image needs of it, unless the cache holds the image whole, the staged one removed then.
+   */
+  readonly keepParent: (environment: string, workspace: string, digest: string) => Effect.Effect<void, CacheError>;
+  /** The directory holding the pages metadata the cache keeps of the image `digest` of the workspace (keepParent), or null where it keeps none. */
+  readonly parent: (environment: string, workspace: string, digest: string) => Effect.Effect<string | null, CacheError>;
   /** Whether the image `digest` of the workspace is whole in the cache. */
   readonly holds: (environment: string, workspace: string, digest: string) => Effect.Effect<boolean, CacheError>;
   /**
@@ -167,7 +195,8 @@ export interface SnapshotCache {
   /** Removes everything of the workspace. */
   readonly clear: (environment: string, workspace: string) => Effect.Effect<void, CacheError>;
   /**
-   * Removes the workspace's images but `keep`, and the snapshots prepared of it, if it was
+   * Removes the workspace's images but `keep`, the pages metadata it keeps of others (keepParent),
+   * and the snapshots prepared of it, if it was
    * not used within the grace, as a restore may still be reading it: whether it did.
    */
   readonly discard: (environment: string, workspace: string, keep: readonly string[]) => Effect.Effect<boolean, CacheError>;
@@ -270,6 +299,11 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
   const holds = (environment: string, workspace: string, digest: string): Effect.Effect<boolean, CacheError> =>
     attempt(() => directories(join(workspaceDir(environment, workspace), LAYERS_DIR))).pipe(Effect.map((digests) => digests.includes(digest)));
 
+  const parentDir = (environment: string, workspace: string, digest: string): string => {
+    checked(environment, workspace, null, [digest]);
+    return join(workspaceDir(environment, workspace), PARENTS_DIR, digest);
+  };
+
   const list = attempt(async () => {
     const found: CachedWorkspace[] = [];
     // What else is there is no workspace of the agent's.
@@ -329,9 +363,42 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       const from = join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name));
       return holds(environment, workspace, digest).pipe(
         Effect.flatMap((held) => attempt(() => (held ? rm(from, { recursive: true, force: true }) : rename(from, image(environment, workspace, digest))))),
+        // Whole now, its pages metadata kept apart is the image's own.
+        Effect.andThen(attempt(() => rm(parentDir(environment, workspace, digest), { recursive: true, force: true }))),
         Effect.andThen(use(environment, workspace)),
       );
     },
+
+    stageParent: (environment, workspace, digest) => {
+      checked(environment, workspace, null, [digest]);
+      const directory = join(workspaceDir(environment, workspace), PARENTS_DIR, staged(digest));
+      return attempt(async () => {
+        await rm(directory, { recursive: true, force: true });
+        await mkdir(directory, { recursive: true });
+        return directory;
+      });
+    },
+
+    keepParent: (environment, workspace, digest) => {
+      const target = parentDir(environment, workspace, digest);
+      const from = join(workspaceDir(environment, workspace), PARENTS_DIR, staged(digest));
+      return holds(environment, workspace, digest).pipe(
+        Effect.flatMap((held) =>
+          attempt(async () => {
+            if (held) return rm(from, { recursive: true, force: true });
+            // One kept already is the same file, as its digest says.
+            await rm(target, { recursive: true, force: true });
+            await rename(from, target);
+          })
+        ),
+        Effect.andThen(use(environment, workspace)),
+      );
+    },
+
+    parent: (environment, workspace, digest) =>
+      attempt(() => directories(join(workspaceDir(environment, workspace), PARENTS_DIR))).pipe(
+        Effect.map((digests) => (digests.includes(digest) ? parentDir(environment, workspace, digest) : null)),
+      ),
 
     stamp: (environment, workspace, digest, files) =>
       attempt(async () => {
@@ -450,6 +517,9 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
             await rm(join(directory, STAMPS_DIR, `${digest}.json`), { force: true });
             await rm(join(directory, LAYERS_DIR, digest), { recursive: true, force: true });
           }
+          for (const digest of await directories(join(directory, PARENTS_DIR))) {
+            if (!keep.includes(digest)) await rm(join(directory, PARENTS_DIR, digest), { recursive: true, force: true });
+          }
           // Removing them used it, which it was not.
           await utimes(directory, usedAt / 1000, usedAt / 1000);
         });
@@ -499,7 +569,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       await rm(join(root, INSPECT_DIR), { recursive: true, force: true });
       for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {
         for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
-          for (const under of [LAYERS_DIR, STAMPS_DIR]) {
+          for (const under of [LAYERS_DIR, PARENTS_DIR, STAMPS_DIR]) {
             const directory = join(workspaceDir(environment, workspace), under);
             const entries = await readdir(directory).catch(() => [] as string[]);
             await Promise.all(entries.filter((name) => name.startsWith(".")).map((name) => rm(join(directory, name), { recursive: true, force: true })));
