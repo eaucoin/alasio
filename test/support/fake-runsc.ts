@@ -9,7 +9,9 @@
  *   ID into DIR, of runsc's three files: its state file, its pages, and its pages metadata,
  *   which here names the images it holds pages of besides its own, its layers: none, or
  *   PARENT's digest and PARENT's layers, failing as runsc does without PARENT's pages
- *   metadata, its pages 4096 bytes, or a delta's 512 unless a file `delta-pages-bytes`
+ *   metadata, and as the Sentry does where PARENT's digest is not the image's the sandbox was
+ *   restored from or last saved (here, the digest PARENT is named by, where it is named by one),
+ *   its pages 4096 bytes, or a delta's 512 unless a file `delta-pages-bytes`
  *   beside it says how many; and, of `--summary-file=PATH`, its summary at PATH, describing
  *   the image as `image inspect` and `image layers` do, the CPU features those of
  *   `summary-cpu-features` where there is one, none while a file `no-summary` is beside it.
@@ -99,6 +101,10 @@ const checkpoint = () => {
   if (parent !== undefined) {
     if (!existsSync(join(parent, "pages_meta.img"))) { process.stderr.write("checkpoint failed: the parent image " + parent + " has no pages metadata\\n"); process.exit(128); }
     const parentMeta = readFileSync(join(parent, "pages_meta.img"));
+    // The Sentry saves a delta only of the image it was restored from or last saved, refusing another's digest; here, the
+    // image the directory is named by, as the agent names each.
+    const named = basename(parent);
+    if (/^[0-9a-f]{64}$/.test(named) && digestOf(parentMeta) !== named) { process.stderr.write("checkpoint failed: the parent image's digest " + digestOf(parentMeta) + " is not that of the image the sandbox was restored from or last saved, " + named + "\\n"); process.exit(128); }
     layers = [digestOf(parentMeta), ...metaOf(parentMeta).layers];
   }
   mkdirSync(image, { recursive: true });

@@ -985,7 +985,7 @@ const uncaught = meter.createCounter("alasio.node_agent.checkpoint.uncaught", {
   unit: "{checkpoint}",
 });
 const parentsKept = meter.createCounter("alasio.node_agent.parents", {
-  description: "The pages metadata of a snapshot's image a restore from the bucket keeps in the node's cache, for the next checkpoint's delta, by outcome: kept, or what failed",
+  description: "The pages metadata of a snapshot's image a restore from the bucket keeps in the node's cache, for the next checkpoint's delta, by outcome: kept, changed (found not what it was as a checkpoint was to use it, and removed), or what failed",
   unit: "{image}",
 });
 const copies = meter.createCounter("alasio.node_agent.copies", {
@@ -1560,6 +1560,24 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
+   * The directory of the pages metadata the cache keeps of the image `own` of the workspace (keepParentLater), a delta's parent
+   * in its place, where its file is still what `own`'s manifest records, its SHA-256 read anew; or null, where it keeps none,
+   * or one that is not, which is removed, said and counted, the checkpoint then taken whole rather than refused by runsc.
+   */
+  const keptParent = (ref: WorkspaceRef, own: Layer): Effect.Effect<string | null, CacheError> =>
+    Effect.gen(function*() {
+      const directory = yield* cache.parent(ref.environment, ref.workspace, own.digest);
+      if (directory === null) return null;
+      const file = own.files.find(({ path }) => path === PAGES_METADATA_FILE);
+      const sha256 = yield* onDisk(() => readFile(join(directory, PAGES_METADATA_FILE)).then((bytes) => createHash("sha256").update(bytes).digest("hex"), () => null));
+      if (file !== undefined && sha256 === file.sha256) return directory;
+      yield* Effect.logWarning(`the pages metadata the node's cache keeps of the image ${own.digest} of ${prefixOf(ref)} is not what its manifest says: it is removed, and the checkpoint taken whole`);
+      yield* Effect.sync(() => parentsKept.add(1, { "alasio.node_agent.parent.outcome": "changed" }));
+      yield* cache.dropParent(ref.environment, ref.workspace, own.digest);
+      return null;
+    });
+
+  /**
    * The snapshot of the sandbox `request` names, taken and committed as the module says:
    * its manifest. A delta of its base, its sandbox tracking its writes and the base's image
    * in the cache, or, where deltaAfterColdRestore says so, the pages metadata of it the cache
@@ -1577,7 +1595,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const [own] = base?.layers ?? [];
       const parentImage = base === undefined || own === undefined || !tracksWrites || prefixOf(base) !== prefixOf(request) ? null
         : (yield* cache.holds(environment, workspace, own.digest)) ? cache.image(environment, workspace, own.digest)
-        : deltaAfterColdRestore ? yield* cache.parent(environment, workspace, own.digest)
+        : deltaAfterColdRestore ? yield* keptParent(request, own)
         : null;
       const extended = parentImage === null || base === undefined ? null : { manifest: base, image: parentImage };
       // A live snapshot is taken whole, of no parent, where a delta of its parent would make a
@@ -2404,16 +2422,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         const file = own.files.find(({ path }) => path === PAGES_METADATA_FILE);
         if (file === undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${own.digest} has no ${PAGES_METADATA_FILE}, as its manifest says` });
         if (yield* cache.holds(environment, workspace, own.digest)) return;
+        // Staged in a directory of its own, which no other restore of the workspace writes or moves meanwhile.
         const directory = yield* cache.stageParent(environment, workspace, own.digest);
-        const got = yield* bucket.getFile(layerKey(ref, own.digest, file.path), join(directory, PAGES_METADATA_FILE), file.bytes);
-        if (got.bytes !== file.bytes || got.sha256 !== file.sha256) {
-          return yield* new SnapshotCorrupt({
-            environment,
-            workspace,
-            reason: `its image ${own.digest}'s ${PAGES_METADATA_FILE} is ${got.bytes} bytes of SHA-256 ${got.sha256}, where its manifest says ${file.bytes} bytes of ${file.sha256}`,
-          });
-        }
-        yield* exclusive([ref], cache.keepParent(environment, workspace, own.digest));
+        return yield* Effect.gen(function*() {
+          const got = yield* bucket.getFile(layerKey(ref, own.digest, file.path), join(directory, PAGES_METADATA_FILE), file.bytes);
+          if (got.bytes !== file.bytes || got.sha256 !== file.sha256) {
+            return yield* new SnapshotCorrupt({
+              environment,
+              workspace,
+              reason: `its image ${own.digest}'s ${PAGES_METADATA_FILE} is ${got.bytes} bytes of SHA-256 ${got.sha256}, where its manifest says ${file.bytes} bytes of ${file.sha256}`,
+            });
+          }
+          yield* exclusive([ref], cache.keepParent(environment, workspace, own.digest, directory));
+        }).pipe(Effect.onError(() => onDisk(() => rm(directory, { recursive: true, force: true })).pipe(Effect.ignore)));
       });
       return inFlightWhile([ref], kept).pipe(
         Effect.andThen(counted("kept")),
@@ -2433,7 +2454,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const fetchNow = (ref: WorkspaceRef, manifest: Manifest, reader: string): Effect.Effect<void> =>
     Effect.forEach(manifest.layers, (layer) =>
       inFlightWhile([ref], Effect.gen(function*() {
-        if (yield* exclusive([ref], intact(ref, layer))) return;
+        // Held whole already: the pages metadata kept of it apart, as one an agent that stopped left, is of no use.
+        if (yield* exclusive([ref], intact(ref, layer))) return yield* cache.dropParent(ref.environment, ref.workspace, layer.digest);
         yield* cache.room(bytesOf([layer]), spared).pipe(Effect.flatMap(logEvicted));
         yield* received(ref, manifest.snapshot, layer);
         yield* exclusive([ref], committed(ref, manifest.snapshot, layer));
