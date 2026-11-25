@@ -359,7 +359,8 @@ const Snapshots = Schema.Struct({
    * is not to be made the default before a test of two nodes, on a release that reads by URLs,
    * has shown a restore read the store across them.
    */
-  restoreReads: defaulted(Schema.Literals(["proxy", "presigned"]), "proxy"),
+  // Spike: presigned for the bench, which installs alasio's defaults.
+  restoreReads: defaulted(Schema.Literals(["proxy", "presigned"]), "presigned"),
   /**
    * The node agent, which takes snapshots on its node and prepares them there. Its memory
    * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
