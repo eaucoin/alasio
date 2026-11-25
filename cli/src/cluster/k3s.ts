@@ -125,6 +125,8 @@ export const KUBELET_CONFIG = [
 export const EVICTION_MAX_POD_GRACE_SECONDS = 120;
 
 export const KUBELET_ARGS: readonly string[] = [
+  // Spike: kubelet's pod sync at verbosity 4, to place a cold restore's waits.
+  "v=4",
   "kube-reserved=cpu=250m,memory=1Gi",
   "system-reserved=cpu=250m,memory=512Mi",
   "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<1Gi",
