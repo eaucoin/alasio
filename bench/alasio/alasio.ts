@@ -8,7 +8,7 @@ import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
+import type { V1Deployment, V1Lease, V1Pod } from "@kubernetes/client-node";
 
 import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_PORT } from "../../cli/src/manifests/sandbox-gateway.ts";
@@ -300,14 +300,18 @@ export async function standbyFor(node: string, arm: "standby" | "none"): Promise
  * Ends the restored pod `name` of `workspace` without a save, as a crash ends it, and waits until it
  * is gone, and the gateway has let its binding go: its Lease gone, as the gateway records what a
  * binding whose pod went is released into while its Lease holds (src/gateway/sessions.ts
- * recordLost), which would otherwise write over the record a cold restore is given.
+ * recordLost), which would otherwise write over the record a cold restore is given. The Lease's
+ * resourceVersion as last seen before it went, the gateway's release of it.
  */
-export async function endUnsaved(workspace: string, name: string): Promise<void> {
+export async function endUnsaved(workspace: string, name: string): Promise<string | null> {
   await kube.kill(SESSIONS, name);
   await gone(name);
   const lease = ref("Lease", leaseName(sessionKey(workspace)), SESSIONS);
+  let seen: string | null = null;
   for (const deadline = Date.now() + 300_000; ; await sleep(1000)) {
-    if ((await kube.get(lease)) === null) return;
+    const held = await kube.get<V1Lease>(lease);
+    if (held === null) return seen;
+    seen = held.metadata?.resourceVersion ?? seen;
     if (Date.now() > deadline) throw new Error(`the binding of ${workspace} was not let go within 300 s of its pod's end`);
   }
 }

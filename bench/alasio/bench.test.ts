@@ -105,7 +105,15 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
   if (k3s.restarts > k3sRestarts) await sayK3sRestarted(`${fixture}-${sizeMib}-before-run-${run}`);
   k3sRestarts = k3s.restarts;
   const held: Held[] = [];
-  const hold = (result: Result, fromMs: number, toMs: number) => held.push({ result: { ...result, details: { ...result.details, k3s } }, fromMs, toMs });
+  const hold = (result: Result, fromMs: number, toMs: number): Held => {
+    const each = { result: { ...result, details: { ...result.details, k3s } }, fromMs, toMs };
+    held.push(each);
+    return each;
+  };
+  // A restore's binding let go, its Lease's resourceVersion as last seen beside the one it was bound with.
+  const letGo = (each: Held, resourceVersion: string | null) => {
+    each.result = { ...each.result, details: { ...each.result.details, lease: { ...(each.result.details?.["lease"] as object | undefined), released: resourceVersion } } };
+  };
   let phase = "setup";
   let workspace = "";
   let copy = "";
@@ -209,11 +217,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     const warmStandby = await standbyFor(node, standbyArm(run));
     const warmBeside = load === null ? null : await load.beside("warm");
     const warm = await restore(node, workspace, sessionId, fixture, runId, manifest, "warm");
-    hold({
+    const warmHeld = hold({
       fixture, sizeMib, run, phase: "restore-warm", ...restoreOutcome(warm, "cache"), metrics: warm.metrics, correctness: warm.probed.correctness,
       details: { ...warm.details, standby_before: warmStandby, compaction_sent_bytes: compactionSent, mixed: warmBeside === null ? null : await warmBeside() },
     }, warm.window.fromMs, warm.window.toMs);
-    await endUnsaved(workspace, warm.pod);
+    letGo(warmHeld, await endUnsaved(workspace, warm.pod));
 
     phase = "restore-cold";
     await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);
@@ -226,11 +234,11 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
     const coldStandby = await standbyFor(node, standbyArm(run));
     const coldBeside = load === null ? null : await load.beside("cold");
     const cold = await restore(node, workspace, sessionId, fixture, runId, manifest, "cold");
-    hold({
+    const coldHeld = hold({
       fixture, sizeMib, run, phase: "restore-cold", ...restoreOutcome(cold, "bucket"), metrics: cold.metrics, correctness: cold.probed.correctness,
       details: { ...cold.details, standby_before: coldStandby, cache_removed: cacheRemoved, mixed: coldBeside === null ? null : await coldBeside() },
     }, cold.window.fromMs, cold.window.toMs);
-    await endUnsaved(workspace, cold.pod);
+    letGo(coldHeld, await endUnsaved(workspace, cold.pod));
     phase = "done";
   } catch (error) {
     if (error instanceof Uncalibrated) throw error;

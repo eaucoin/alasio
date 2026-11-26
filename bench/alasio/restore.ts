@@ -5,9 +5,9 @@
  * counters, the sandbox's boot log, and, of the `trace` variant, the pod's own steps as kubelet
  * says them. What alasio's spans say of it is read once the run is over (withSpans).
  */
-import type { V1Pod } from "@kubernetes/client-node";
+import type { V1Lease, V1Pod } from "@kubernetes/client-node";
 
-import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
+import { BINDING_LABEL, keyHash, leaseName } from "../../src/binder/names.ts";
 import { STANDBY_ANNOTATION, STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import type { NodeMemory, SandboxState } from "../../src/node-agent/memory.ts";
@@ -91,6 +91,8 @@ export async function restore(node: string, workspace: string, sessionId: string
   // What the standby it claimed held, idle, before.
   const standbyIdle = standby ? (memoryBefore?.sandboxes.find((sandbox) => sandbox.pod === name && sandbox.state === "standby")?.bytes ?? null) : null;
   const layerCache = await layerCacheBytes(node);
+  // Its binding's Lease as the restore left it bound.
+  const lease = (await kube.get<V1Lease>(ref("Lease", leaseName(sessionKey(workspace)), SESSIONS)))?.metadata?.resourceVersion ?? null;
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
   const { line: prepared, snapshot: restoredSnapshot } = await preparedLine(node, workspace, manifest.snapshot);
   const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${restoredSnapshot}`);
@@ -114,6 +116,8 @@ export async function restore(node: string, workspace: string, sessionId: string
     // Resident, its MemoryFile's, against what it touched before its pages were read, which runsc says; what it touched after is not said.
     awaited_bytes: logged.awaitedBytes,
     standby_idle_bytes: standbyIdle,
+    sandbox_oom_group: memory.oomGroup,
+    sandbox_memory_max_bytes: memory.max,
     sandboxes_bound_bytes: byState("bound"),
     sandboxes_standby_bytes: byState("standby"),
     sandboxes_free_bytes: byState("free"),
@@ -132,7 +136,7 @@ export async function restore(node: string, workspace: string, sessionId: string
   const window = { fromMs: probed.t0_wall_ms, toMs: probed.t0_wall_ms + probed.first_exec_ms };
   const details = {
     pod: name, node, standby, source, prepared, restored_snapshot: restoredSnapshot, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said,
-    memory_stat: memory.stat, agent_memory: agentMemory, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
+    memory_stat: memory.stat, agent_memory: agentMemory, lease: { bound: lease }, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
     ...(timeline === null ? {} : { pod_timeline: await timeline.stop(pod) }),
   };
   return { probed, metrics, details, pod: name, window };

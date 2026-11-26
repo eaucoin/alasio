@@ -43,20 +43,35 @@ export async function bootLog(node: string, sandboxId: string): Promise<string[]
   return (await onNode(node, `cat ${RUNSC_LOGS}/${sandboxId}/runsc.log.*.boot.txt 2>/dev/null || true`)).split("\n");
 }
 
-/** The memory of the pod of uid `uid` on `node`, as its cgroup says: its peak and what it holds now. */
-export async function podMemory(node: string, uid: string): Promise<{ readonly peak: number | null; readonly current: number | null; readonly stat: Record<string, number> }> {
+/**
+ * The memory of the pod of uid `uid` on `node`, as its cgroup says: its peak and what it holds now;
+ * and of its pod sandbox's scope, the one of its children that holds its sandbox's processes, which
+ * the node agent's guard gives memory.oom.group and limits, those as they are read back: its
+ * oom.group, and its memory.max, null where it has none.
+ */
+export async function podMemory(node: string, uid: string): Promise<{
+  readonly peak: number | null;
+  readonly current: number | null;
+  readonly stat: Record<string, number>;
+  readonly oomGroup: number | null;
+  readonly max: number | null;
+}> {
   const printed = await onNode(node, [
     `dir=$(find /sys/fs/cgroup -maxdepth 6 -type d \\( -name '*pod${uid}*' -o -name '*pod${uid.replaceAll("-", "_")}*' \\) | head -n 1)`,
     `[ -n "$dir" ] || exit 0`,
     `echo "peak $(cat "$dir/memory.peak")"`,
     `echo "current $(cat "$dir/memory.current")"`,
     `grep -E '^(anon|file) ' "$dir/memory.stat"`,
+    `scope=$(for each in "$dir"/*/; do [ -s "$each/cgroup.procs" ] && echo "$each"; done | head -n 1)`,
+    `[ -n "$scope" ] || exit 0`,
+    `echo "oom_group $(cat "$scope/memory.oom.group")"`,
+    `echo "max $(cat "$scope/memory.max")"`,
   ].join("; "));
   const field = (name: string) => {
     const value = printed.split("\n").find((line) => line.startsWith(`${name} `))?.split(" ")[1];
-    return value === undefined ? null : Number(value);
+    return value === undefined || !/^[0-9]+$/u.test(value) ? null : Number(value);
   };
-  return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 } };
+  return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 }, oomGroup: field("oom_group"), max: field("max") };
 }
 
 /**
