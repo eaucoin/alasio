@@ -46,6 +46,13 @@ case " $* " in
   hook="${ALASIO_BAYMA_HOOK:-/usr/local/bin/bayma-sandbox-hook}"
   case "${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE:-}" in
   save | resume) exec timeout --kill-after=1 "${ALASIO_SAVE_HOOK_SECONDS:-30}" "$hook" "$@" ;;
+  restore)
+    # Told why the sandbox stopped, where the binding's variables say it
+    # (src/kube/sandbox-shape.ts SANDBOX_STOP_REASON_VARIABLE): read into the shell, the one
+    # variable exported.
+    . "$attach/env"
+    if [ -n "${BAYMA_SANDBOX_STOP_REASON:-}" ]; then export BAYMA_SANDBOX_STOP_REASON; fi
+    ;;
   esac
   exec "$hook" "$@"
   ;;
