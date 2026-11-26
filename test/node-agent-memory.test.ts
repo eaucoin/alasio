@@ -32,6 +32,8 @@ function memoryNode() {
   const ownProc = join(root, "self-cgroup");
   mkdirSync(join(ownCgroups, "kubepods.slice", "agent.scope"), { recursive: true });
   writeFileSync(join(ownCgroups, "kubepods.slice", "agent.scope", "memory.current"), `${150 * MIB}\n`);
+  writeFileSync(join(ownCgroups, "kubepods.slice", "agent.scope", "memory.stat"), `anon ${40 * MIB}\nfile ${100 * MIB}\nactive_file ${30 * MIB}\ninactive_file ${70 * MIB}\nfile_dirty 0\n`);
+  writeFileSync(join(ownCgroups, "kubepods.slice", "agent.scope", "memory.events"), "low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n");
   writeFileSync(ownProc, "0::/kubepods.slice/agent.scope\n");
   mkdirSync(join(nodeRoot, "proc"), { recursive: true });
   writeFileSync(join(nodeRoot, "proc", "meminfo"), `MemTotal:       ${16 * 1024 * 1024} kB\nMemFree:         1000 kB\nMemAvailable:    ${9 * 1024 * 1024} kB\n`);
@@ -92,13 +94,34 @@ test("the agent's own memory is its cgroup's, by the path its process names wher
     mkdirSync(join(root, "fs", "pod.slice"), { recursive: true });
     writeFileSync(join(root, "fs", "pod.slice", "memory.current"), "4096\n");
     writeFileSync(proc, "0::/pod.slice\n");
-    assert.equal(await ownMemory(proc, join(root, "fs")), 4096);
+    assert.equal((await ownMemory(proc, join(root, "fs"))).agentBytes, 4096);
     // Its own namespace: its cgroup is the root it sees, its path said as /.
     writeFileSync(join(root, "fs", "memory.current"), "8192\n");
     writeFileSync(proc, "0::/\n");
-    assert.equal(await ownMemory(proc, join(root, "fs")), 8192);
+    assert.equal((await ownMemory(proc, join(root, "fs"))).agentBytes, 8192);
     rmSync(join(root, "fs", "memory.current"));
-    assert.equal(await ownMemory(proc, join(root, "fs")), null);
+    assert.deepEqual(await ownMemory(proc, join(root, "fs")), {
+      agentBytes: null, agentAnonBytes: null, agentFileBytes: null, agentActiveFileBytes: null, agentInactiveFileBytes: null, agentDirtyBytes: null, agentEvents: null,
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the agent's own memory is split as its memory.stat says, its anonymous memory from its page cache, the page cache's active, inactive and dirty, with its cgroup's events", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-own-split-"));
+  try {
+    const proc = join(root, "cgroup");
+    const own = join(root, "fs", "pod.slice");
+    mkdirSync(own, { recursive: true });
+    writeFileSync(proc, "0::/pod.slice\n");
+    writeFileSync(join(own, "memory.current"), `${500 * MIB}\n`);
+    writeFileSync(join(own, "memory.stat"), `anon ${90 * MIB}\nfile ${400 * MIB}\nkernel 1000\nactive_file ${100 * MIB}\ninactive_file ${300 * MIB}\nfile_dirty ${2 * MIB}\n`);
+    writeFileSync(join(own, "memory.events"), "low 0\nhigh 0\nmax 1234\noom 0\noom_kill 0\noom_group_kill 0\n");
+    assert.deepEqual(await ownMemory(proc, join(root, "fs")), {
+      agentBytes: 500 * MIB, agentAnonBytes: 90 * MIB, agentFileBytes: 400 * MIB, agentActiveFileBytes: 100 * MIB, agentInactiveFileBytes: 300 * MIB, agentDirtyBytes: 2 * MIB,
+      agentEvents: { high: 0, max: 1234, oom: 0, oomKill: 0 },
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -128,7 +151,8 @@ test("each sandbox's memory is read from its pod's cgroup, its MemoryFile's of i
       { namespace: "alasio-sessions", pod: "sandboxes-none-2ccc", state: "free", bytes: null, anonBytes: null, fileBytes: null, shmemBytes: null, zswapBytes: null },
       { namespace: "alasio-sessions", pod: "sandboxes-none-restore-1bbb", state: "standby", bytes: 32 * MIB, anonBytes: 16 * MIB, fileBytes: 16 * MIB, shmemBytes: 8 * MIB, zswapBytes: 0 },
     ]);
-    assert.deepEqual([memory.totalBytes, memory.availableBytes, memory.agentBytes], [16 * GIB, 9 * GIB, 150 * MIB]);
+    assert.deepEqual([memory.totalBytes, memory.availableBytes, memory.agentBytes, memory.agentAnonBytes, memory.agentFileBytes], [16 * GIB, 9 * GIB, 150 * MIB, 40 * MIB, 100 * MIB]);
+    assert.deepEqual(memory.agentEvents, { high: 0, max: 3, oom: 1, oomKill: 1 });
     assert.equal(memory.budgetBytes, (16 * GIB - NODE_MEMORY_RESERVED_BYTES - NODE_MEMORY_SOFT_EVICTION_BYTES - 3 * GIB) / 2);
     assert.equal(memory.budgetedBytes, 32 * MIB);
   } finally {

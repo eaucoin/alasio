@@ -127,6 +127,9 @@
  *   kubelet made it no directory, 409 where it has a binding already, or a mount.
  * - `GET /attachments`: `{ attachments: [{ namespace, pod, reachable }] }`, the pods of this node a
  *   workspace is attached into, each by whether what is attached is reachable still (./workspaces.ts).
+ * - `GET /memory`: what the node's memory holds (./memory.ts NodeMemory): its sandboxes', by their
+ *   pods' state, the agent's own, split, and the budget of what is held ahead (200); 501 where the
+ *   agent reads none.
  * - `GET /memory/guard`: `{ sandboxes: [{ namespace, pod, limitBytes, endedBytes, at }] }`, what
  *   the guard of the node's memory did of its sandboxes of late: the limit in force it set, and
  *   what one it ended held (./guard.ts GuardRecord) (200).

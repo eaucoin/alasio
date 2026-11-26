@@ -175,7 +175,7 @@ export function aggregate(results: readonly Result[]): Cell[] {
 const RESTORE_TABLES: readonly (readonly [string, readonly string[]])[] = [
   ["", ["first_exec_ms", "orchestration_ms", "policy_wait_ms", "runsc_resume_ms", "resident_ms", "verify_ms"]],
   ["the sandbox's memory", ["memory_peak_bytes", "memory_bytes", "memory_file_bytes", "sandbox_overhead_bytes"]],
-  ["the node's memory", ["node_agent_memory_bytes"]],
+  ["the node's memory", ["node_agent_memory_bytes", "node_agent_anon_bytes", "node_agent_file_bytes"]],
 ];
 
 /** The tables of each phase, by their titles, and the metrics each shows, in order. */
