@@ -251,11 +251,12 @@ export interface BindingRequest extends PodOwner {
 const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
 /**
  * How often alasio asks an agent how a checkpoint or a prepare it started stands, where its
- * start was not answered as it ended: 25 ms after it last asked, then twice as long each time,
- * half a second at most, as a prepare from the bucket may end within a second or two, which a
- * restore waits on, and a checkpoint takes seconds.
+ * start was not answered as it ended: again 25 ms after each answer that it runs. The agent
+ * answers each ask as the operation ends, or some seconds after where it runs on
+ * (../node-agent/server.ts OPERATION_ANSWER_MS), so a release learns its save is durable as it
+ * is, not at its next ask.
  */
-const OPERATION_POLLS = Schedule.min([Schedule.exponential("25 millis"), Schedule.spaced("500 millis")]);
+const OPERATION_POLLS = Schedule.spaced("25 millis");
 /**
  * How long the agents' addresses, as their pods were listed, and their DaemonSet's count of nodes, are taken as they are: a
  * restore's calls of its node's agent, a dozen within a second or two, list them once or

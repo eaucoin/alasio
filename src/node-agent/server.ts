@@ -16,7 +16,8 @@
  *   bayma's state directory in the container, it is saved live, running on; its manifest
  *   records what bayma's hook said the save caught, and a restore from it resumes only
  *   while bayma's state generation is that one.
- * - `GET /checkpoints/<environment>/<workspace>`: how its last checkpoint stands (200):
+ * - `GET /checkpoints/<environment>/<workspace>`: how its last checkpoint stands (200), answered as it
+ *   ends, or OPERATION_ANSWER_MS after it was asked where it runs on:
  *   `{ state: "running" }`; `{ state: "done", value }`, `value` the snapshot's manifest; or
  *   `{ state: "failed", status, error }`, `status` 500, whose error says why, and that the
  *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept; 410 where its
@@ -238,6 +239,8 @@ export interface NodeAgentServerOptions {
   readonly memory?: Effect.Effect<NodeMemory>;
   /** What the guard of the node's memory did of its sandboxes (./guard.ts GuardRecords), as `GET /memory/guard` answers it; none unless given. */
   readonly guard?: GuardRecords;
+  /** How long a request asking how a checkpoint or a prepare stands waits for it to end: OPERATION_ANSWER_MS, but for tests. */
+  readonly answerWithinMs?: number;
 }
 
 /** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
@@ -321,6 +324,13 @@ const WORKSPACES = /^\/workspaces\/([^/]+)$/u;
  */
 const PREPARE_ANSWER_MS = 2_000;
 
+/**
+ * How long a request asking how a checkpoint or a prepare stands waits for it to end before it is answered that it runs: so
+ * its caller learns it ended as it does, not at its next ask, half a second later at most, as a release waits on its save;
+ * well within its caller's call (../sandbox/node-agents.ts SHORT_CALL).
+ */
+const OPERATION_ANSWER_MS = 10_000;
+
 /** How long a 503 asks its caller to wait before it asks again, in seconds. */
 const RETRY_AFTER_S = 2;
 
@@ -369,6 +379,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   standbys = makeStandbyRestores(),
   memory,
   guard,
+  answerWithinMs = OPERATION_ANSWER_MS,
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
   const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable | LiveSaveDeferred | SaveDeferred>(scope, failureOf);
@@ -376,10 +387,17 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   const started = answer(202, { state: "running" });
   /** Done as the agent's API stops, before it waits for the requests under way to end: those held for a change (`GET /holdings`) are refused at once. */
   const stopping = yield* Deferred.make<void>();
-  /** How the operation of `operations` for the workspace a path names stands. */
+  /**
+   * How the operation of `operations` for the workspace a path names stands, once it has ended, or OPERATION_ANSWER_MS after it
+   * was asked where it runs on (answerWithinMs), or as it stands as the agent's API stops.
+   */
   const outcome = <A, E>(operations: Operations<A, E>, path: RegExpExecArray) =>
     workspaceOf(path).pipe(
-      Effect.flatMap((workspace) => operations.outcome(keyOf(workspace))),
+      Effect.flatMap((workspace) =>
+        operations.outcomeWithin(keyOf(workspace), answerWithinMs).pipe(
+          Effect.raceFirst(Deferred.await(stopping).pipe(Effect.andThen(operations.outcome(keyOf(workspace))))),
+        )
+      ),
       Effect.map((found) => (found === null ? answer(404, { error: "the agent keeps no such operation of the workspace's" }) : answer(200, found))),
     );
 

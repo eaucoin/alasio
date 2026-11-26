@@ -4344,6 +4344,42 @@ test("the agent's API answers what the node's memory holds where it reads it, an
     })
   ));
 
+test("the agent's API answers a request asking how a checkpoint stands as the checkpoint ends, or, where it runs on, that it runs once it has waited its while for it", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: unusedWorkspaces, answerWithinMs: 1_500 });
+      const call = (method: string, path: string, body?: unknown) =>
+        Effect.promise(async () => {
+          const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+            method,
+            headers: { authorization: "Bearer the token", "content-type": "application/json" },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          });
+          return { status: response.status, body: (await response.json()) as { readonly state: string }, at: Date.now() };
+        });
+      // Its runsc's save held until let go.
+      const held = join(here.releases.dirOf(RELEASE), "hold-checkpoint");
+      writeFileSync(held, "");
+      // Let go however the test ends, as the agent's stop waits for it.
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(held, { force: true })));
+      assert.equal((yield* call("POST", "/checkpoints", request("fs-abc"))).status, 202);
+      // Asked while it runs on past the while: that it runs, once waited.
+      const asked = Date.now();
+      const running = yield* call("GET", "/checkpoints/main/fs-abc");
+      assert.equal(running.body.state, "running");
+      assert.ok(running.at - asked >= 1_400, `answered after ${running.at - asked} ms`);
+      // Asked again, and let go meanwhile: answered as it ends.
+      const asking = yield* call("GET", "/checkpoints/main/fs-abc").pipe(Effect.forkScoped);
+      yield* Effect.sleep("300 millis");
+      rmSync(held, { force: true });
+      const letGo = Date.now();
+      const ended = yield* Fiber.join(asking);
+      assert.equal(ended.body.state, "done");
+      assert.ok(ended.at - letGo < 1_000, `answered ${ended.at - letGo} ms after its save was let go`);
+    })
+  ));
+
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
