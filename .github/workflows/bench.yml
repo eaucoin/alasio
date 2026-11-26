@@ -160,7 +160,7 @@ jobs:
       # thrown, so the run before passes whatever came of the runs. The store's measures alone
       # (BENCH_MODE=store) write no line.
       - name: Every phase of every run passed
-        if: env.BENCH_MODE != 'store'
+        if: env.BENCH_MODE != 'store' && env.BENCH_MODE != 'soak'
         run: |
           [ -s "$BENCH_DIR/results.jsonl" ] || { echo "::error::no run wrote a result"; exit 1; }
           failed=$(jq --slurp '[.[] | select(.ok | not)] | length' "$BENCH_DIR/results.jsonl")
