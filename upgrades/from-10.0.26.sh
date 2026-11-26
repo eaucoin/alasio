@@ -74,21 +74,26 @@ accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
 # masters and the filers' store, each its pods gone, so that each volume is copied as its part
 # left it; then each claim's directory copied to STORE_COPY/<claim>, into STORE_COPY/<claim>.partial
 # while it is copied, renamed once whole, its bytes and how long it took said; and OUT/
-# object-store-copied says it all was. The gateways run on, failing each request while the parts
-# behind them are stopped, until the upgrade starts each part again, on 4.54, as its StatefulSet
-# says. Meanwhile Neon's safekeepers and pageservers keep on their own volumes what they would
-# upload, and upload it once the store answers; what else would write the store fails, and
-# writes again: workspace storage's JuiceFS, the node agents' snapshots, the lake's loads; and a
-# read fails, a Neon compute's of a layer its pageserver no longer holds among them. Run in a
-# quiet hour, nothing is lost. A run again copies again what was not copied whole, and once
-# OUT/object-store-copied says it was, nothing. Should the upgrade fail, its failure says the
-# parts are stopped still, which the cut-over run again starts, by the upgrade; to stay on 10.0.26
-# instead, scale each back to the count OUT/object-store-replicas keeps.
+# object-store-copied says it all was. Then each part started again, still on 4.48, at the count
+# OUT/object-store-replicas kept of it as it was stopped, in the order its peers need: the filers'
+# store, the masters, the volume servers, the filers, each ready before the next starts. So the
+# upgrade finds the store answering, as it reads what it does of it before it changes it, the
+# snapshots the sandbox gateway names among them, and then starts each part again on 4.54, as its
+# StatefulSet says. The gateways run on, failing each request while the parts behind them are
+# stopped. Meanwhile Neon's safekeepers and pageservers keep on their own volumes what they would
+# upload, and upload it once the store answers; what else would write the store fails, and writes
+# again: workspace storage's JuiceFS, the node agents' snapshots, the lake's loads; and a read
+# fails, a Neon compute's of a layer its pageserver no longer holds among them. Run in a quiet
+# hour, nothing is lost. The copies are of the store as it was stopped: what is written once it
+# started again is in none. A run again copies again what was not copied whole, and once
+# OUT/object-store-copied says it was, nothing, but starts each part again as above, which a part
+# running at its count already is; should the upgrade fail, the store runs on 4.48 as before.
 #
-# It takes as long as the stop, the parts' grace, 30 s, at most, and the copy, at the rate this
-# machine's disk copies the store's bytes (events.log says each claim's). The copies are kept:
-# STORE_COPY is the owner's to delete once the store is seen well on 4.54. Its pods' end is waited
-# for STOP_WAIT_SECONDS (10 min) at most, looking every POLL_SECONDS (5).
+# It takes as long as the stop, the parts' grace, 30 s, at most; the copy, at the rate this
+# machine's disk copies the store's bytes (events.log says each claim's); and the parts' start,
+# a minute or so. The copies are kept: STORE_COPY is the owner's to delete once the store is seen
+# well on 4.54. Its pods' end, and each part's being ready, is waited for STOP_WAIT_SECONDS
+# (10 min) at most, the end looked for every POLL_SECONDS (5).
 
 NS=alasio
 STORE_COPY=${STORE_COPY:-$OUT/object-store}
@@ -142,11 +147,15 @@ store_copy_checked() {
   log "the object store's volumes hold $needed bytes, which $STORE_COPY has room for, $room free"
 }
 store_copied_past() {
-  [ ! -e "$OUT/object-store-copied" ] || return 0
-  local listed part count claim directory started bytes
+  local listed
   listed=$(store_claims)
   [ -n "$listed" ] || return 0
-  log "stopping the object store, to copy its volumes as SeaweedFS 4.48 left them: every request of it fails until the upgrade starts it again"
+  [ -e "$OUT/object-store-copied" ] || store_copied "$listed"
+  store_started
+}
+store_copied() {
+  local listed=$1 part count claim directory started bytes
+  log "stopping the object store, to copy its volumes as SeaweedFS 4.48 left them: every request of it fails until it is started again"
   # Each part's count before the cut-over stopped it, kept as first read: a run again after a stop reads none.
   if [ ! -e "$OUT/object-store-replicas" ]; then
     : >"$OUT/object-store-replicas.read"
@@ -170,15 +179,19 @@ store_copied_past() {
     log "copied the object store's $claim, $bytes bytes, in $(($(date +%s) - started)) s, to $STORE_COPY/$claim"
   done <<<"$listed"
   date -u +%FT%TZ >"$OUT/object-store-copied"
-  log "the object store's volumes copied, the store to be started again by the upgrade, on SeaweedFS 4.54"
+  log "the object store's volumes copied"
 }
-# Fails the run as an upgrade that failed does, saying whether the object store is stopped still.
-upgrade_failed() {
-  [ -e "$OUT/object-store-copied" ] || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
-  case "$(k get statefulset alasio-seaweedfs-master -o jsonpath='{.spec.replicas}' 2>/dev/null)" in
-    0) fail "the upgrade failed (upgrade.log): the object store stays stopped, every request of it failing, until the cut-over run again gets the upgrade through; to stay on 10.0.26 instead, scale each of its parts back to the count $OUT/object-store-replicas keeps (kubectl -n $NS scale statefulset <part> --replicas=<count>)" ;;
-    *) fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it" ;;
-  esac
+# Each part started again at the count kept of it, those its peers need first: the reverse of the order they are stopped in.
+store_started() {
+  local part count
+  for part in $(printf '%s\n' $STORE_PARTS | tac); do
+    count=$(awk -F '\t' -v part="$part" '$1 == part { print $2 }' "$OUT/object-store-replicas")
+    [ -n "$count" ] || fail "$OUT/object-store-replicas keeps no count of the object store's $part"
+    k scale statefulset "$part" --replicas="$count" >/dev/null || fail "the object store's $part could not be started again: the cut-over run again starts it"
+    k rollout status statefulset "$part" --timeout="${STOP_WAIT_SECONDS}s" >/dev/null ||
+      fail "the object store's $part was not ready within ${STOP_WAIT_SECONDS} s of its start (kubectl -n $NS describe statefulset $part): the cut-over run again starts it"
+  done
+  log "the object store started again, each part ready, on SeaweedFS 4.48, as it was, for the upgrade to start it on 4.54"
 }
 # END the object store copied whole before SeaweedFS 4.54.
 
@@ -209,7 +222,7 @@ if [ ! -e "$OUT/upgraded" ]; then
   store_copied_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
-  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || upgrade_failed
+  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"

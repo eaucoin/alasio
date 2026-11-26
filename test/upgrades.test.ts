@@ -19,13 +19,15 @@ const pathOf = (bin: string) => [bin, "/usr/bin", "/bin"].join(delimiter);
 
 /** The bundled object store's parts, by their StatefulSets, as the cut-over stops them. */
 const STORE_PARTS = ["alasio-seaweedfs-filer", "alasio-seaweedfs-volume", "alasio-seaweedfs-master", "alasio-seaweedfs-filer-store"];
+/** The same, as the cut-over starts them again: each once those it needs are ready. */
+const STARTED = [...STORE_PARTS].reverse();
 
 /**
  * A machine for the cut-over: a kubectl that reaches its cluster and lists the namespaces
  * `namespaces` names, `<name>\t<branch label>` each, and the bundled object store's claims, each
- * a directory of the machine's, whose parts it stops as it is told, saying so in `stopped`; and
- * an UPGRADE and an UPGRADE_CHECK, each saying it ran, UPGRADE failing while `upgradeFails` is
- * there.
+ * a directory of the machine's, whose parts it stops and starts as it is told, saying so in
+ * `stopped` and `started`, a part named in `unready` never ready; and an UPGRADE and an
+ * UPGRADE_CHECK, each saying it ran, UPGRADE failing while `upgradeFails` is there.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -36,6 +38,8 @@ function machine() {
   const volumes = join(root, "volumes");
   const counts = join(root, "counts");
   const stopped = join(root, "stopped");
+  const started = join(root, "started");
+  const unready = join(root, "unready");
   const upgradeFails = join(root, "upgrade-fails");
   const config = join(root, "config.json");
   for (const directory of [bin, volumes, counts]) mkdirSync(directory);
@@ -50,7 +54,11 @@ case "$*" in
   "-n alasio get pvc -o jsonpath="*) cat '${claims}' ;;
   "get pv "*" -o jsonpath="*) printf '%s' '${volumes}'/"$3" ;;
   "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}") cat '${counts}'/"$5" 2>/dev/null || echo 1 ;;
-  "-n alasio scale statefulset "*" --replicas=0") echo 0 >'${counts}'/"$5" && echo "$5" >>'${stopped}' ;;
+  "-n alasio scale statefulset "*" --replicas="*)
+    count=\${6#--replicas=}
+    echo "$count" >'${counts}'/"$5"
+    if [ "$count" = 0 ]; then echo "$5" >>'${stopped}'; else echo "$5" >>'${started}'; fi ;;
+  "-n alasio rollout status statefulset "*" --timeout="*) ! grep -qx "$6" '${unready}' 2>/dev/null ;;
   "-n alasio get pod -l "*" -o name") ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
@@ -100,6 +108,14 @@ esac
       rmSync(stopped, { force: true });
       return read;
     },
+    /** The parts the cut-over started again, in order, since the last time it was asked. */
+    started: () => {
+      const read = existsSync(started) ? readFileSync(started, "utf8").split("\n").filter(Boolean) : [];
+      rmSync(started, { force: true });
+      return read;
+    },
+    /** Makes `part` never ready once started, or, given none, every part ready. */
+    unready: (part?: string) => (part === undefined ? rmSync(unready, { force: true }) : writeFileSync(unready, `${part}\n`)),
     /** The counts the cut-over kept of the object store's parts as it stopped them, a `<part>\t<count>` each. */
     replicas: () => readFileSync(join(out, "object-store-replicas"), "utf8").split("\n").filter(Boolean),
     bin,
@@ -126,7 +142,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
   }
 });
 
-test("the cut-over stops the bundled object store past its point of no return, writers first, and copies each of its volumes whole before the upgrade, once", () => {
+test("the cut-over stops the bundled object store past its point of no return, writers first, copies each of its volumes whole, and starts it again, each part once its peers are ready, before the upgrade, once", () => {
   const at = machine();
   try {
     const claims = at.store(4096);
@@ -134,15 +150,16 @@ test("the cut-over stops the bundled object store past its point of no return, w
     assert.equal(run.code, 0, run.said);
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.stopped(), STORE_PARTS);
+    assert.deepEqual(at.started(), STARTED);
     for (const claim of claims) assert.deepEqual(at.copied(claim), at.volume(claim), claim);
     // No other claim's volume.
     assert.equal(at.copied("data-alasio-log-0"), null);
     assert.match(run.said, /checking that the upgrade can run[^\n]*\n[^\n]* checking that the object store's volumes can be copied, to \S+\/object-store\n[^\n]* the object store's volumes hold \d+ bytes, which \S+ has room for, \d+ free\n[^\n]* past the point of no return[^\n]*\n[^\n]* stopping the object store[^\n]*\n/u);
-    assert.match(run.said, /(copied the object store's data-alasio-seaweedfs-[a-z-]+-0, \d+ bytes, in \d+ s, to \S+\n[^\n]* ){3}the object store's volumes copied[^\n]*\n[^\n]* upgrading, from the cut-over/u);
-    // Once: a run again copies and stops nothing.
+    assert.match(run.said, /(copied the object store's data-alasio-seaweedfs-[a-z-]+-0, \d+ bytes, in \d+ s, to \S+\n[^\n]* ){3}the object store's volumes copied\n[^\n]* the object store started again, each part ready, on SeaweedFS 4\.48, as it was, for the upgrade to start it on 4\.54\n[^\n]* upgrading, from the cut-over/u);
+    // Once: a run again copies, stops and starts nothing.
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
-    assert.deepEqual(at.stopped(), []);
+    assert.deepEqual([at.stopped(), at.started()], [[], []]);
     assert.doesNotMatch(again.said, /copied/u);
   } finally {
     at.remove();
@@ -170,19 +187,27 @@ test("the cut-over refuses an object store's volume it cannot copy, or a disk sh
   }
 });
 
-test("the cut-over whose upgrade fails once it has stopped the object store says it is stopped still, and how to stay on the release before", () => {
+test("the cut-over whose object store's part is not ready again fails, and a run again starts it again, copying nothing again; an upgrade failing leaves the store running as before", () => {
   const at = machine();
   try {
     at.store();
+    at.unready("alasio-seaweedfs-master");
+    const unready = at.cutOver();
+    assert.notEqual(unready.code, 0);
+    assert.match(unready.said, /FAILED: the object store's alasio-seaweedfs-master was not ready within 600 s of its start \(kubectl -n alasio describe statefulset alasio-seaweedfs-master\): the cut-over run again starts it\n$/u);
+    assert.deepEqual([at.ran(), at.stopped(), at.started()], [["check"], STORE_PARTS, STARTED.slice(0, 2)]);
+    assert.deepEqual(at.replicas(), STORE_PARTS.map((part) => `${part}\t1`));
+    at.unready();
     at.upgradeFails(true);
     const failed = at.cutOver();
     assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /FAILED: the upgrade failed \(upgrade\.log\): the object store stays stopped, every request of it failing, until the cut-over run again gets the upgrade through; to stay on 10\.0\.26 instead, scale each of its parts back to the count \S+\/object-store-replicas keeps/u);
-    assert.deepEqual(at.replicas(), STORE_PARTS.map((part) => `${part}\t1`));
+    assert.match(failed.said, /FAILED: the upgrade failed \(upgrade\.log\): the cut-over run again goes on with it\n$/u);
+    assert.doesNotMatch(failed.said, /copied/u);
+    assert.deepEqual([at.ran(), at.stopped(), at.started()], [["upgrade"], [], STARTED]);
     at.upgradeFails(false);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
-    assert.deepEqual(at.stopped(), STORE_PARTS);
+    assert.deepEqual([at.ran(), at.stopped(), at.started()], [["upgrade"], [], STARTED]);
   } finally {
     at.remove();
   }

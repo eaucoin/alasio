@@ -379,9 +379,12 @@ if (inShard("upgrade")) {
       workspaces: [componentName("workspaces-juicefs"), "access-key", "secret-key"],
       snapshots: [componentName("snapshots"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
     };
-    /** Shell, of the bucket "$1", through a gateway, that puts 6 MiB at .alasio-e2e/upgrade-probe, and that reads it back: its SHA-256 either way. */
-    const PROBE_PUT = 'head -c 6291456 /dev/urandom >/tmp/probe && aws s3api --endpoint-url http://127.0.0.1:8333 put-object --bucket "$1" --key .alasio-e2e/upgrade-probe --body /tmp/probe >/dev/null && sha256sum /tmp/probe | cut -c1-64';
-    const PROBE_GET = 'aws s3api --endpoint-url http://127.0.0.1:8333 get-object --bucket "$1" --key .alasio-e2e/upgrade-probe /tmp/probe >/dev/null && sha256sum /tmp/probe | cut -c1-64';
+    /**
+     * Shell, of the bucket "$1", through a gateway, that puts 6 MiB at .alasio-e2e/upgrade-probe, and that reads it back: its
+     * SHA-256 either way. Each bucket's in a file of its own, as every bucket's runs at once in the one container.
+     */
+    const PROBE_PUT = 'head -c 6291456 /dev/urandom >"/tmp/probe-$1" && aws s3api --endpoint-url http://127.0.0.1:8333 put-object --bucket "$1" --key .alasio-e2e/upgrade-probe --body "/tmp/probe-$1" >/dev/null && sha256sum "/tmp/probe-$1" | cut -c1-64';
+    const PROBE_GET = 'aws s3api --endpoint-url http://127.0.0.1:8333 get-object --bucket "$1" --key .alasio-e2e/upgrade-probe "/tmp/probe-$1" >/dev/null && sha256sum "/tmp/probe-$1" | cut -c1-64';
     /** `script` run of each probed bucket, in a gateway's pod beside it, as the bucket's writer, with the aws CLI of its lifecycle container: what it printed of each. */
     const inEveryBucket = async (script: string) => {
       const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
@@ -778,14 +781,16 @@ if (inShard("upgrade")) {
         seed: async () => {
           probes = await inEveryBucket(PROBE_PUT);
           for (const { bucket, sha256 } of probes) assert.match(sha256, /^[0-9a-f]{64}$/u, bucket);
+          assert.equal(new Set(probes.map(({ sha256 }) => sha256)).size, probes.length, "two buckets were put the same object");
         },
-        keeps: "each bucket's object, read back whole as its writer reads it, through the store upgraded to SeaweedFS 4.54; and the store's volumes, copied whole before it, as SeaweedFS 4.48 left them, each said copied",
+        keeps: "each bucket's object, read back whole as its writer reads it, through the store upgraded to SeaweedFS 4.54; and the store's volumes, copied whole before it, as SeaweedFS 4.48 left them, each said copied, the store started again on 4.48 before the upgrade",
         check: async () => {
           assert.deepEqual(await inEveryBucket(PROBE_GET), probes);
           const copies = (await inCutOverRecord("ls -1 object-store")).split("\n").filter(Boolean);
           assert.deepEqual(copies, ["data-alasio-seaweedfs-filer-store-0", "data-alasio-seaweedfs-master-0", "data-alasio-seaweedfs-volume-0"]);
           const events = await inCutOverRecord("cat events.log");
           for (const claim of copies) assert.match(events, new RegExp(`copied the object store's ${claim}, \\d+ bytes, in \\d+ s`, "u"), claim);
+          assert.match(events, /the object store started again, each part ready, on SeaweedFS 4\.48, as it was, for the upgrade to start it on 4\.54\n[^\n]* upgrading, from the cut-over/u);
         },
       },
     ];
@@ -847,7 +852,7 @@ if (inShard("upgrade")) {
       const [secrets, stack] = [await namespaceSecrets(), await stackSecrets()];
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* checking that the object store's volumes can be copied[^\n]*\n[^\n]* the object store's volumes hold \d+ bytes[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
       assert.deepEqual([await namespaceSecrets(), await stackSecrets()], [secrets, stack]);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
       assert.deepEqual(await alasioApplied(), applied);
