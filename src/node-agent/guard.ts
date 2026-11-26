@@ -31,11 +31,18 @@
  * GROWTH_WINDOW_MS, by GROWN_BYTES at least, of one being restored past what its restore brings in
  * (Restores), its scope's processes killed at once (cgroup.kill); then none more for
  * END_WINDOW_MS, nor while one ended is still there, its memory being freed, so the room is
- * measured anew after each. Where none grew so, the pressure is another pod's (the folder
- * instances', the platform's): it ends nothing, says so once a while and counts it, and leaves
- * kubelet's eviction and the kernel to act. A sandbox ended, by the agent or by its own
- * cgroup's OOM, is one whose bayma ended: its pod's gateway releases its binding as one that ran
- * out of memory, and its session comes back from its last save.
+ * measured anew after each. And only where the sandboxes took the most of what the node is losing
+ * now, over the last ATTRIBUTION_WINDOW_MS, the room at its most then less the room now: their
+ * growth together over as long, no less than what is left of that loss, the other pods'; and none
+ * while the room has stopped falling. A sandbox that grew as another pod grows more, as a
+ * session's REPL loading a dataset while a pod beside it fills the node, is not the cause: ended,
+ * it frees what the other takes again, and a session is lost for none of its own doing, as two
+ * sandboxes beside a pod that grew by 6 GiB measured, the one that had grown ended in 17 trials of
+ * 20. Where no sandbox grew so, or the other pods take the most, the pressure is another pod's (the
+ * folder instances', the platform's): it ends nothing, says so once a while with what each took
+ * and counts it, and leaves kubelet's eviction and the kernel to act. A sandbox ended, by the
+ * agent or by its own cgroup's OOM, is one whose bayma ended: its pod's gateway releases its
+ * binding as one that ran out of memory, and its session comes back from its last save.
  */
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -76,6 +83,16 @@ export const SANDBOX_MEMORY_HEADROOM_BYTES = 1024 ** 3;
 /** How far back a sandbox's growth is measured, the one that grew most being the one ended. */
 export const GROWTH_WINDOW_MS = 10_000;
 
+/**
+ * How far back what the node is losing, and who takes it, is measured, as the module says: 2 s,
+ * 8 looks. Short, so that a fall of the room another pod caused before, past, holds back no end of
+ * a sandbox growing now, while the kernel nears its OOM, which takes the platform's processes
+ * first: a pod beside the sandboxes grew by 6 GiB in some 8 s, and a REPL grows at as much, 800
+ * MiB a second, so either is GiBs over 2 s, far more than the 4 MiB a look of a sandbox that frees
+ * as it writes, and one that filled its memory 3 s before is past it as the other grows.
+ */
+export const ATTRIBUTION_WINDOW_MS = 2_000;
+
 /** By how much a sandbox must have grown over GROWTH_WINDOW_MS to be taken for the cause of its node's want of memory. */
 export const GROWN_BYTES = 256 * 1024 ** 2;
 
@@ -88,42 +105,52 @@ const FOREIGN_SAID_MS = 60_000;
 /** By how much a sandbox's limit must move before it is written again. */
 const LIMIT_STEP_BYTES = 16 * 1024 ** 2;
 
-/** A sandbox as the guard plans for it: its key, its pod's state, what its pod and its own cgroup hold, and by how much it grew over GROWTH_WINDOW_MS. */
+/** A sandbox as the guard plans for it: its key, its pod's state, what its pod and its own cgroup hold, and by how much it grew over GROWTH_WINDOW_MS, and over ATTRIBUTION_WINDOW_MS. */
 export interface Guarded {
   readonly key: string;
   readonly state: SandboxState;
   readonly bytes: number;
   readonly scopeBytes: number;
   readonly grown: number;
+  readonly grownRecently: number;
 }
 
 /**
  * What the guard does at a look: the limit of each bound sandbox's cgroup, by its key, null where
- * it has none; the sandbox it ends, if any; and whether its node wants memory that no sandbox is
- * the cause of.
+ * it has none; the sandbox it ends, if any; whether its node wants memory that no sandbox is the
+ * cause of; and of what the node lost over ATTRIBUTION_WINDOW_MS, what the sandboxes took by their
+ * growth together, and what the other pods took, the rest.
  */
 export interface GuardPlan {
   readonly limits: ReadonlyMap<string, number | null>;
   readonly end: string | null;
   readonly foreign: boolean;
+  readonly sandboxesTook: number;
+  readonly othersTook: number;
 }
 
 /**
  * What the guard does, as the module says, given `room`, what the node has left for its
  * sandboxes before kubelet evicts or a cgroup above them reaches its limit; `lastRoom`, what it
  * has left before kubelet evicts at once or that limit; `sandboxes`; whether one it ended is still
- * there, or it ended one within END_WINDOW_MS (`ending`), while which it ends none.
+ * there, or it ended one within END_WINDOW_MS (`ending`), while which it ends none; and `lost`,
+ * what the room lost over ATTRIBUTION_WINDOW_MS, its most then less what it is now.
  */
-export function guardPlan(room: number, lastRoom: number, sandboxes: readonly Guarded[], ending: boolean): GuardPlan {
+export function guardPlan(room: number, lastRoom: number, sandboxes: readonly Guarded[], ending: boolean, lost: number): GuardPlan {
   const bound = sandboxes.filter(({ state }) => state === "bound");
   const share = Math.floor(Math.max(0, room) / Math.max(1, bound.length));
   // No less than its share, which is less than SANDBOX_MEMORY_HEADROOM_BYTES where it is limited, and the room.
   const headroom = Math.max(SANDBOX_MEMORY_SLACK_BYTES, Math.min(SANDBOX_MEMORY_HEADROOM_BYTES, room));
   const limits = new Map(bound.map(({ key, scopeBytes }) => [key, share < SANDBOX_MEMORY_LIMITED_BELOW_BYTES ? scopeBytes + headroom : null]));
-  if (lastRoom >= SANDBOX_MEMORY_SLACK_BYTES) return { limits, end: null, foreign: false };
+  const sandboxesTook = sandboxes.reduce((sum, { grownRecently }) => sum + grownRecently, 0);
+  const othersTook = Math.max(0, lost - sandboxesTook);
+  if (lastRoom >= SANDBOX_MEMORY_SLACK_BYTES) return { limits, end: null, foreign: false, sandboxesTook, othersTook };
   const grower = sandboxes.filter(({ grown }) => grown >= GROWN_BYTES).toSorted((a, b) => b.grown - a.grown)[0];
-  if (grower === undefined) return { limits, end: null, foreign: true };
-  return { limits, end: ending ? null : grower.key, foreign: false };
+  // None grew into it, or the other pods take the most of what the node is losing: theirs the want.
+  if (grower === undefined || othersTook > sandboxesTook) return { limits, end: null, foreign: true, sandboxesTook, othersTook };
+  // The room no longer falling: none ended for it, until it falls again or the one grown is past the window.
+  if (lost <= 0) return { limits, end: null, foreign: false, sandboxesTook, othersTook };
+  return { limits, end: ending ? null : grower.key, foreign: false, sandboxesTook, othersTook };
 }
 
 /** A file's text, or null where it cannot be read. */
@@ -175,7 +202,7 @@ const ended = meter.createCounter("alasio.node_agent.sandboxes.ended", {
   unit: "{sandbox}",
 });
 const spared = meter.createCounter("alasio.node_agent.memory.foreign_pressure", {
-  description: "The node agent's looks that found its node's memory near its end with no sandbox grown into it, the want another pod's, which it left to kubelet and the kernel",
+  description: "The node agent's looks that found its node's memory near its end with no sandbox grown into it, or other pods having taken the most of it, the want another pod's, which it left to kubelet and the kernel",
   unit: "{look}",
 });
 const unguarded = meter.createCounter("alasio.node_agent.sandboxes.unguarded", {
@@ -275,9 +302,10 @@ export interface GuardOptions extends Pick<MemoryOptions, "runsc" | "nodeRoot" |
   readonly restores?: Restores;
 }
 
-/** What the guard keeps from look to look: each sandbox's bytes as each look read them, by its key; when it last ended one, and the cgroups of those it ended, kept until they go; and when it last said its node's want was another pod's. */
+/** What the guard keeps from look to look: each sandbox's bytes as each look read them, by its key; the room as each look over ATTRIBUTION_WINDOW_MS found it; when it last ended one, and the cgroups of those it ended, kept until they go; and when it last said its node's want was another pod's. */
 export interface GuardState {
   readonly seen: Map<string, readonly { readonly at: number; readonly bytes: number }[]>;
+  rooms: readonly { readonly at: number; readonly room: number }[];
   readonly endedCgroups: Set<string>;
   lastEndAt: number;
   lastForeignAt: number;
@@ -285,7 +313,7 @@ export interface GuardState {
 }
 
 /** A guard's state before its first look. */
-export const newGuardState = (): GuardState => ({ seen: new Map(), endedCgroups: new Set(), lastEndAt: 0, lastForeignAt: 0, unguarded: new Set() });
+export const newGuardState = (): GuardState => ({ seen: new Map(), rooms: [], endedCgroups: new Set(), lastEndAt: 0, lastForeignAt: 0, unguarded: new Set() });
 
 /** One look of the guard's, as the module says, with what it keeps from look to look. */
 export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimableIn, records = new GuardRecords(), restores = new Restores() }: GuardOptions, state: GuardState): Effect.Effect<void> =>
@@ -315,6 +343,10 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimab
     const above = yield* Effect.promise(() => aboveRoom(cgroups, sandboxes.map(({ cgroup }) => cgroup), reclaimable));
     const room = Math.min(available === null ? Number.POSITIVE_INFINITY : available - NODE_MEMORY_SOFT_EVICTION_BYTES, above);
     const lastRoom = Math.min(available === null ? Number.POSITIVE_INFINITY : available - NODE_MEMORY_HARD_EVICTION_BYTES, above);
+    // What the room lost over ATTRIBUTION_WINDOW_MS: its most then less what it is now; none where it is or was unbounded.
+    state.rooms = [...state.rooms.filter(({ at }) => now - at <= ATTRIBUTION_WINDOW_MS), { at: now, room }];
+    const most = Math.max(...state.rooms.map((each) => each.room));
+    const lost = Number.isFinite(most) && Number.isFinite(room) ? Math.max(0, most - room) : 0;
     const guarded: Guarded[] = [];
     for (const sandbox of sandboxes) {
       const key = keyOf(sandbox);
@@ -322,11 +354,13 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimab
       const seen = [...(state.seen.get(key) ?? []).filter(({ at }) => now - at <= GROWTH_WINDOW_MS), { at: now, bytes: scopeBytes }];
       state.seen.set(key, seen);
       // Of one being restored, what is past what its restore brings in alone.
-      const least = Math.max(Math.min(...seen.map(({ bytes }) => bytes)), restores.floorOf(key, now) ?? 0);
-      guarded.push({ key, state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes, grown: Math.max(0, scopeBytes - least) });
+      const floor = restores.floorOf(key, now) ?? 0;
+      const least = Math.max(Math.min(...seen.map(({ bytes }) => bytes)), floor);
+      const leastRecently = Math.max(Math.min(...seen.filter(({ at }) => now - at <= ATTRIBUTION_WINDOW_MS).map(({ bytes }) => bytes)), floor);
+      guarded.push({ key, state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes, grown: Math.max(0, scopeBytes - least), grownRecently: Math.max(0, scopeBytes - leastRecently) });
     }
     const ending = state.endedCgroups.size > 0 || now - state.lastEndAt < END_WINDOW_MS;
-    const plan = guardPlan(room, lastRoom, guarded, ending);
+    const plan = guardPlan(room, lastRoom, guarded, ending, lost);
     for (const [key, limit] of plan.limits) {
       const sandbox = sandboxes.find((each) => keyOf(each) === key);
       if (sandbox === undefined) continue;
@@ -345,7 +379,9 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimab
       spared.add(1);
       if (now - state.lastForeignAt >= FOREIGN_SAID_MS) {
         state.lastForeignAt = now;
-        yield* Effect.logWarning(`its node has ${mib(Math.max(0, lastRoom))} left before kubelet evicts at once or its pods reach their limit, and no sandbox grew by ${mib(GROWN_BYTES)} in ${GROWTH_WINDOW_MS / 1000} s: another pod's want, left to kubelet's eviction and the kernel`);
+        yield* Effect.logWarning(
+          `its node has ${mib(Math.max(0, lastRoom))} left before kubelet evicts at once or its pods reach their limit, and of the ${mib(lost)} it lost in ${ATTRIBUTION_WINDOW_MS / 1000} s sandboxes took ${mib(plan.sandboxesTook)}, other pods ${mib(plan.othersTook)}: another pod's want, left to kubelet's eviction and the kernel`,
+        );
       }
       return;
     }
