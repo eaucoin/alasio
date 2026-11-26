@@ -1,8 +1,9 @@
 /**
  * What the node's memory holds, as its node agent reads it: each gVisor sandbox's, by the state
  * of its pod (`bound` to a session or harness's binding, its workspace's token written beside it;
- * a `standby`, which a restore may claim, its runtime told so by its pod's annotation; or `free`,
- * a pool's pod waiting for a binding), as its pod's cgroup counts it (memory.current, and of it
+ * a `standby`, which a restore may claim, found by its shim's socket, as runsc lists none of a
+ * standby's containers, created and none started; or `free`, a pool's pod waiting for a binding),
+ * as its pod's cgroup counts it (memory.current, and of it
  * its anonymous and file-backed memory and what zswap holds compressed, memory.stat and
  * memory.zswap.current), and of it what its MemoryFile holds, the memfd its Sentry keeps all of
  * its application's memory in, its page cache and its tmpfs with it (memory.stat's shmem), the
@@ -29,7 +30,7 @@ import { join } from "node:path";
 import type { BatchObservableResult } from "@opentelemetry/api";
 import { Effect, type Scope } from "effect";
 
-import { STANDBY_ANNOTATION } from "../kube/sandbox-shape.ts";
+import { STANDBY_ANNOTATION, STANDBY_SOCKETS } from "../kube/sandbox-shape.ts";
 import { meter } from "../telemetry/index.ts";
 import { NODE_MEMORY_RESERVED_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES } from "./names.ts";
 import type { ListedContainer, Runsc } from "./runsc.ts";
@@ -195,6 +196,29 @@ export async function goferOf(cgroup: string, proc: string): Promise<number | nu
   return held;
 }
 
+/** Where kubelet keeps each pod's logs on its node, in a directory named `<namespace>_<pod>_<uid>`. */
+const POD_LOGS = join("var", "log", "pods");
+
+/**
+ * The node's standbys, under its root `nodeRoot`: each by its shim's socket in STANDBY_SOCKETS,
+ * `<namespace>.<pod>.sock` (standbySocket), not its containers' beside it; its pod's uid by the
+ * directory kubelet keeps its logs in; of those whose pod's cgroup under `cgroups` is there, as a
+ * socket a standby left as it went may outlive it.
+ */
+export async function standbysOf(nodeRoot: string, cgroups: string): Promise<readonly { readonly uid: string; readonly namespace: string; readonly pod: string }[]> {
+  const sockets = await readdir(join(nodeRoot, STANDBY_SOCKETS)).catch(() => [] as string[]);
+  const logs = await readdir(join(nodeRoot, POD_LOGS)).catch(() => [] as string[]);
+  const found = [];
+  for (const socket of sockets) {
+    const named = /^([a-z0-9-]+)\.([a-z0-9-]+)\.sock$/u.exec(socket);
+    if (!named) continue;
+    const [, namespace = "", pod = ""] = named;
+    const uid = logs.find((dir) => dir.startsWith(`${namespace}_${pod}_`))?.slice(`${namespace}_${pod}_`.length);
+    if (uid !== undefined && (await podCgroup(cgroups, uid)) !== null) found.push({ uid, namespace, pod });
+  }
+  return found;
+}
+
 /** A sandbox's memory, as the module says, with its pod's cgroup, under the node's cgroup root as the agent sees it; null where it was not found. */
 export interface SandboxCgroup extends SandboxMemory {
   readonly cgroup: string | null;
@@ -211,21 +235,27 @@ export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions,
     const listed = yield* runsc.containers.pipe(
       Effect.catch((error) => Effect.as(Effect.logWarning(`the node's sandboxes' memory could not be read, as runsc could not list them: ${error.message}`), [] as readonly ListedContainer[])),
     );
-    // Each pod's containers, by its uid, of the pods some container of which runs, as a standby's root does while its others
-    // wait for their restore.
+    // Each pod's containers, by its uid, of the pods some container of which runs.
     const pods = new Map<string, ListedContainer[]>();
     for (const container of listed) {
       const uid = container.annotations[POD_UID];
       if (uid !== undefined) pods.set(uid, [...(pods.get(uid) ?? []), container]);
     }
-    const running = [...pods].filter(([, containers]) => containers.some(({ status }) => status === "running"));
-    const sandboxes = yield* Effect.forEach(running, ([uid, containers]) =>
+    const running = yield* Effect.forEach([...pods].filter(([, containers]) => containers.some(({ status }) => status === "running")), ([uid, containers]) =>
       Effect.gen(function*() {
         const [first] = containers;
         const namespace = first?.annotations[POD_NAMESPACE] ?? "";
         const pod = first?.annotations[POD_NAME] ?? "";
         const bound = (yield* Effect.promise(() => text(join(attachRoot, namespace, pod, "token")))) !== null;
         const state: SandboxState = bound ? "bound" : containers.some(({ annotations }) => annotations[STANDBY_ANNOTATION] !== undefined) ? "standby" : "free";
+        return { uid, namespace, pod, state };
+      }));
+    // And the standbys, which runsc lists none of, their shims having booted their sandboxes with none of their containers
+    // started: each by its shim's socket, of those whose pod's cgroup is there.
+    const standbys = yield* Effect.forEach((yield* Effect.promise(() => standbysOf(nodeRoot, cgroups))).filter(({ uid }) => !pods.has(uid)), (standby) =>
+      Effect.map(Effect.promise(() => text(join(attachRoot, standby.namespace, standby.pod, "token"))), (token): typeof running[number] => ({ ...standby, state: token === null ? "standby" : "bound" })));
+    const sandboxes = yield* Effect.forEach([...running, ...standbys], ({ uid, namespace, pod, state }) =>
+      Effect.gen(function*() {
         const cgroup = yield* Effect.promise(() => podCgroup(cgroups, uid));
         const stat = cgroup === null || !split ? null : yield* Effect.promise(() => text(join(cgroup, "memory.stat")));
         return {

@@ -11,7 +11,7 @@ import { test } from "node:test";
 
 import { Effect } from "effect";
 
-import { STANDBY_ANNOTATION } from "../src/kube/sandbox-shape.ts";
+import { STANDBY_ANNOTATION, STANDBY_SOCKETS } from "../src/kube/sandbox-shape.ts";
 import { meminfoOf, nodeMemory, ownMemory, podCgroup, sandboxesOf, statOf } from "../src/node-agent/memory.ts";
 import { NODE_MEMORY_RESERVED_BYTES, NODE_MEMORY_SOFT_EVICTION_BYTES, RUNSC_ROOT } from "../src/node-agent/names.ts";
 import { makeRunsc } from "../src/node-agent/runsc.ts";
@@ -172,6 +172,28 @@ test("each sandbox's memory is read from its pod's cgroup, its MemoryFile's of i
     assert.deepEqual(memory.agentEvents, { high: 0, max: 3, oom: 1, oomKill: 1 });
     assert.equal(memory.budgetBytes, (16 * GIB - NODE_MEMORY_RESERVED_BYTES - NODE_MEMORY_SOFT_EVICTION_BYTES - 3 * GIB) / 2);
     assert.equal(memory.budgetedBytes, 32 * MIB);
+  } finally {
+    node.done();
+  }
+});
+
+test("a standby, which runsc lists none of, is counted by its shim's socket, its pod's uid as kubelet's logs name it, held ahead; a socket whose pod is gone is not", async () => {
+  const node = memoryNode();
+  try {
+    const sockets = join(node.nodeRoot, STANDBY_SOCKETS);
+    mkdirSync(sockets, { recursive: true });
+    // Its pod's shim's socket and its container's beside it; and one a standby left as it went.
+    for (const name of ["alasio-sessions.sandboxes-none-restore-1bbb.sock", "alasio-sessions.sandboxes-none-restore-1bbb.bayma.sock", "alasio-sessions.sandboxes-none-restore-9zzz.sock"]) writeFileSync(join(sockets, name), "");
+    for (const dir of ["alasio-sessions_sandboxes-none-restore-1bbb_bbbb-0002", "alasio-sessions_sandboxes-none-restore-9zzz_zzzz-0009"]) mkdirSync(join(node.nodeRoot, "var", "log", "pods", dir), { recursive: true });
+    node.cgroupOf("bbbb-0002", 17 * MIB, 12 * MIB, 4 * MIB);
+    const memory = await node.read();
+    assert.deepEqual(memory.sandboxes.map(({ pod, state, bytes, anonBytes }) => [pod, state, bytes, anonBytes]), [["sandboxes-none-restore-1bbb", "standby", 17 * MIB, 12 * MIB]]);
+    assert.equal(memory.budgetedBytes, 17 * MIB);
+    // Claimed, its binding's token written, before runsc lists it: bound, not held ahead.
+    node.bound("sandboxes-none-restore-1bbb");
+    const claimed = await node.read();
+    assert.deepEqual(claimed.sandboxes.map(({ pod, state }) => [pod, state]), [["sandboxes-none-restore-1bbb", "bound"]]);
+    assert.equal(claimed.budgetedBytes, 0);
   } finally {
     node.done();
   }
