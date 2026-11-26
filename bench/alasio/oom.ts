@@ -154,14 +154,16 @@ const scopeMaxOf = (lines: readonly string[]): string | null => lines.map((line)
 /**
  * The foreign arm's pod: on `node`, in a namespace of no sessions, runc's (no runtime class),
  * Burstable, its requests of CPU and memory under its limits, of `image`. Its process waits until
- * it is seen in a cgroup under `capped`, the Burstable pods' cgroup held, then grows as GROWER does
- * until it ends or GROWTH_BOUND_MS has gone; the pod is deleted then. Its uid; its setup: its QoS
- * class and resources as admitted, its process's /proc/<pid>/cgroup, and whether that is under
- * `capped`; the most its pod's cgroup held, read every second, and its memory.peak; and how it
- * ended: its container's reason and exit code, as the pod's status said, and how long it ran;
- * null where its setup failed.
+ * it is seen in a cgroup under `capped`, the Burstable pods' cgroup held, and that cgroup is held to
+ * `limit` anew (systemd sets a slice's limits back as it makes a slice under it, as it does the
+ * pod's), then grows as GROWER does until it ends or GROWTH_BOUND_MS has gone; the pod is deleted
+ * then. Its uid; its setup: its QoS class and resources as admitted, its process's
+ * /proc/<pid>/cgroup, whether that is under `capped`, and the limit `capped` had then and was held
+ * to; the most its pod's cgroup held, read every second, its memory.peak, and each limit `capped`
+ * had meanwhile; and how it ended: its container's reason and exit code, as the pod's status said,
+ * and how long it ran; null where its setup failed.
  */
-async function foreignGrown(node: string, image: string, capped: string): Promise<{ readonly uid: string; readonly setup: Record<string, unknown>; readonly setupOk: boolean; readonly ended: Record<string, unknown> | null }> {
+async function foreignGrown(node: string, image: string, capped: string, limit: number): Promise<{ readonly uid: string; readonly setup: Record<string, unknown>; readonly setupOk: boolean; readonly ended: Record<string, unknown> | null }> {
   const name = `oom-foreign-${randomBytes(4).toString("hex")}`;
   const target = ref("Pod", name, "default");
   const pod: V1Pod = {
@@ -199,6 +201,9 @@ async function foreignGrown(node: string, image: string, capped: string): Promis
     ].join("; ")).catch((error: unknown) => `unread: ${errorText(error)}`)).trim();
     const [podCgroup = "", pid = "", procCgroup = ""] = located.split(" ");
     const cgroupPath = procCgroup.startsWith("0::") ? `/sys/fs/cgroup${procCgroup.slice(3)}` : "";
+    // The held cgroup's limit as the pod's making left it, which systemd may have set back as it made the pod's slice under it; and as held anew.
+    const capFound = (await onNode(node, `cat ${capped}/memory.max`)).trim();
+    const capSet = (await onNode(node, `echo ${limit} > ${capped}/memory.max; cat ${capped}/memory.max`)).trim();
     const setup = {
       pod: name,
       qos_class: now?.status?.qosClass ?? null,
@@ -208,15 +213,20 @@ async function foreignGrown(node: string, image: string, capped: string): Promis
       pid: pid || null,
       proc_cgroup: procCgroup || located,
       under_capped: cgroupPath.startsWith(`${capped}/`),
+      cap_found: capFound,
+      cap_set: capSet,
     };
-    const setupOk = now?.status?.qosClass === "Burstable" && setup.under_capped;
+    const setupOk = now?.status?.qosClass === "Burstable" && setup.under_capped && capSet === String(limit);
     if (!setupOk) return { uid, setup, setupOk, ended: null };
     await kube.execOk("default", name, ["touch", "/tmp/go"], { container: "grower" });
     const grown = Date.now();
     let peakCurrent = 0;
+    // Each limit the held cgroup had as the pod grew, read every second.
+    const capSeen = new Set<string>();
     for (;;) {
-      const current = Number((await onNode(node, `cat ${podCgroup}/memory.current 2>/dev/null || echo 0`).catch(() => "0")).trim());
-      peakCurrent = Math.max(peakCurrent, current || 0);
+      const [current = "0", max = ""] = (await onNode(node, `cat ${podCgroup}/memory.current 2>/dev/null || echo 0; cat ${capped}/memory.max`).catch(() => "0")).trim().split("\n");
+      peakCurrent = Math.max(peakCurrent, Number(current) || 0);
+      if (max) capSeen.add(max);
       now = await kube.get<V1Pod>(target);
       const state = now?.status?.containerStatuses?.[0]?.state;
       if (state?.terminated || Date.now() - grown > GROWTH_BOUND_MS) {
@@ -227,7 +237,7 @@ async function foreignGrown(node: string, image: string, capped: string): Promis
           uid,
           setup,
           setupOk,
-          ended: { reason: terminated ? (terminated.reason ?? null) : "still running", exit_code: terminated?.exitCode ?? null, ran_ms: Date.now() - grown, container_ms: containerMs, phase: now?.status?.phase ?? null, peak_current: peakCurrent, memory_peak: memoryPeak },
+          ended: { reason: terminated ? (terminated.reason ?? null) : "still running", exit_code: terminated?.exitCode ?? null, ran_ms: Date.now() - grown, container_ms: containerMs, phase: now?.status?.phase ?? null, peak_current: peakCurrent, memory_peak: memoryPeak, cap_seen: [...capSeen] },
         };
       }
       await new Promise((resolve) => setTimeout(resolve, 1_000));
@@ -278,7 +288,7 @@ async function trial(number: number): Promise<Record<string, unknown>> {
     const grown = Date.now();
     // The foreign arm's pod, of the image the sessions' bayma runs.
     const image = ARM === "foreign" ? (await kube.get<V1Pod>(ref("Pod", b.pod, SESSIONS)))?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "" : "";
-    const foreign = ARM === "foreign" ? await foreignGrown(b.node, image, cgroup) : null;
+    const foreign = ARM === "foreign" ? await foreignGrown(b.node, image, cgroup, cap.limit) : null;
     if (foreign && !foreign.setupOk) return await setupFailed({ foreign: { image, ...foreign.setup } });
     const ran = ARM === "foreign" ? null : await Promise.race([
       kube.exec(SESSIONS, a.pod, ["node", "-e", ARM === "burst" ? BURST : GROWER], { container: "bayma" }).then((done) => ({ code: done.code, out: done.stdout.trim().slice(-200), said: done.stderr.slice(-400) }), (error: unknown) => ({ code: null, out: "", said: errorText(error).slice(-400) })),
