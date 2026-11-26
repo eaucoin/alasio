@@ -702,6 +702,28 @@ async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly 
   await docker("builder", "prune", "--all", "--force");
 }
 
+/** How long the release before's alasio is let run with nothing KEDA counts waiting for it: a day, past the end of any run. */
+export const PREVIOUS_COOLDOWN_SECONDS = 24 * 60 * 60;
+
+/**
+ * How alasio is scaled, of the release before's installation or this checkout's, in a run of
+ * `shard`: at one, as the suites reach its pod as one, by exec, which none of KEDA's triggers
+ * counts; but where the agents shard makes its scale a range and fixes it again, and the wake
+ * shard's gate gives it the default scale, KEDA's, which its press wakes from none, each back
+ * to none within the run; and in the upgrade shard, whose cut-over upgrades to the default
+ * scale, as an installation of the release before's does. There the release before's is at
+ * the default scale too, from none, its seeds and the cut-overs reaching its pod as the suites
+ * do: so KEDA lets it run for PREVIOUS_COOLDOWN_SECONDS, which the cut-over carries, until
+ * alasio is fixed at one. With the default 300 s, it slept under them that long after its last
+ * update, as 45870579579's upgrade shard's did, before its seeds ever said a thing to Telegram.
+ */
+export function alasioScaleOf(of: "previous" | "release", shard: Shard | undefined): { readonly cooldownSeconds?: number; readonly scaling?: { readonly min: number; readonly max: number } } {
+  if (of === "previous") return { cooldownSeconds: PREVIOUS_COOLDOWN_SECONDS };
+  if (shard === "upgrade") return {};
+  // What KEDA scales of an environment's, its relay of its Codex login among it, back to none within the agents and wake shards' runs.
+  return { ...(shard === "agents" || shard === "wake" ? { cooldownSeconds: 30 } : {}), scaling: { min: 1, max: 1 } };
+}
+
 /**
  * The install configuration the run starts alasio with: its images, pulled from where they
  * were pushed, alasio's with the stand-in for Codex, the stand-ins, small volumes, and
@@ -727,12 +749,7 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       },
       // The release before's as much as the box's asks for.
       resources: { requests: { cpu: "50m", memory: of === "previous" ? "2560Mi" : "256Mi" } },
-      // What KEDA scales of an environment's, its relay of its Codex login among it, back to none within the agents and wake shards' runs.
-      ...(of === "release" && (SHARD === "agents" || SHARD === "wake") ? { cooldownSeconds: 30 } : {}),
-      // One, as the suites reach its pod as one, but where the agents shard makes its scale a range and fixes it again, and the
-      // wake shard's gate gives it the default scale, KEDA's, which its press wakes from none; and in the upgrade shard, whose
-      // cut-over upgrades to the default scale, as an installation of the release before's does.
-      ...(of === "release" && SHARD !== "upgrade" ? { scaling: { min: 1, max: 1 } } : {}),
+      ...alasioScaleOf(of, SHARD),
       // On one node but in the wake shard, whose gate wakes it onto one it never ran on.
       ...(SHARD === "wake" ? {} : on("agent-1")),
     },
