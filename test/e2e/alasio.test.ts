@@ -860,7 +860,7 @@ if (inShard("upgrade")) {
       const [secrets, stack] = [await namespaceSecrets(), await stackSecrets()];
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* checking that the object store's volumes can be copied[^\n]*\n[^\n]* the object store's volumes hold \d+ bytes[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* checking that the object store can be snapshotted[^\n]*\n[^\n]* the object store's snapshot links \d+ volumes' data and copies \d+ bytes[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
       assert.deepEqual([await namespaceSecrets(), await stackSecrets()], [secrets, stack]);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
       assert.deepEqual(await alasioApplied(), applied);
