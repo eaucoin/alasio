@@ -803,11 +803,12 @@ describe("neon", () => {
     assert.equal(made.setup, "snapshots");
   });
 
-  test("aborts the uploads left incomplete after a day in each bucket written in parts, Neon's, the lake's, the backups' and the snapshots', each rule given as an identity that may write its bucket, and in workspace storage's, which JuiceFS writes whole, none", () => {
+  test("aborts the uploads left incomplete after a day in each bucket written in parts, Neon's, the lake's, the backups' and the snapshots', each rule given as an admin of its bucket, as SeaweedFS asks of its rules, and in workspace storage's, which JuiceFS writes whole, none", () => {
     const lifecycle = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
     const script = lifecycle?.command?.[2] ?? "";
     const given = [...script.matchAll(/AWS_ACCESS_KEY_ID="\$(\w+)_KEY_ID" AWS_SECRET_ACCESS_KEY="\$\1_SECRET" aws s3api --endpoint-url http:\/\/127\.0\.0\.1:8333 put-bucket-lifecycle-configuration --bucket (\w+) --lifecycle-configuration '([^']+)'/gu)];
-    assert.deepEqual(given.map(([, as, bucket]) => [bucket, as]), [["neon", "ADMIN"], ["lake", "LAKE"], ["backups", "BACKUPS"], ["snapshots", "SNAPSHOTS"]]);
+    // Neon's as its admin, the snapshots' as their writer, their admin, the lake's and the backups' as the gateways' own identity, neither bucket's writer.
+    assert.deepEqual(given.map(([, as, bucket]) => [bucket, as]), [["neon", "ADMIN"], ["lake", "RULES"], ["backups", "RULES"], ["snapshots", "SNAPSHOTS"]]);
     for (const [, , , rules] of given) {
       assert.deepEqual(JSON.parse(rules ?? ""), {
         Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
@@ -815,14 +816,12 @@ describe("neon", () => {
     }
     // Each waited for as made before its rule is given.
     for (const bucket of ["neon", "lake", "backups", "snapshots"]) assert.ok(script.indexOf(`head-bucket --bucket ${bucket} `) < script.indexOf(`--bucket ${bucket} --lifecycle-configuration`), bucket);
-    // Each identity's keys from the Secret the setup gives its writers.
+    // Each identity's keys, once, from the Secret the setup gives it.
     assert.deepEqual(lifecycle?.env?.filter(({ valueFrom }) => valueFrom).map(({ name, valueFrom }) => [name, `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]), [
       ["ADMIN_KEY_ID", "alasio-neon-s3-admin/AWS_ACCESS_KEY_ID"],
       ["ADMIN_SECRET", "alasio-neon-s3-admin/AWS_SECRET_ACCESS_KEY"],
-      ["LAKE_KEY_ID", "alasio-lake/LAKE_S3_KEY"],
-      ["LAKE_SECRET", "alasio-lake/LAKE_S3_SECRET"],
-      ["BACKUPS_KEY_ID", "alasio-neon-s3-backups/AWS_ACCESS_KEY_ID"],
-      ["BACKUPS_SECRET", "alasio-neon-s3-backups/AWS_SECRET_ACCESS_KEY"],
+      ["RULES_KEY_ID", "alasio-seaweedfs-rules/AWS_ACCESS_KEY_ID"],
+      ["RULES_SECRET", "alasio-seaweedfs-rules/AWS_SECRET_ACCESS_KEY"],
       ["SNAPSHOTS_KEY_ID", "alasio-snapshots/AWS_ACCESS_KEY_ID"],
       ["SNAPSHOTS_SECRET", "alasio-snapshots/AWS_SECRET_ACCESS_KEY"],
     ]);

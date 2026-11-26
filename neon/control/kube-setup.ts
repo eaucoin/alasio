@@ -70,6 +70,8 @@ export interface SecretNames {
   /** Each part's of the bundled object store: its certificate and its authority's, and the filers' their signing keys too (./store-security.ts). */
   storeParts: Record<StorePart, string>;
   s3Admin: string;
+  /** The bundled store's gateways' own identity's keys, which give the lake's and the backups' buckets their lifecycle rules. */
+  s3Rules: string;
   /**
    * Neon's bucket's expiry's (./expiry.ts): the bucket's admin's keys, and a token of the scrubber's scope. The storage
    * controller takes that scope (storage_controller/src/http.rs at release-9129) for three requests alone: GET
@@ -200,6 +202,7 @@ export function secretNames(prefix: string): SecretNames {
     filerStoreBackup: `${prefix}-seaweedfs-filer-store-backup`,
     storeParts: Object.fromEntries(STORE_PARTS.map((part) => [part, `${prefix}-seaweedfs-${part}-security`])) as Record<StorePart, string>,
     s3Admin: `${prefix}-neon-s3-admin`,
+    s3Rules: `${prefix}-seaweedfs-rules`,
     neonExpiry: `${prefix}-neon-expiry`,
     s3Backups: `${prefix}-neon-s3-backups`,
     compute: `${prefix}-neon-compute`,
@@ -384,6 +387,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces.bucket, snapshots: snapshotsBucket };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
+    // The gateways', with which they give the lake's and the backups' buckets their lifecycle rules.
+    rendered[names.s3Rules] = aws("rules");
     // The filers' store's users', which its Valkey requires: the filers', each filer is
     // given, the collector's, which reads its metrics, and the backups'.
     rendered[names.filerStoreFiler] = { password: secrets.filerStoreFilerPassword };

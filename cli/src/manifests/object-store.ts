@@ -567,14 +567,15 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
   const { scaling } = bundled.gateways;
   const made = [buckets.neon, buckets.lake, buckets.backups, buckets.workspaces, buckets.snapshots];
-  // Each bucket's rule given as an identity that may write the bucket, which SeaweedFS asks of
-  // its rules: Neon's as its admin, the others' as their own writers', each by the keys of
+  // Each bucket's rule given as an admin of the bucket, which SeaweedFS asks of its rules (from
+  // 4.52): Neon's as its admin, the snapshots' as their own writer, which is their admin, and the
+  // lake's and the backups' as the gateways' own identity, which is theirs, each by the keys of
   // the Secret it is given (neon/control/secrets.ts s3Identities, neon/control/kube-setup.ts).
   const aws = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] as const;
   const lifecycles = [
     { bucket: buckets.neon, as: "ADMIN", secret: neonName("s3-admin"), keys: aws },
-    { bucket: buckets.lake, as: "LAKE", secret: componentName("lake"), keys: ["LAKE_S3_KEY", "LAKE_S3_SECRET"] as const },
-    { bucket: buckets.backups, as: "BACKUPS", secret: neonName("s3-backups"), keys: aws },
+    { bucket: buckets.lake, as: "RULES", secret: componentName("seaweedfs-rules"), keys: aws },
+    { bucket: buckets.backups, as: "RULES", secret: componentName("seaweedfs-rules"), keys: aws },
     { bucket: buckets.snapshots, as: "SNAPSHOTS", secret: componentName("snapshots"), keys: aws },
   ];
   const image = imageReference(bundled.image);
@@ -705,7 +706,8 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               env: [
                 { name: "AWS_DEFAULT_REGION", value: "us-east-1" },
                 { name: "HOME", value: "/tmp" },
-                ...lifecycles.flatMap(({ as, secret, keys: [id, key] }) => [
+                // Each identity's keys once, however many buckets it gives rules.
+                ...[...new Map(lifecycles.map((lifecycle) => [lifecycle.as, lifecycle])).values()].flatMap(({ as, secret, keys: [id, key] }) => [
                   { name: `${as}_KEY_ID`, valueFrom: { secretKeyRef: { name: secret, key: id } } },
                   { name: `${as}_SECRET`, valueFrom: { secretKeyRef: { name: secret, key } } },
                 ]),

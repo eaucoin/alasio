@@ -35,10 +35,11 @@ export type ClientRole = (typeof CLIENT_ROLES)[number];
 
 /**
  * Who holds S3 credentials: Neon's storage, the stack's admin (of Neon's bucket), the
- * backups, the lake, its reader, workspace storage's JuiceFS, and the node agents, which
- * keep session sandboxes' snapshots.
+ * backups, the lake, its reader, workspace storage's JuiceFS, the node agents, which keep
+ * session sandboxes' snapshots, and the bundled store's gateways, which give the lake's and
+ * the backups' buckets their lifecycle rules.
  */
-export type S3Identity = "neon" | "admin" | "backups" | "lake" | "lakeReader" | "workspaces" | "snapshots";
+export type S3Identity = "neon" | "admin" | "backups" | "lake" | "lakeReader" | "workspaces" | "snapshots" | "rules";
 
 /**
  * Main's environment's principals on the log, as cli/src/manifests/log.ts's
@@ -229,6 +230,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       lakeReader: kept(s3.lakeReader, () => ({ accessKey: `lakereader${hexId().slice(0, 12)}`, secretKey: secret() })),
       workspaces: kept(s3.workspaces, () => ({ accessKey: `workspaces${hexId().slice(0, 12)}`, secretKey: secret() })),
       snapshots: kept(s3.snapshots, () => ({ accessKey: `snapshots${hexId().slice(0, 12)}`, secretKey: secret() })),
+      rules: kept(s3.rules, () => ({ accessKey: `rules${hexId().slice(0, 12)}`, secretKey: secret() })),
     },
     controllerDbPassword: kept(stored.controllerDbPassword, () => secret()),
     alasioPassword: passwords.alasioPassword,
@@ -288,7 +290,10 @@ export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-e
  * bucket and reads the workspaces' metadata it backs up; and an admin of Neon's bucket
  * alone, which gives it its lifecycle rules. The snapshots' identity is its bucket's admin,
  * giving it its rules itself: what may write that bucket writes the images the node agents
- * restore as root, so nothing else may.
+ * restore as root, so nothing else may. And the gateways' own, admin of the lake's and the
+ * backups' buckets, which gives them their lifecycle rules: SeaweedFS takes a bucket's rules
+ * from its admin alone (from 4.52), which neither bucket's writer is, nor is to be, as the lake's
+ * is every branch environment's too.
  */
 export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3Config {
   const on = (name: string) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
@@ -308,6 +313,7 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
       { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
       { name: "workspaces", credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) },
       { name: "snapshots", credentials: [secrets.s3.snapshots], actions: [...on(buckets.snapshots), `Admin:${buckets.snapshots}`] },
+      { name: "rules", credentials: [secrets.s3.rules], actions: [`Admin:${buckets.lake}`, `Admin:${buckets.backups}`] },
     ],
   };
 }

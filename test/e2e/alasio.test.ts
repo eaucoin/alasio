@@ -595,8 +595,9 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And what the object store's parts prove themselves with, which this release adds to the stack's.
+          // And what the object store's parts prove themselves with, and the gateways' own S3 identity, which this release adds to the stack's.
           assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
+            "s3.rules",
             "storeSecurity.authority",
             "storeSecurity.filerReadSigningKey",
             "storeSecurity.filerSigningKey",

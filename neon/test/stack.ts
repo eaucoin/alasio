@@ -1208,7 +1208,7 @@ export function neonStack(): void {
       /** The pod of a part's address, as SeaweedFS names a server: its name in its headless Service, and a port. */
       const podOfAddress = (address: string) => address.split(".")[0] ?? "";
 
-      test("each bucket written in parts holds SeaweedFS's rule for its uploads left incomplete, which the gateway, ready, gave it as an identity that may write it, and workspace storage's none", async () => {
+      test("each bucket written in parts holds SeaweedFS's rule for its uploads left incomplete, which the gateway, ready, gave it as an admin of the bucket, and workspace storage's none", async () => {
         const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
         /** The IDs of `bucket`'s lifecycle rules; none where it has no configuration of them. */
         const rules = async (bucket: string): Promise<string[]> => {

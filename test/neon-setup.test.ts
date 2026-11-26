@@ -143,7 +143,11 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const pageserverKeys = Object.keys(kube.secrets.get(names.pageserver)?.data ?? {});
   assert.ok(!pageserverKeys.includes("identity.toml") && !pageserverKeys.includes("metadata.json"), pageserverKeys.join(", "));
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces", "snapshots"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces", "snapshots", "rules"]);
+  // The gateways' own, admin of the lake's and the backups' buckets alone, which gives them their lifecycle rules, its keys in a Secret of its own.
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "rules")?.actions, ["Admin:lake", "Admin:backups"]);
+  assert.deepEqual([value(kube, names.s3Rules, "AWS_ACCESS_KEY_ID"), value(kube, names.s3Rules, "AWS_SECRET_ACCESS_KEY")], [root.s3.rules.accessKey, root.s3.rules.secretKey]);
+  assert.equal(names.s3Rules, "q-seaweedfs-rules");
 
   // The log's: its cluster's id and its admin's password; every principal's for its
   // access applier; and each principal's, KEDA's with its mechanism.
@@ -450,7 +454,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
   return {
     tenantId: "tenant",
     timelineId: "timeline",
-    s3: { neon: s3, admin: s3, backups: s3, lake: s3, lakeReader: s3, workspaces: s3, snapshots: s3 },
+    s3: { neon: s3, admin: s3, backups: s3, lake: s3, lakeReader: s3, workspaces: s3, snapshots: s3, rules: s3 },
     controllerDbPassword: "c",
     alasioPassword: "q",
     lakePassword: "l",
@@ -506,6 +510,7 @@ test("with an external object store, every service uses its credentials, but the
   });
   const names = secretNames("q");
   assert.equal(rendered[names.seaweedfs], undefined);
+  assert.equal(rendered[names.s3Rules], undefined);
   assert.equal(rendered[names.filerStoreFiler], undefined);
   assert.equal(rendered[names.filerStoreCollector], undefined);
   assert.equal(rendered[names.filerStoreBackup], undefined);
