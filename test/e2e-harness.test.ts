@@ -2,7 +2,7 @@
  * The shard of the end-to-end run's suites (test/e2e/harness.ts) its environment selects,
  * and where it makes its cluster, as CI's end-to-end jobs select each; the lines of a node's
  * logs its failure dump keeps as errors; the configuration the
- * upgrade shard upgrades with; and the Telegram
+ * upgrade shard upgrades with; how each shard's installations scale alasio; and the Telegram
  * stand-in's reading of what is sent it as a form, as Grafana sends its alerts; and the credentials
  * a failed command's error hides.
  */
@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { LOGGED_ERROR, runsShard, shardOf, SHARDS, targetOf, withoutBearers } from "./e2e/harness.ts";
+import { alasioScaleOf, LOGGED_ERROR, runsShard, shardOf, SHARDS, targetOf, withoutBearers } from "./e2e/harness.ts";
 import { overlaid } from "./e2e/release-config.ts";
 import { createTelegramStub } from "./e2e/telegram-stub.ts";
 
@@ -75,6 +75,17 @@ test("the upgrade shard's install configuration is laid over the one alasio init
     sessions: { storage: { size: "1Gi" } },
   });
   assert.deepEqual(overlaid({ list: [1, 2] }, { list: [3] }), { list: [3] });
+});
+
+test("alasio runs under every suite that reaches its pod: fixed at one, or, at the default scale, the release before's let run past the end of any run", () => {
+  for (const shard of [undefined, ...SHARDS.filter((name) => name !== "upgrade")]) assert.deepEqual(alasioScaleOf("release", shard).scaling, { min: 1, max: 1 }, shard);
+  // The upgrade shard's at the default scale, the release before's and, as the cut-over carries what it has, this checkout's after it.
+  const previous = alasioScaleOf("previous", "upgrade");
+  assert.equal(previous.scaling, undefined);
+  assert.deepEqual(alasioScaleOf("release", "upgrade"), {});
+  assert.ok((previous.cooldownSeconds ?? 300) >= 24 * 60 * 60, `the release before's alasio sleeps ${previous.cooldownSeconds ?? 300} s after its last update`);
+  // Back to none within the run where a suite lets it sleep.
+  assert.deepEqual([alasioScaleOf("release", "agents").cooldownSeconds, alasioScaleOf("release", "wake").cooldownSeconds], [30, 30]);
 });
 
 test("ALASIO_E2E_TARGET makes the cluster in Docker unless it names the host, and refuses another", () => {
