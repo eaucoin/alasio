@@ -56,8 +56,11 @@ const RESTORE_BOUND_MS = 300_000;
 export async function restore<D = null>(node: string, workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest, kind: "warm" | "cold", during?: () => Promise<D>) {
   const storeBefore = await storeBytes(node);
   const diskBefore = await diskReadBytes(node);
-  // What the node's standbys hold idle, one of which the restore may claim.
-  const memoryBefore = await agentOk(node, "GET", "/memory").then((said) => JSON.parse(said) as NodeMemory, () => null);
+  // What the node's standbys hold idle, one of which the restore may claim, as their pods' cgroups count it: their sandboxes'
+  // containers are created and none started, which runsc lists none of, so the node agent's reading has them not.
+  const standbysBefore = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: STANDBY_LABEL }).catch(() => [] as V1Pod[]);
+  const idleBefore = new Map<string, number | null>();
+  for (const each of standbysBefore.filter((pod) => pod.spec?.nodeName === node)) idleBefore.set(each.metadata?.name ?? "", (await podMemory(node, each.metadata?.uid ?? "")).current);
   // Settled whatever comes of the probe, which fails a restore that never answers before its pod is seen.
   const watching = watchRestore(workspace, manifest.release).then((watched) => ({ watched }), (error: unknown) => ({ error }));
   const timeline = VARIANT === "trace" ? podTimeline(workspace) : null;
@@ -93,7 +96,7 @@ export async function restore<D = null>(node: string, workspace: string, session
   // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
   const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
   // What the standby it claimed held, idle, before.
-  const standbyIdle = standby ? (memoryBefore?.sandboxes.find((sandbox) => sandbox.pod === name && sandbox.state === "standby")?.bytes ?? null) : null;
+  const standbyIdle = standby ? (idleBefore.get(name) ?? null) : null;
   const layerCache = await layerCacheBytes(node);
   // Its binding's Lease as the restore left it bound.
   const lease = (await kube.get<V1Lease>(ref("Lease", leaseName(sessionKey(workspace)), SESSIONS)))?.metadata?.resourceVersion ?? null;
