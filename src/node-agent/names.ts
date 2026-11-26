@@ -316,6 +316,34 @@ export const savesSummary = (release: string, since: string): boolean => release
 export const SAVES_SUMMARY_SINCE_VARIABLE = "ALASIO_GVISOR_SAVES_SUMMARY_SINCE";
 
 /**
+ * Whether gVisor's `release` asks bayma's hook over the socket bayma's server serves it on
+ * (hookSocketOf) rather than running it in the sandbox (runsc checkpoint
+ * --save-restore-exec-socket): each mode the hook would run in, the Sentry connects and asks it
+ * as the hook does, telling a restore why the sandbox stopped as its resume is told (runsc resume
+ * --save-restore-reason), and no process starts in a sandbox just restored. One at or past
+ * `since`, the first release that does, as cluster/node/pins.json says it
+ * (gvisor.hooksOverSocketSince) and the installation gives the node agent it
+ * (HOOKS_OVER_SOCKET_SINCE_VARIABLE); none where `since` names none. What a save asks is kept with
+ * the sandbox for its restore: a snapshot saved with the hook to run, by any release, runs it as
+ * it is restored, and asks over the socket from its next save on.
+ */
+export const hooksOverSocket = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that asks bayma's hook over its socket (hooksOverSocket). */
+export const HOOKS_OVER_SOCKET_SINCE_VARIABLE = "ALASIO_GVISOR_HOOKS_OVER_SOCKET_SINCE";
+
+/**
+ * The socket bayma's server serves its hook on, for the hook `hook` (bayma's `sandbox-hook`,
+ * told `--state-dir`): sandbox-hook.sock in that state directory, as bayma's sandbox-hook finds it;
+ * null for a hook told none. Pure, for tests.
+ */
+export function hookSocketOf(hook: readonly string[]): string | null {
+  const at = hook.indexOf("--state-dir");
+  const stateDir = at < 0 ? undefined : hook[at + 1];
+  return stateDir === undefined || stateDir === "" ? null : `${stateDir.replace(/\/+$/u, "")}/sandbox-hook.sock`;
+}
+
+/**
  * Whether gVisor's `release` bounds a save's waits for the pages that its sandbox's restore has
  * not loaded yet (runsc checkpoint --load-wait): for those it saves, and bayma's hook's for those
  * it touches, past which runsc kills the hook. Past it, the save fails, what it wrote

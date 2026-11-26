@@ -748,7 +748,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
    * A pod that ends meanwhile, or cannot start, as it is read until it runs, whose sandbox the
    * agent does not resume, or whose readiness cannot be set, is refused.
    */
-  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number, labels: Readonly<Record<string, string>>): Effect.Effect<void, RestoreRefused> =>
+  const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, bytes: number, labels: Readonly<Record<string, string>>, stopReason: string | undefined): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
       // The policies that select it, as the labels it was made with say, which its node's rules for it must name.
       const policies = yield* kube.list("networking.k8s.io/v1", "NetworkPolicy", pool.namespace, "").pipe(
@@ -764,7 +764,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
       // deferred, as every deferral for DEFER_FOR_MS at most, but where no try restores it. Its
       // sandbox may have run where a command failed, or the pod did not accept once resumed (500),
       // and where the call was sent and failed unanswered.
-      const resumed = agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, policies, snapshot, port }, bytes).pipe(
+      const resumed = agents.resume(node, { ...ref(pool, workspace), namespace: pool.namespace, pod: name, policies, snapshot, port, ...(stopReason === undefined ? {} : { stopReason }) }, bytes).pipe(
         Effect.mapError((error) => {
           const status = error._tag === "NodeAgentError" ? error.status : undefined;
           const ran = error._tag === "NodeAgentError" && error.unsent !== true && (status === undefined || status === 500);
@@ -903,7 +903,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
 
   const restoring = (pool: Pool, workspace: string, mode: "none" | "full", attaching: Attaching): Restoring => {
     /** What this bind's maker restored, which its pod's readying resumes. */
-    let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly bytes: number; readonly manifest: Manifest; readonly labels: Readonly<Record<string, string>>; readonly started: number } | null = null;
+    let restored: { readonly pod: string; readonly node: string; readonly snapshot: string; readonly bytes: number; readonly manifest: Manifest; readonly labels: Readonly<Record<string, string>>; readonly started: number; readonly stopReason: string | undefined } | null = null;
 
     const make: MakePod = (labels, annotations, binding) =>
       Effect.gen(function*() {
@@ -941,7 +941,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         const failures: (NodeAgentError | KubeApiError)[] = [];
         for (const node of able.success.nodes) {
           // Of one stopped as it ran out of its memory, its bayma's hook told so, for its sessions' next execs.
-          const stopReason = into?.memoryLimit === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: `it ran out of its memory (${into.memoryLimit})` };
+          const reason = into?.memoryLimit === undefined ? undefined : `it ran out of its memory (${into.memoryLimit})`;
+          const stopReason = reason === undefined ? {} : { [SANDBOX_STOP_REASON_VARIABLE]: reason };
           // Into the node's standby of its template and release, where one runs there, claimed for its binding first, so the
           // sync of its network policies its labels start runs as it is restored into (./standbys.ts); its workspace attached
           // into its directory as its snapshot is prepared, then restored into it, paused. One whose restore cannot be done so
@@ -1003,7 +1004,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             );
           }));
           if (standing !== null && tried !== null && "restored" in tried) {
-            restored = { pod: tried.restored.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: tried.restored.metadata?.labels ?? {}, started };
+            restored = { pod: tried.restored.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: tried.restored.metadata?.labels ?? {}, started, stopReason: reason };
             yield* standing.keep(pool, node, base, kept.runtimeClassName);
             return tried.restored;
           }
@@ -1056,7 +1057,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             Effect.tapError(() => attaching.detach(node, name)),
             Effect.mapError((error) => new BindStepFailed({ reason: `its restore's pod could not be made: ${error.message}` })),
           );
-          restored = { pod: pod.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: pod.metadata?.labels ?? {}, started };
+          restored = { pod: pod.metadata?.name ?? "", node, snapshot: manifest.snapshot, bytes: manifest.bytes, manifest, labels: pod.metadata?.labels ?? {}, started, stopReason: reason };
           // A standby kept on the node for the next restore of its template and release there.
           if (standing !== null) yield* standing.keep(pool, node, base, kept.runtimeClassName);
           return pod;
@@ -1077,7 +1078,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         const of = restored;
         if (of === null || of.pod !== pod.metadata?.name) return yield* attach(pod);
         yield* Effect.gen(function*() {
-          const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, of.labels).pipe(Effect.result);
+          const done = yield* resumeRestored(pool, workspace, of.pod, of.node, of.snapshot, of.bytes, of.labels, of.stopReason).pipe(Effect.result);
           if (done._tag === "Success") {
             const now = yield* Clock.currentTimeMillis;
             deferredSince.delete(named(pool, workspace));

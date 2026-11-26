@@ -1082,7 +1082,7 @@ function restoringAgents(current: Manifest | null, released: (Omit<Released, "ma
         Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: (pod) => ((pod as V1Pod | null)?.status?.containerStatuses ?? []).some(({ state }) => state?.running) }),
         Effect.provide(KubeClient.layer),
         Effect.orDie,
-        Effect.andThen(Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} on ${request.port}, of ${bytes} bytes`))),
+        Effect.andThen(Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot} on ${request.port}, of ${bytes} bytes${request.stopReason === undefined ? "" : `, told ${request.stopReason}`}`))),
       ),
     // As an agent does it: only where the workspace is at `snapshot` still.
     spend: (node, _ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${node} ${snapshot}`), void (state.current = state.current?.snapshot === snapshot ? null : state.current))),
@@ -1152,7 +1152,8 @@ test("a workspace released into its snapshot is restored from it as it is next b
     await spent(recorded.asked, "node-a", snapshot);
     assert.deepEqual(recorded.asked, [
       `prepare node-a socket retrying pages`,
-      `resume node-a ${name} ${snapshot} on 7290, of ${64 * 1024 ** 2} bytes`,
+      // Its sandbox's resume told why it stopped, for bayma's hook asked over its socket.
+      `resume node-a ${name} ${snapshot} on 7290, of ${64 * 1024 ** 2} bytes, told it ran out of its memory (4Gi)`,
       `record ${env.namespace}/fs-restored released into none`,
       `spend node-a ${snapshot}`,
     ]);

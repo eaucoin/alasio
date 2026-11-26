@@ -264,6 +264,8 @@ interface NodeOptions {
   readonly savesWithLoadWaitSince?: string;
   /** The first release that writes a checkpoint's summary, none unless given (NodeAgentOptions savesSummarySince). */
   readonly savesSummarySince?: string;
+  /** The first release that asks bayma's hook over its socket, none unless given (NodeAgentOptions hooksOverSocketSince). */
+  readonly hooksOverSocketSince?: string;
   readonly loadWait?: NodeAgentOptions["loadWait"];
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
@@ -282,7 +284,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", hooksOverSocketSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -311,6 +313,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
         savesWithLoadWaitSince,
         savesSummarySince,
+        hooksOverSocketSince,
         ...(loadWait === undefined ? {} : { loadWait }),
         backgroundReadMs,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
@@ -1171,6 +1174,43 @@ test("a checkpoint under a release that writes its summary reads its image's des
       there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD);
       assert.match(failure(yield* Effect.exit(there.agent.checkpoint(request("fs-abc")))), /checkpoint --summary-file of 20260921\.0-eaucoin\.8 failed: its summary is not one: .*ENOENT/u);
       assert.equal(cachesAny(there, "fs-abc"), false);
+    })
+  ));
+
+test("a checkpoint under a release that asks bayma's hook over its socket asks it there, in the hook's state directory, its save bound as the hook bounds its own, and runs no hook; its resume tells why the sandbox stopped, where it was told; under a release before, the hook runs, and its resume tells nothing", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const checkpointed = (here: Node) => here.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint")) ?? [];
+      const resumed = (here: Node) => here.releases.calls(RELEASE).filter((args) => args.includes("resume")).map((args) => args.slice(args.indexOf("resume") + 1));
+      const stopReason = "it ran out of its memory (1Gi)";
+
+      const over = yield* node("node-1", { hooksOverSocketSince: RELEASE });
+      yield* over.agent.checkpoint(request("fs-abc"));
+      const asked = checkpointed(over);
+      assert.ok(asked.includes(`--save-restore-exec-socket=${STATE_DIR}/sandbox-hook.sock`), asked.join(" "));
+      assert.ok(asked.includes(`--save-restore-exec-save-timeout=${SAVE_HOOK_SECONDS}s`), asked.join(" "));
+      assert.ok(asked.some((arg) => /^--save-restore-exec-timeout=\d+s$/u.test(arg)), asked.join(" "));
+      assert.ok(!asked.some((arg) => arg.startsWith("--save-restore-exec-argv=")), asked.join(" "));
+      const snapshot = released(s3);
+      yield* over.agent.resume({ ...resumeRequest(snapshot), stopReason });
+      yield* over.agent.resume(resumeRequest(snapshot));
+      assert.deepEqual(resumed(over), [
+        [`--save-restore-reason=${stopReason}`, CONTAINER],
+        [`--save-restore-reason=${stopReason}`, OTHER_CONTAINER],
+        [CONTAINER],
+        [OTHER_CONTAINER],
+      ]);
+
+      // Under a release before the first that asks it so, as under every release where none is named.
+      for (const since of ["20260921.0-eaucoin.9", ""]) {
+        const before = yield* node(`node-before-${since}`, { hooksOverSocketSince: since });
+        yield* before.agent.checkpoint(request("fs-abc"));
+        const ran = checkpointed(before);
+        assert.ok(ran.includes(`--save-restore-exec-argv=${HOOK.join(" ")}`), ran.join(" "));
+        assert.ok(!ran.some((arg) => arg.startsWith("--save-restore-exec-socket=") || arg.startsWith("--save-restore-exec-save-timeout=")), ran.join(" "));
+        yield* before.agent.resume({ ...resumeRequest(snapshot), stopReason });
+        assert.deepEqual(resumed(before), [[CONTAINER], [OTHER_CONTAINER]]);
+      }
     })
   ));
 

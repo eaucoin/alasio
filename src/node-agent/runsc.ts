@@ -16,7 +16,7 @@ import { basename, join, relative, sep } from "node:path";
 
 import { Effect, Schema } from "effect";
 
-import { gvisorHandler } from "./names.ts";
+import { gvisorHandler, SAVE_HOOK_SECONDS } from "./names.ts";
 
 /** Where the node's releases, their runtimes' options and their sandboxes' state are. */
 export interface RunscOptions {
@@ -188,6 +188,14 @@ export interface CheckpointOptions {
    * writes one (./names.ts savesSummary), outside the image's directory: what summaryOf reads.
    */
   readonly summaryFile?: string;
+  /**
+   * The socket bayma's server serves its hook on in the container, of a release that asks the
+   * hook over it (./names.ts hooksOverSocket), which runsc asks in place of running `hook`: what
+   * the save asks is kept with the sandbox for its restore. A save, and a resume after one taken
+   * live, are given SAVE_HOOK_SECONDS, as the hook run in the container gives itself (its
+   * start.sh), its restore `hookTimeout`.
+   */
+  readonly hookSocket?: string;
 }
 
 /**
@@ -273,8 +281,12 @@ export interface Runsc {
   readonly checkpoint: (release: string, options: CheckpointOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** Runs `argv` in a container, by its runtime's id, under `release`, as a process of its own, for `timeoutMs` at most, failing where it fails. */
   readonly exec: (release: string, containerId: string, argv: readonly string[], timeoutMs: number) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
-  /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
-  readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /**
+   * Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. Given
+   * `stopReason`, of a release that asks bayma's hook over its socket (./names.ts hooksOverSocket), the restore runsc
+   * asks of the hook as the sandbox first resumes tells it why the sandbox stopped.
+   */
+  readonly resume: (release: string, containerId: string, stopReason?: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /**
    * Kills a container, by its runtime's id, as its shim would, `runsc kill <id> KILL`: one runsc holds paused, as each of a
    * sandbox restored whole is until its resume, as the fork's runsc kills one (runsc/container/container.go killPaused),
@@ -467,7 +479,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
     releases,
     current,
 
-    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds, summaryFile }) =>
+    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds, summaryFile, hookSocket }) =>
       run(release, ["checkpoint"], [
         `--image-path=${imagePath}`,
         "--compression=none",
@@ -476,14 +488,17 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         ...(summaryFile === undefined ? [] : [`--summary-file=${summaryFile}`]),
         // Its pages written as the sandbox runs, past the page cache, which the pause then waits on.
         ...(live ? ["--leave-running", "--precopy=auto", "--precopy-throttle=on", "--direct"] : []),
-        // The hook told a live save from one that ends the sandbox, as gVisor tells it neither, and
-        // bayma collects its garbage only as its sandbox ends.
-        `--save-restore-exec-argv=${[...hook, ...(live ? ["--leave-running"] : [])].join(" ")}`,
+        // The hook told a live save from one that ends the sandbox, as gVisor tells a socket alone,
+        // and bayma collects its garbage only as its sandbox ends.
+        ...(hookSocket === undefined
+          ? [`--save-restore-exec-argv=${[...hook, ...(live ? ["--leave-running"] : [])].join(" ")}`]
+          : [`--save-restore-exec-socket=${hookSocket}`, `--save-restore-exec-save-timeout=${SAVE_HOOK_SECONDS}s`]),
         `--save-restore-exec-timeout=${hookTimeout}`,
         containerId,
       ]).pipe(Effect.asVoid),
 
-    resume: (release, containerId) => run(release, ["resume"], [containerId]).pipe(Effect.asVoid),
+    resume: (release, containerId, stopReason) =>
+      run(release, ["resume"], [...(stopReason === undefined ? [] : [`--save-restore-reason=${stopReason}`]), containerId]).pipe(Effect.asVoid),
 
     kill: (release, containerId) =>
       run(release, ["kill"], [containerId, "KILL"]).pipe(

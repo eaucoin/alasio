@@ -120,6 +120,8 @@ import { type Listing, listedEgressGap, type PodAddress } from "./kube-router.ts
 import { makeLoading } from "./loading.ts";
 import {
   backgroundReadSeconds,
+  hookSocketOf,
+  hooksOverSocket,
   LOAD_WAIT_WATCHDOG_MARGIN_SECONDS,
   LOADING_SAVE_FLOOR_SECONDS,
   LOADING_SAVE_LATEST_SECONDS,
@@ -362,6 +364,12 @@ export const ResumeRequest = Schema.Struct({
   snapshot: SnapshotId,
   /** The port its bayma serves on, which the pod accepts connections on once it is ready. */
   port: Schema.Number.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: 65_535 })),
+  /**
+   * Why its sandbox stopped, where its host says, one line, which bayma's hook is told as the sandbox
+   * is restored: of a snapshot asked over the hook's socket, by runsc's resume (./runsc.ts resume); of
+   * one whose hook runs, by the variables written beside its binding's token.
+   */
+  stopReason: Schema.optional(Schema.String.check(Schema.isMaxLength(256), Schema.isPattern(/^[^\r\n]*$/u))),
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
 
@@ -788,6 +796,8 @@ export interface NodeAgentOptions {
   readonly savesWithLoadWaitSince: string;
   /** The first gVisor release that writes a checkpoint's summary (savesSummary), which describes its image; none where empty. */
   readonly savesSummarySince: string;
+  /** The first gVisor release that asks bayma's hook over its socket (hooksOverSocket); none where empty. */
+  readonly hooksOverSocketSince: string;
   /**
    * How long a save of a release that bounds it waits for pages still loading, in seconds
    * (SAVE_LOAD_WAIT_SECONDS unless told), and how long a workspace's release saves may have been
@@ -1206,7 +1216,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, hooksOverSocketSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -1634,11 +1644,14 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         : null;
       // Its summary, of a release that writes one, beside what it staged, which goes with it.
       const summaryFile = savesSummary(release, savesSummarySince) ? `${staged}.summary.json` : null;
+      // Bayma's hook asked over its socket, of a release that asks it so, as the restore of the snapshot then asks it too.
+      const hookSocket = hooksOverSocket(release, hooksOverSocketSince) ? hookSocketOf(hook) : null;
       const saved = runsc.checkpoint(release, {
         containerId,
         imagePath: staged,
         hook,
         hookTimeout: `${hookSeconds}s`,
+        ...(hookSocket === null ? {} : { hookSocket }),
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
         live: live !== undefined,
         ...(waits === null ? {} : { loadWaitSeconds: waits }),
@@ -2769,7 +2782,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // Its restore reads what its sandbox did not touch first in the background, for a while yet, from its resume on: bayma's
       // hook, which runsc's resume runs, waits on those reads of the pages it touches, however long after the prepare.
       storeProxy.resumed(prefixOf(request), backgroundReadMs);
-      yield* Effect.forEach(running.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true }).pipe(step("alasio.node_agent.resume.runsc", request));
+      // Why it stopped told to bayma's hook as runsc's resume asks it, of a release that asks it so.
+      const told = (release: string) => (request.stopReason !== undefined && hooksOverSocket(release, hooksOverSocketSince) ? request.stopReason : undefined);
+      yield* Effect.forEach(running.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id, told(containers[index]?.release ?? "")), { discard: true }).pipe(
+        step("alasio.node_agent.resume.runsc", request),
+      );
       // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since, none of
       // its saves deferred yet.
       for (const id of running.containerIds) bases.set(id, from);

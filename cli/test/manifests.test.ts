@@ -2625,6 +2625,8 @@ describe("node agents", () => {
       ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE: "20260921.0-eaucoin.7",
       ALASIO_GVISOR_SAVES_WITH_LOAD_WAIT_SINCE: "20261102.0-eaucoin.10",
       ALASIO_GVISOR_SAVES_SUMMARY_SINCE: "20261102.0-eaucoin.11",
+      // None names the first that asks bayma's hook over its socket yet.
+      ALASIO_GVISOR_HOOKS_OVER_SOCKET_SINCE: "",
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
       ALASIO_LOADING_STALL_SECONDS: "90",
