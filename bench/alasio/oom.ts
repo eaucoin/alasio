@@ -2,16 +2,20 @@
  * The two-sandbox OOM measure (BENCH_MODE=oom): does an OOM above two sessions' sandboxes, as
  * memory grows past what the cgroup above them may hold, end a session it should not?
  * Each trial binds two new sessions on the node, their pods' limits far above (test/e2e/harness.ts),
- * and holds the cgroup of the node's Burstable pods, theirs, to what it holds then and
- * BENCH_OOM_HEADROOM_MIB (2048) more, so that the kernel's OOM is of that cgroup, above both
- * sandboxes, and not of a pod's own nor of the node, which a runner's memory filled whole starves
- * before the kernel kills. B holds 1.5 GiB and charges and frees 4 MiB every 20 ms beside it; then,
- * as BENCH_OOM_ARM says:
+ * and holds the cgroup of the node's Burstable pods, theirs, to what it holds then but its clean
+ * page cache, which the kernel reclaims as it nears the limit (as the guard's reclaimableIn counts
+ * it), and BENCH_OOM_HEADROOM_MIB (2048) more, so that the kernel's OOM is of that cgroup, above
+ * both sandboxes, and not of a pod's own nor of the node, which a runner's memory filled whole
+ * starves before the kernel kills. B holds 1.5 GiB and charges and frees 4 MiB every 20 ms beside
+ * it; then, as BENCH_OOM_ARM says:
  * - `grow` (unless said): A grows by BENCH_OOM_GROWTH_MIB (64) every 80 ms until it is killed;
  * - `foreign`: A is left as it is, and a pod of no sandbox, runc's, Burstable, on the same node in
  *   a namespace of no sessions, grows as A would until it ends, so that the want is another pod's;
- * - `burst`: A takes 1 GiB at once and holds it 15 s, as a session's exec may, which the guard's
- *   limit of its sandbox, where it sets one, should leave room for.
+ *   it grows only once its process is seen in a cgroup under the one held;
+ * - `burst`: A takes 1 GiB at once and holds it 15 s, as a session's exec may, once the guard has
+ *   limited its sandbox, which the limit should leave room for.
+ * A trial whose arm's conditions did not come about (the foreign pod's process elsewhere, A's
+ * sandbox not limited) is a line of its setup alone, `setup_ok` false, and no result.
  * The cgroup's limit is given back after. Then whether B's pod runs on, the same pod, its process
  * alive, and A's; what the kernel killed, the node agent ended or said of another pod's want and
  * kubelet evicted meanwhile; what the agent's guard set on each sandbox's cgroup, and says it did
@@ -34,7 +38,7 @@ import { BENCH_DIR, RUNS } from "./settings.ts";
 const ARM = process.env["BENCH_OOM_ARM"] || "grow";
 if (!["grow", "foreign", "burst"].includes(ARM)) throw new Error(`BENCH_OOM_ARM is ${ARM}, not grow, foreign or burst`);
 
-/** What the Burstable pods' cgroup is held to beyond what it holds as A begins, which A outgrows: BENCH_OOM_HEADROOM_MIB, 2048 unless said. */
+/** What the Burstable pods' cgroup is held to beyond what it holds as A begins but its clean page cache, which A outgrows: BENCH_OOM_HEADROOM_MIB, 2048 unless said. */
 const HEADROOM_BYTES = Number(process.env["BENCH_OOM_HEADROOM_MIB"] || 2048) * 1024 ** 2;
 /** Where the node's Burstable pods' cgroup is, as kubelet makes it under systemd's driver or cgroupfs's. */
 const BURSTABLE = "$(ls -d /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice /sys/fs/cgroup/kubepods/burstable 2>/dev/null | head -n 1)";
@@ -62,8 +66,8 @@ const GROWTH_MIB = Number(process.env["BENCH_OOM_GROWTH_MIB"] || 64);
 const GROWER = `const held = []; const grow = setInterval(() => (held.length * ${GROWTH_MIB} * 1024 * 1024 >= ${GROWER_MOST_BYTES} ? clearInterval(grow) : held.push(Buffer.alloc(${GROWTH_MIB} << 20, 7))), 80);`;
 /** A, of the burst arm: 1 GiB at once, every page written, held 15 s, then said. */
 const BURST = "const b = Buffer.alloc(1 << 30, 7); setTimeout(() => console.log('held', b.length), 15000)";
-/** How long the burst arm waits, once the Burstable pods' cgroup is held, for the guard to set what limits it sets. */
-const GUARD_SETTLE_MS = 5_000;
+/** How long the burst arm waits, once the Burstable pods' cgroup is held, for the guard to limit A's sandbox. */
+const GUARD_SETTLE_MS = 10_000;
 /** How long the foreign pod may take to start, its image on the node already. */
 const FOREIGN_START_MS = 60_000;
 
@@ -125,12 +129,39 @@ async function guardRecordsOf(node: string, pods: readonly string[]): Promise<un
 }
 
 /**
- * The foreign arm's pod: on `node`, in a namespace of no sessions, runc's (no runtime class),
- * Burstable, of `image`, growing as GROWER does until it ends or GROWTH_BOUND_MS has gone since it
- * started; deleted then. Its uid, and how it ended: its container's reason and exit code, as the
- * pod's status said, and how long it ran.
+ * Holds the Burstable pods' cgroup on `node` to what it holds but its clean page cache (active and
+ * inactive file pages, but those dirty or being written back, as the guard's reclaimableIn counts
+ * them) and HEADROOM_BYTES more: its path, its limit before, to give back, what it held, of it
+ * what was clean page cache, and the limit set.
  */
-async function foreignGrown(node: string, image: string): Promise<{ readonly uid: string; readonly ended: Record<string, unknown> }> {
+async function capBurstable(node: string): Promise<{ readonly path: string; readonly limitBefore: string; readonly current: number; readonly reclaimable: number; readonly limit: number }> {
+  const reclaimable = `awk '$1 == "active_file" || $1 == "inactive_file" { r += $2 } $1 == "file_dirty" || $1 == "file_writeback" { r -= $2 } END { printf "%.0f", (r > 0 ? r : 0) }' "$dir/memory.stat"`;
+  const said = (await onNode(node, [
+    `dir=${BURSTABLE}`,
+    'before=$(cat "$dir/memory.max")',
+    'current=$(cat "$dir/memory.current")',
+    `reclaimable=$(${reclaimable})`,
+    `echo $(( current - reclaimable + ${HEADROOM_BYTES} )) > "$dir/memory.max"`,
+    'echo "$dir $before $current $reclaimable $(cat "$dir/memory.max")"',
+  ].join("; "))).trim();
+  const [path = "", limitBefore = "max", current = "", held = "", limit = ""] = said.split(" ");
+  return { path, limitBefore, current: Number(current), reclaimable: Number(held), limit: Number(limit) };
+}
+
+/** The memory.max of A's sandbox's scope, as podCgroupsOf says it: its bytes, "max" for none, or null where it says none. */
+const scopeMaxOf = (lines: readonly string[]): string | null => lines.map((line) => / max=(\S+)/u.exec(line)?.[1]).find((max) => max !== undefined) ?? null;
+
+/**
+ * The foreign arm's pod: on `node`, in a namespace of no sessions, runc's (no runtime class),
+ * Burstable, its requests of CPU and memory under its limits, of `image`. Its process waits until
+ * it is seen in a cgroup under `capped`, the Burstable pods' cgroup held, then grows as GROWER does
+ * until it ends or GROWTH_BOUND_MS has gone; the pod is deleted then. Its uid; its setup: its QoS
+ * class and resources as admitted, its process's /proc/<pid>/cgroup, and whether that is under
+ * `capped`; the most its pod's cgroup held, read every second, and its memory.peak; and how it
+ * ended: its container's reason and exit code, as the pod's status said, and how long it ran;
+ * null where its setup failed.
+ */
+async function foreignGrown(node: string, image: string, capped: string): Promise<{ readonly uid: string; readonly setup: Record<string, unknown>; readonly setupOk: boolean; readonly ended: Record<string, unknown> | null }> {
   const name = `oom-foreign-${randomBytes(4).toString("hex")}`;
   const target = ref("Pod", name, "default");
   const pod: V1Pod = {
@@ -141,23 +172,63 @@ async function foreignGrown(node: string, image: string): Promise<{ readonly uid
       nodeName: node,
       restartPolicy: "Never",
       terminationGracePeriodSeconds: 0,
-      containers: [{ name: "grower", image, imagePullPolicy: "IfNotPresent", command: ["node", "-e", GROWER], resources: { requests: { memory: "64Mi" }, limits: { memory: "8Gi" } } }],
+      containers: [{
+        name: "grower",
+        image,
+        imagePullPolicy: "IfNotPresent",
+        command: ["sh", "-c", 'while [ ! -e /tmp/go ]; do sleep 0.2; done; exec node -e "$GROWER"'],
+        env: [{ name: "GROWER", value: GROWER }],
+        resources: { requests: { cpu: "10m", memory: "64Mi" }, limits: { cpu: "1", memory: "8Gi" } },
+      }],
     },
   };
   await kube.apply(pod);
   try {
     const t0 = Date.now();
-    let started: number | null = null;
+    let now = await kube.get<V1Pod>(target);
+    while (!now?.status?.containerStatuses?.[0]?.state?.running && Date.now() - t0 < FOREIGN_START_MS) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      now = await kube.get<V1Pod>(target);
+    }
+    const uid = now?.metadata?.uid ?? "";
+    const under = uid.replaceAll("-", "_");
+    // Its pod's cgroup, and the process of it that is not the pause container's, with its /proc/<pid>/cgroup.
+    const located = (await onNode(node, [
+      `pod=$(ls -d /sys/fs/cgroup/kubepods.slice/*/kubepods-*-pod${under}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${under}.slice /sys/fs/cgroup/kubepods/*/pod${uid} /sys/fs/cgroup/kubepods/pod${uid} 2>/dev/null | head -n 1)`,
+      'for pid in $(cat "$pod"/*/cgroup.procs 2>/dev/null); do [ "$(cat /proc/$pid/comm)" != pause ] && { echo "$pod $pid $(cat /proc/$pid/cgroup)"; break; }; done; true',
+    ].join("; ")).catch((error: unknown) => `unread: ${errorText(error)}`)).trim();
+    const [podCgroup = "", pid = "", procCgroup = ""] = located.split(" ");
+    const cgroupPath = procCgroup.startsWith("0::") ? `/sys/fs/cgroup${procCgroup.slice(3)}` : "";
+    const setup = {
+      pod: name,
+      qos_class: now?.status?.qosClass ?? null,
+      admitted_resources: now?.spec?.containers[0]?.resources ?? null,
+      waiting: now?.status?.containerStatuses?.[0]?.state?.waiting?.reason ?? null,
+      pod_cgroup: podCgroup,
+      pid: pid || null,
+      proc_cgroup: procCgroup || located,
+      under_capped: cgroupPath.startsWith(`${capped}/`),
+    };
+    const setupOk = now?.status?.qosClass === "Burstable" && setup.under_capped;
+    if (!setupOk) return { uid, setup, setupOk, ended: null };
+    await kube.execOk("default", name, ["touch", "/tmp/go"], { container: "grower" });
+    const grown = Date.now();
+    let peakCurrent = 0;
     for (;;) {
-      const now = await kube.get<V1Pod>(target);
+      const current = Number((await onNode(node, `cat ${podCgroup}/memory.current 2>/dev/null || echo 0`).catch(() => "0")).trim());
+      peakCurrent = Math.max(peakCurrent, current || 0);
+      now = await kube.get<V1Pod>(target);
       const state = now?.status?.containerStatuses?.[0]?.state;
-      if (state?.terminated) {
-        const { reason, exitCode, startedAt, finishedAt } = state.terminated;
-        return { uid: now?.metadata?.uid ?? "", ended: { reason: reason ?? null, exit_code: exitCode, ran_ms: startedAt && finishedAt ? new Date(finishedAt).getTime() - new Date(startedAt).getTime() : null, phase: now?.status?.phase ?? null } };
-      }
-      if (state?.running && started === null) started = Date.now();
-      if (started === null ? Date.now() - t0 > FOREIGN_START_MS : Date.now() - started > GROWTH_BOUND_MS) {
-        return { uid: now?.metadata?.uid ?? "", ended: { reason: started === null ? "never started" : "still running", exit_code: null, phase: now?.status?.phase ?? null, waiting: now?.status?.containerStatuses?.[0]?.state?.waiting?.reason ?? null } };
+      if (state?.terminated || Date.now() - grown > GROWTH_BOUND_MS) {
+        const memoryPeak = (await onNode(node, `cat ${podCgroup}/memory.peak 2>/dev/null || echo unread`).catch(() => "unread")).trim();
+        const terminated = state?.terminated;
+        const containerMs = terminated?.startedAt && terminated.finishedAt ? new Date(terminated.finishedAt).getTime() - new Date(terminated.startedAt).getTime() : null;
+        return {
+          uid,
+          setup,
+          setupOk,
+          ended: { reason: terminated ? (terminated.reason ?? null) : "still running", exit_code: terminated?.exitCode ?? null, ran_ms: Date.now() - grown, container_ms: containerMs, phase: now?.status?.phase ?? null, peak_current: peakCurrent, memory_peak: memoryPeak },
+        };
       }
       await new Promise((resolve) => setTimeout(resolve, 1_000));
     }
@@ -172,20 +243,43 @@ async function trial(number: number): Promise<Record<string, unknown>> {
   const restartsBefore = await platformRestarts();
   const b = await boundWorkspace();
   const a = await boundWorkspace();
+  // What gives the Burstable pods' cgroup its limit back, once held; called again, it does nothing.
+  let giveBack = async (): Promise<void> => {};
   try {
     await kube.execOk(SESSIONS, b.pod, ["sh", "-c", `nohup node -e "${HOLDER}" > /tmp/holder.log 2>&1 & sleep 3`], { container: "bayma" });
     // A's workspace marked, for its session's fallback to be told by.
     await kube.execOk(SESSIONS, a.pod, ["sh", "-c", 'echo kept > "$HOME/oom-marker"'], { container: "bayma" });
-    // The Burstable pods' cgroup held to what it holds now and HEADROOM_BYTES more: its limit before, to give back.
-    const limited = (await onNode(b.node, `dir=${BURSTABLE}; before=$(cat "$dir/memory.max"); echo $(( $(cat "$dir/memory.current") + ${HEADROOM_BYTES} )) > "$dir/memory.max"; echo "$dir $before $(cat "$dir/memory.max")"`)).trim();
-    const [cgroup = "", limitBefore = "max", limit = ""] = limited.split(" ");
-    // The burst arm's A takes its GiB once the guard has looked at the room left, and limited the sandboxes if it does.
-    if (ARM === "burst") await new Promise((resolve) => setTimeout(resolve, GUARD_SETTLE_MS));
+    // The Burstable pods' cgroup held to what it holds now but its clean page cache and HEADROOM_BYTES more; its limit before given back once A, or the foreign pod, has ended.
+    const cap = await capBurstable(b.node);
+    const cgroup = cap.path;
+    let givenBack = false;
+    giveBack = async () => {
+      if (!givenBack) await onNode(b.node, `echo ${cap.limitBefore} > ${cgroup}/memory.max`);
+      givenBack = true;
+    };
+    const capOk = cgroup !== "" && Number.isFinite(cap.limit) && cap.limit > 0;
+    // A setup that failed: its line, of what was set up alone, the limit given back.
+    const setupFailed = async (setup: Record<string, unknown>) => {
+      await giveBack();
+      return { trial: number, arm: ARM, setup_ok: false, cap, setup, took_ms: Date.now() - started };
+    };
+    if (!capOk) return await setupFailed({ cap: "not set" });
+    // The burst arm's A takes its GiB once the guard has limited its sandbox, its scope's memory.max a number.
+    let aLimitBefore: string | null = null;
+    if (ARM === "burst") {
+      const until = Date.now() + GUARD_SETTLE_MS;
+      do {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        aLimitBefore = scopeMaxOf(await podCgroupsOf(a.node, a.uid));
+      } while (!/^\d+$/u.test(aLimitBefore ?? "") && Date.now() < until);
+      if (!/^\d+$/u.test(aLimitBefore ?? "")) return await setupFailed({ a_limit_before: aLimitBefore, cgroups: { a: await podCgroupsOf(a.node, a.uid), b: await podCgroupsOf(b.node, b.uid) } });
+    }
     const cgroupsBefore = ARM === "burst" ? { a: await podCgroupsOf(a.node, a.uid), b: await podCgroupsOf(b.node, b.uid) } : undefined;
     const grown = Date.now();
     // The foreign arm's pod, of the image the sessions' bayma runs.
     const image = ARM === "foreign" ? (await kube.get<V1Pod>(ref("Pod", b.pod, SESSIONS)))?.spec?.containers.find(({ name }) => name === "bayma")?.image ?? "" : "";
-    const foreign = ARM === "foreign" ? await foreignGrown(b.node, image) : null;
+    const foreign = ARM === "foreign" ? await foreignGrown(b.node, image, cgroup) : null;
+    if (foreign && !foreign.setupOk) return await setupFailed({ foreign: { image, ...foreign.setup } });
     const ran = ARM === "foreign" ? null : await Promise.race([
       kube.exec(SESSIONS, a.pod, ["node", "-e", ARM === "burst" ? BURST : GROWER], { container: "bayma" }).then((done) => ({ code: done.code, out: done.stdout.trim().slice(-200), said: done.stderr.slice(-400) }), (error: unknown) => ({ code: null, out: "", said: errorText(error).slice(-400) })),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), GROWTH_BOUND_MS)),
@@ -195,7 +289,7 @@ async function trial(number: number): Promise<Record<string, unknown>> {
     const cgroupsAtEnd = { a: await podCgroupsOf(a.node, a.uid), b: await podCgroupsOf(b.node, b.uid) };
     // One not killed in time ended first, so that it grows no further once the limit is given back.
     if (ran === null && ARM !== "foreign") await kube.kill(SESSIONS, a.pod);
-    await onNode(b.node, `echo ${limitBefore} > ${cgroup}/memory.max`);
+    await giveBack();
     const events = (await onNode(b.node, `cat ${cgroup}/memory.events`)).trim().split("\n");
     await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     const podOf = async (uid: string, name: string) => {
@@ -240,11 +334,13 @@ async function trial(number: number): Promise<Record<string, unknown>> {
     return {
       trial: number,
       arm: ARM,
+      setup_ok: true,
       a: { pod: a.pod, ended: ran !== null, exec: ran, ended_ms: aEndedMs, ...aPod },
       b: { pod: b.pod, ...bPod, stamp_age_ms: stampAge },
       b_survived: bPod.there && bPod.phase === "Running" && stampAge !== null && stampAge < 2_000,
       a_survived: aSurvived,
-      foreign: foreign && { image, ...foreign.ended },
+      a_limit: ARM === "burst" ? { before: aLimitBefore, after: scopeMaxOf(cgroupsAtEnd.a) } : undefined,
+      foreign: foreign && { image, ...foreign.setup, ...foreign.ended },
       victims,
       platform_restarted: platformRestarted,
       a_after: { bound: aBound?.name ?? null, gateway: aGateway },
@@ -256,12 +352,14 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       cgroups_at_end: cgroupsAtEnd,
       fallback,
       report,
-      cgroup: { path: cgroup, limit_before: limitBefore, limit: Number(limit), events },
+      cgroup: { path: cgroup, limit_before: cap.limitBefore, current: cap.current, reclaimable: cap.reclaimable, limit: cap.limit, events },
       kernel,
       evicted,
       took_ms: Date.now() - started,
     };
   } finally {
+    // A trial that threw gives the limit back too.
+    await giveBack().catch(() => {});
     for (const { workspace } of [a, b]) await forgetWorkspace(workspace);
   }
 }
@@ -269,7 +367,7 @@ async function trial(number: number): Promise<Record<string, unknown>> {
 /** The measure's trials, RUNS of them, each a line of logs/oom.jsonl. */
 export async function oomTrials(): Promise<void> {
   for (let number = 1; number <= RUNS; number++) {
-    const line = await trial(number).catch((error: unknown) => ({ trial: number, failure: errorText(error) }));
+    const line = await trial(number).catch((error: unknown) => ({ trial: number, arm: ARM, setup_ok: false, failure: errorText(error) }));
     appendFileSync(join(BENCH_DIR, "logs", "oom.jsonl"), `${JSON.stringify(line)}\n`);
     console.error(`# OOM trial ${number}: ${JSON.stringify(line).slice(0, 600)}`);
   }
