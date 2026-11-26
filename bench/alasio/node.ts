@@ -180,7 +180,7 @@ export async function bootLogs(node: string): Promise<void> {
   for (const { release } of NODE_PINS.gvisor.releases) {
     const options = `${CONTAINERD}/${gvisorHandler(release)}.toml`;
     // [runsc_config] is the options' last table (cli/src/cluster/k3s.ts).
-    await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot,create,restore,start,state,events,wait,ps,pause,resume"\\n' >> ${options}; tail -n 4 ${options}`);
+    await onNode(node, `grep -q '^  debug-log' ${options} || printf '  debug-log = "${RUNSC_LOGS}/%%ID%%/"\\n  panic-log = "${RUNSC_LOGS}/%%ID%%/"\\n  debug-command = "boot,create,restore,start,state,events,wait,ps,pause,resume"\\n' >> ${options}; tail -n 5 ${options}`);
   }
   const free = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${FREE_LABEL}=true` });
   for (const pod of free) await kube.remove(ref("Pod", pod.metadata?.name ?? "", SESSIONS));
