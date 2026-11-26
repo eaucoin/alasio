@@ -134,13 +134,16 @@ export function resumeSteps(spans: readonly Span[], workspace: string, fromMs: n
 
 /**
  * A restore's first request at the gateway's front, the probe's MCP initialize: from its receipt,
- * the start of the first alasio.front.request of `workspace` at or after `t0Ms`, to bayma's answer
- * of it through the front, the end of the front's request whose trace holds bayma's `initialize`
- * span within it; where bayma's span is not there, the first request's own end, unless the client
- * was `refused` and asked again, whose answer then is not told. Null where it is not traced.
+ * the start of the first alasio.front.request of `workspace` from `t0Ms` to `endMs`, its first
+ * exec's answer, to bayma's answer of it through the front, the end of the front's request whose
+ * trace holds bayma's `initialize` span within it; where bayma's span is not there, the first
+ * request's own end, unless the client was `refused` and asked again, whose answer then is not
+ * told. None of the run's later requests, another restore's among them. Null where it is not
+ * traced.
  */
-export function frontWindow(spans: readonly Span[], workspace: string, t0Ms: number, refused: boolean): { readonly receivedNs: bigint; readonly answeredNs: bigint } | null {
-  const fronts = spans.filter((span) => span.name === "alasio.front.request" && span.attributes["alasio.sandbox.name"] === workspace && span.startNs >= msToNs(t0Ms)).toSorted((a, b) => (a.startNs < b.startNs ? -1 : 1));
+export function frontWindow(spans: readonly Span[], workspace: string, t0Ms: number, endMs: number, refused: boolean): { readonly receivedNs: bigint; readonly answeredNs: bigint } | null {
+  const fronts = spans.filter((span) => span.name === "alasio.front.request" && span.attributes["alasio.sandbox.name"] === workspace && span.startNs >= msToNs(t0Ms) && span.startNs <= msToNs(endMs))
+    .toSorted((a, b) => (a.startNs < b.startNs ? -1 : 1));
   const [first] = fronts;
   if (first === undefined) return null;
   const traces = new Set(fronts.map(({ traceId }) => traceId));
@@ -175,7 +178,7 @@ export function orchestration(spans: readonly Span[], workspace: string, t0Ms: n
   const excluded = toRunningMs !== null && runscResumeMs !== null ? toRunningMs + runscResumeMs : null;
   const withClientMs = firstExecMs !== null && probeExecMs !== null && excluded !== null ? firstExecMs - probeExecMs - excluded : null;
   if (excluded === null) return { orchestrationMs: null, withClientMs, how: null };
-  const front = frontWindow(spans, workspace, t0Ms, client.refused);
+  const front = firstExecMs === null ? null : frontWindow(spans, workspace, t0Ms, t0Ms + firstExecMs, client.refused);
   if (front !== null) return { orchestrationMs: ms(front.answeredNs - front.receivedNs) - excluded, withClientMs, how: "front" };
   return client.requestToAnswerMs === null ? { orchestrationMs: null, withClientMs, how: null } : { orchestrationMs: client.requestToAnswerMs - excluded, withClientMs, how: "client" };
 }

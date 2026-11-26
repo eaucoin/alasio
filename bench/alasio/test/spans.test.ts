@@ -55,12 +55,16 @@ test("a restore's orchestration is of the gateway's part of its first request, f
   const next = span("alasio.front.request", 1740, 1750, { traceId: "next" });
   // Another workspace's initialize, in its own trace, earlier, which is not this one's.
   const other = span("initialize", 1100, 1110, { traceId: "other", service: "bayma", attributes: {} });
+  // The run's next restore of the workspace, a minute on: its first request and bayma's initialize, of no use to this one's.
+  const later = span("alasio.front.request", 61_000, 63_000, { traceId: "later" });
+  const laterInitialize = span("initialize", 62_000, 62_100, { traceId: "later", service: "bayma", attributes: {} });
   const measured = { firstExecMs: 900, probeExecMs: 100, toRunningMs: 300, runscResumeMs: 150 };
   const client = { refused: false, requestToAnswerMs: 650 };
-  assert.deepEqual(orchestration([other, front, initialize, next], "fs-1", 1000, measured, client), { orchestrationMs: 645 - 450, withClientMs: 800 - 450, how: "front" });
-  // Without bayma's span, the first request is the one that carried it, unless the client was refused and asked again.
-  assert.deepEqual(frontWindow([front, next], "fs-1", 1000, false), { receivedNs: 1_055_000_000n, answeredNs: 1_700_000_000n });
-  assert.equal(frontWindow([front, next], "fs-1", 1000, true), null);
+  assert.deepEqual(orchestration([other, front, initialize, next, later, laterInitialize], "fs-1", 1000, measured, client), { orchestrationMs: 645 - 450, withClientMs: 800 - 450, how: "front" });
+  // Without bayma's span, the first request is the one that carried it, though a later restore's bayma said its own, unless the
+  // client was refused and asked again.
+  assert.deepEqual(frontWindow([front, next, later, laterInitialize], "fs-1", 1000, 1900, false), { receivedNs: 1_055_000_000n, answeredNs: 1_700_000_000n });
+  assert.equal(frontWindow([front, next], "fs-1", 1000, 1900, true), null);
   // Without the front's spans, the client's own view of it, said so.
   assert.deepEqual(orchestration([], "fs-1", 1000, measured, client), { orchestrationMs: 650 - 450, withClientMs: 350, how: "client" });
   assert.deepEqual(orchestration([], "fs-1", 1000, measured, { refused: false, requestToAnswerMs: null }), { orchestrationMs: null, withClientMs: 350, how: null });
