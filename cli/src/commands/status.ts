@@ -19,11 +19,11 @@ import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common
 import { HARNESS_POOLS } from "../manifests/harness-pools.ts";
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
-import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
+import { FILER, GATEWAY, MASTER, masterAddresses, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
 import { GATEWAY_COMPONENT, GATEWAY_PORT } from "../manifests/sandbox-gateway.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
-import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
+import { describeGrowthFrozen, describeReplication, describeVolumeServer, growthFrozen, volumeServerDisk } from "../object-store.ts";
 import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
@@ -127,8 +127,9 @@ const statefulSet = (workloads: readonly KubernetesObject[], name: string): V1St
 
 /**
  * What the bundled object store keeps, where it runs among `workloads`: the copies of
- * each object, as its masters are told; and of each volume server, its disk, as its
- * metrics say it, read in its pod; or why it is not measured.
+ * each object, as its masters are told; of each volume server, its disk, as its metrics say
+ * it, read in its pod, or why it is not measured; and whether a master holds volume growth
+ * frozen, as its metrics say, and how to resume it.
  */
 const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<string[], KubeApiError, KubeApi> =>
   Effect.gen(function*() {
@@ -151,7 +152,15 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
         Effect.catch((error) => Effect.succeed(`${name}: not measured: ${error.message}`)),
       );
     });
-    return [describeReplication(replication), ...disks.map((line) => `  ${line}`)];
+    // Each master's metrics, of whether it holds volume growth frozen; one that cannot be read says nothing.
+    const masters = yield* seen(kube.list<V1Pod>(kind("Pod"), { namespace: NAMESPACE, labelSelector: selectorOf(master.spec?.selector.matchLabels ?? {}) }));
+    const frozen = yield* Effect.forEach(Option.getOrElse(masters, () => []).filter((pod) => pod.status?.phase === "Running"), (pod) =>
+      runIn({ namespace: NAMESPACE, pod: pod.metadata?.name ?? "", container: "master" }, ["wget", "-q", "-O", "-", `http://127.0.0.1:${METRICS_PORT}/metrics`]).pipe(
+        Effect.map(({ exitCode, stdout }) => (exitCode === 0 && growthFrozen(stdout) === true ? [pod.metadata?.name ?? ""] : [])),
+        Effect.orElseSucceed(() => []),
+      ));
+    const shell = `kubectl -n ${NAMESPACE} exec -it deployment/${GATEWAY} -c buckets -- weed shell -master=${masterAddresses(master.spec?.replicas ?? 1)} -filer=${FILER}:8888`;
+    return [describeReplication(replication), ...disks.map((line) => `  ${line}`), ...describeGrowthFrozen(frozen.flat().sort(), shell).map((line) => `  ${line}`)];
   });
 
 /** Whether `workload` is a sandbox pool's, ready once its pods run, each ready only once bound. */

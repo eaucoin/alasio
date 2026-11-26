@@ -65,6 +65,32 @@ export function volumeServerDisk(text: string): VolumeServerDisk | null {
   return size === null || free === null || room === null || maxVolumes === null ? null : { ...disk, size, free, room, maxVolumes };
 }
 
+/**
+ * Whether a master's metrics' text, `text`, says it holds volume growth frozen
+ * (`SeaweedFS_master_volume_growth_frozen`, from SeaweedFS 4.49): as a master does that finds
+ * the volume servers holding a topology other than its own, its state lost or made anew, so
+ * that it would give new volumes ids those servers hold already. The store writes on to the
+ * volumes it has until they fill, and makes no others. Null where the metric is not there.
+ */
+export function growthFrozen(text: string): boolean | null {
+  const frozen = samples(text).find(({ name }) => name === "SeaweedFS_master_volume_growth_frozen");
+  return frozen === undefined ? null : frozen.value > 0;
+}
+
+/**
+ * What `status` says of the store whose masters `frozen` names, each by its pod, holding volume
+ * growth frozen: that it is, and how to resume it once the store is seen whole, in `weed
+ * shell` as `shell` runs it; nothing where none does.
+ */
+export function describeGrowthFrozen(frozen: readonly string[], shell: string): string[] {
+  if (frozen.length === 0) return [];
+  return [
+    `its volume growth: frozen by ${frozen.join(", ")}, which found the volume servers holding another master state than its own, lost or made anew: ` +
+    `the store writes on to the volumes it has until they fill, and makes none; once its volume servers are all seen, and its masters' state is the one they hold, ` +
+    `resume it in weed shell (${shell}) with volume.growth.resume`,
+  ];
+}
+
 /** The copies of each object a replication, `000` or `00N`, keeps, as said. */
 export function describeReplication(replication: string): string {
   const copies = Number(replication.slice(2)) + 1;
