@@ -4495,17 +4495,20 @@ if (inShard("agents")) {
       const snapshotted = (await kube.get<V1Pod>(ref("Pod", bound.name, SESSIONS)))?.spec?.runtimeClassName !== undefined;
       const url = `http://${GATEWAY}.${NAMESPACE}.svc.cluster.local:${GATEWAY_PORT}/mcp`;
       const mark = "mcp-release-cut";
-      const running = inAlasio<ReleaseSeen>("./claude-mcp-release.ts", url, await mainToken(session), mark);
-      // The pod deleted as the cut call starts, as its mark says, a real loss mid-call.
+      let ended = false;
+      const running = inAlasio<ReleaseSeen>("./claude-mcp-release.ts", url, await mainToken(session), mark).finally(() => (ended = true));
+      // The pod deleted as the cut call starts, as its mark says, a real loss mid-call. Looked for no more once the script
+      // ended, however: 45839900809's ended failing, and the look went on under the tests after, through alasio's pod, until
+      // one of them ended that pod and it failed, no pod of alasio's running, a rejection no one handled.
       const lost = (async () => {
-        await until("the call to cut to start", async () => ((await gatewayCall(await mainToken(session), "GET", `/workspace/files?path=workspace%2F${mark}`)).status === 200 ? true : undefined), 15 * 60_000);
+        await until("the call to cut to start", async () => (ended || (await gatewayCall(await mainToken(session), "GET", `/workspace/files?path=workspace%2F${mark}`)).status === 200 ? true : undefined), 15 * 60_000);
+        assert.ok(!ended, "the script ended before its call to cut started");
         const cutting = await boundPodOf(session);
         assert.ok(cutting, "no pod was bound as the call to cut started");
         await kube.kill(SESSIONS, cutting.name);
         return cutting;
       })();
-      const seen = await running;
-      const cut = await lost;
+      const [seen, cut] = await Promise.all([running, lost]);
       // What was attached into the pod lost detached on its node by the node's agent, as no deletion of the pod's was seen.
       await untilDetachedOn(cut.node, SESSIONS, cut.name);
       t.diagnostic(`Claude Code across its session's releases and loss (${snapshotted ? "snapshotted" : "no snapshot"}): ${JSON.stringify(seen)}`);
