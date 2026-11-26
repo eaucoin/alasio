@@ -45,6 +45,17 @@ function memoryNode() {
     writeFileSync(join(dir, "memory.stat"), `anon ${anon}\nfile ${bytes - anon}\nkernel 1000\nshmem ${shmem}\n`);
     if (zswap !== undefined) writeFileSync(join(dir, "memory.zswap.current"), `${zswap}\n`);
   };
+  /** Processes in the pod sandbox's scope of the pod `uid`, as the node's /proc says them: each pid's argv and smaps_rollup's Pss, in kB. */
+  const processes = (uid: string, each: Readonly<Record<number, readonly [readonly string[], number]>>) => {
+    const scope = join(ownCgroups, "kubepods.slice", "kubepods-burstable.slice", `kubepods-burstable-pod${uid.replaceAll("-", "_")}.slice`, "cri-containerd-0abc.scope");
+    mkdirSync(scope, { recursive: true });
+    writeFileSync(join(scope, "cgroup.procs"), Object.keys(each).map((pid) => `${pid}\n`).join(""));
+    for (const [pid, [argv, pss]] of Object.entries(each)) {
+      mkdirSync(join(nodeRoot, "proc", pid), { recursive: true });
+      writeFileSync(join(nodeRoot, "proc", pid, "cmdline"), `${argv.join("\0")}\0`);
+      writeFileSync(join(nodeRoot, "proc", pid, "smaps_rollup"), `55d0c0000000-7ffd00000000 ---p 00000000 00:00 0                          [rollup]\nRss:              ${pss * 2} kB\nPss:              ${pss} kB\nPss_Anon:         ${pss} kB\n`);
+    }
+  };
   /** A pod of the sessions' namespace, its pause container and bayma's, which run, of the uid `uid`. */
   const pod = (name: string, uid: string) => {
     releases.runs(`${name}-pause`, RELEASE, "alasio-sessions", name, true, [], uid);
@@ -58,7 +69,7 @@ function memoryNode() {
   };
   const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot, current: RELEASE });
   const read = () => Effect.runPromise(nodeMemory({ runsc, nodeRoot, attachRoot, ownProc, ownCgroups }));
-  return { root, releases, runsc, nodeRoot, attachRoot, cgroupOf, pod, bound, read, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, releases, runsc, nodeRoot, attachRoot, cgroupOf, processes, pod, bound, read, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("memory.stat's and /proc/meminfo's values are read by their keys, none of a key they lack", () => {
@@ -127,13 +138,19 @@ test("the agent's own memory is split as its memory.stat says, its anonymous mem
   }
 });
 
-test("each sandbox's memory is read from its pod's cgroup, its MemoryFile's of it, by its pod's state; and what may be held ahead is half of what kubelet's reservations, its soft eviction and the bound sandboxes leave", async () => {
+test("each sandbox's memory is read from its pod's cgroup, its MemoryFile's of it and its gofers' from their processes, by its pod's state; and what may be held ahead is half of what kubelet's reservations, its soft eviction and the bound sandboxes leave", async () => {
   const node = memoryNode();
   try {
     // A session's, bound, its token written beside its workspace.
     node.pod("sandboxes-none-0aaa", "aaaa-0001");
     node.cgroupOf("aaaa-0001", 3 * GIB, 64 * MIB, 2900 * MIB, 64 * MIB);
     node.bound("sandboxes-none-0aaa");
+    // Its sandbox, and a gofer to each of its two containers, all in its pod sandbox's scope.
+    node.processes("aaaa-0001", {
+      101: [["runsc-sandbox", "--root=/run/containerd/runsc/k8s.io", "boot"], 90_000],
+      102: [["runsc-gofer", "--root=/run/containerd/runsc/k8s.io", "gofer", "--bundle", "/run/a"], 3_000],
+      103: [["runsc-gofer", "--root=/run/containerd/runsc/k8s.io", "gofer", "--bundle", "/run/b"], 1_000],
+    });
     // A standby, its bayma's container created and not yet run, as one waits for a restore.
     node.pod("sandboxes-none-restore-1bbb", "bbbb-0002");
     node.releases.held("sandboxes-none-restore-1bbb-bayma", "created");
@@ -147,9 +164,9 @@ test("each sandbox's memory is read from its pod's cgroup, its MemoryFile's of i
     node.releases.died("sandboxes-none-3ddd-bayma");
     const memory = await node.read();
     assert.deepEqual(memory.sandboxes, [
-      { namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 3 * GIB, anonBytes: 64 * MIB, fileBytes: 3 * GIB - 64 * MIB, shmemBytes: 2900 * MIB, zswapBytes: 64 * MIB },
-      { namespace: "alasio-sessions", pod: "sandboxes-none-2ccc", state: "free", bytes: null, anonBytes: null, fileBytes: null, shmemBytes: null, zswapBytes: null },
-      { namespace: "alasio-sessions", pod: "sandboxes-none-restore-1bbb", state: "standby", bytes: 32 * MIB, anonBytes: 16 * MIB, fileBytes: 16 * MIB, shmemBytes: 8 * MIB, zswapBytes: 0 },
+      { namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 3 * GIB, anonBytes: 64 * MIB, fileBytes: 3 * GIB - 64 * MIB, shmemBytes: 2900 * MIB, zswapBytes: 64 * MIB, goferBytes: 4_000 * 1024 },
+      { namespace: "alasio-sessions", pod: "sandboxes-none-2ccc", state: "free", bytes: null, anonBytes: null, fileBytes: null, shmemBytes: null, zswapBytes: null, goferBytes: null },
+      { namespace: "alasio-sessions", pod: "sandboxes-none-restore-1bbb", state: "standby", bytes: 32 * MIB, anonBytes: 16 * MIB, fileBytes: 16 * MIB, shmemBytes: 8 * MIB, zswapBytes: 0, goferBytes: null },
     ]);
     assert.deepEqual([memory.totalBytes, memory.availableBytes, memory.agentBytes, memory.agentAnonBytes, memory.agentFileBytes], [16 * GIB, 9 * GIB, 150 * MIB, 40 * MIB, 100 * MIB]);
     assert.deepEqual(memory.agentEvents, { high: 0, max: 3, oom: 1, oomKill: 1 });
@@ -169,7 +186,7 @@ test("the sandboxes are read without their split where asked, of what their cgro
     const [sandbox] = await Effect.runPromise(sandboxesOf({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot }, false));
     assert.deepEqual(
       { ...sandbox, cgroup: sandbox?.cgroup?.endsWith("kubepods-burstable-podaaaa_0001.slice") },
-      { namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 3 * GIB, anonBytes: null, fileBytes: null, shmemBytes: null, zswapBytes: null, cgroup: true },
+      { namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 3 * GIB, anonBytes: null, fileBytes: null, shmemBytes: null, zswapBytes: null, goferBytes: null, cgroup: true },
     );
   } finally {
     node.done();

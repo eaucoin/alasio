@@ -4426,7 +4426,7 @@ test("the agent's API answers what the node's memory holds where it reads it, an
         agentEvents: { high: 0, max: 3, oom: 0, oomKill: 0 },
         budgetBytes: 3 * 1024 ** 3,
         budgetedBytes: 32 * 1024 ** 2,
-        sandboxes: [{ namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 1024 ** 3, anonBytes: 1024 ** 2, fileBytes: 0, shmemBytes: 0, zswapBytes: 0 }],
+        sandboxes: [{ namespace: "alasio-sessions", pod: "sandboxes-none-0aaa", state: "bound", bytes: 1024 ** 3, anonBytes: 1024 ** 2, fileBytes: 0, shmemBytes: 0, zswapBytes: 0, goferBytes: 4 * 1024 ** 2 }],
       };
       const asked = (port: number, token = "the token") =>
         Effect.promise(async () => {

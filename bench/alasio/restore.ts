@@ -105,6 +105,7 @@ export async function restore<D = null>(node: string, workspace: string, session
     node_agent_memory_bytes: agentMemory?.agent_bytes ?? null,
     node_agent_anon_bytes: agentMemory?.agent_anon_bytes ?? null,
     node_agent_file_bytes: agentMemory?.agent_file_bytes ?? null,
+    gofer_bytes: agentMemory?.sandbox?.goferBytes ?? null,
     restore_kernel_load_ms: logged.kernelLoadMs,
     restore_memory_load_ms: logged.memoryLoadMs,
     restore_to_running_ms: logged.toRunningMs,

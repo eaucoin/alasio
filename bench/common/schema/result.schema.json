@@ -48,6 +48,7 @@
         "node_agent_memory_bytes": { "$ref": "#/$defs/bytes" },
         "node_agent_anon_bytes": { "$ref": "#/$defs/bytes" },
         "node_agent_file_bytes": { "$ref": "#/$defs/bytes" },
+        "gofer_bytes": { "$ref": "#/$defs/bytes" },
         "kernel_save_ms": { "$ref": "#/$defs/ms" },
         "memory_save_ms": { "$ref": "#/$defs/ms" },
         "overall_save_ms": { "$ref": "#/$defs/ms" },
