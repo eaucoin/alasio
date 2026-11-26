@@ -2193,6 +2193,8 @@ describe("the lake", () => {
     const server = createServer((request, response) => {
       const url = new URL(request.url ?? "/", "http://parts");
       const json = (status: number, body: unknown) => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+      // The filer reads nothing for a request without its token, as SeaweedFS's with a read key.
+      if (url.pathname.startsWith("/buckets/") && request.headers.authorization !== "Bearer reads") return json(401, { error: "wrong jwt" });
       if (url.pathname === "/buckets/lake/claude/entries/failing.parquet" && url.searchParams.has("metadata")) {
         return typeof parts.entry === "number" ? json(parts.entry, {}) : json(200, parts.entry);
       }
@@ -2203,7 +2205,7 @@ describe("the lake", () => {
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const store = { filer: `http://${host}`, master: `http://${host}`, volumeServers: 2 };
+    const store = { filer: `http://${host}`, filerToken: "reads", master: `http://${host}`, volumeServers: 2 };
     const entry = { FullPath: "/buckets/lake/claude/entries/failing.parquet", FileSize: 4, chunks: [{ file_id: "7,01637037d6", size: 4 }] };
     const located: [number, object] = [200, { volumeOrFileId: "7", locations: [{ url: host, publicUrl: host }] }];
     try {
@@ -2246,7 +2248,7 @@ describe("the lake", () => {
         parts = shown as Parts;
         await assert.rejects(read(), (error: unknown) => error instanceof StoreUndecided && error.message.includes(path), JSON.stringify(shown));
       }
-      // Another store than the bundled one, whose parts are not asked.
+      // Another store than the bundled one, or a branch environment's lake, whose parts are not asked.
       await assert.rejects(readable(db, path, { retryMs: 10 }), /not the bundled one/u);
     } finally {
       server.close();
@@ -2266,6 +2268,7 @@ describe("the lake", () => {
     const server = createServer((request, response) => {
       const url = new URL(request.url ?? "/", "http://parts");
       const json = (status: number, body: unknown) => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+      if (url.pathname.startsWith("/buckets/") && request.headers.authorization !== "Bearer reads") return json(401, { error: "wrong jwt" });
       if (url.pathname === "/buckets/lake/") return json(buckets, { Path: "/buckets/lake", Entries: [] });
       if (url.pathname.startsWith("/buckets/lake/") && url.searchParams.has("metadata")) return json(200, entry);
       if (url.pathname === "/dir/lookup") return json(404, { volumeId: url.searchParams.get("volumeId"), error: `volume id ${url.searchParams.get("volumeId")} not found` });
@@ -2274,7 +2277,7 @@ describe("the lake", () => {
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const store = { filer: `http://${host}`, master: `http://${host}`, volumeServers: 2 };
+    const store = { filer: `http://${host}`, filerToken: "reads", master: `http://${host}`, volumeServers: 2 };
     const superuser = new pg.Client({ connectionString: postgres?.url });
     await superuser.connect();
     await superuser.query("create database reconcile_s3 owner lake");
@@ -3497,6 +3500,11 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.throws(() => loadMaintenanceConfig({ ...local, LAKE_RETENTION_DAYS: "-1" }), /LAKE_RETENTION_DAYS must be a positive number/);
   assert.throws(() => loadMaintenanceConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches" }), /LAKE_BRANCHES_TOKEN is not set/);
   assert.deepEqual(loadMaintenanceConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches", LAKE_BRANCHES_TOKEN: "t" }).branches, { url: "http://control:8080/branches", token: "t" });
+  // The bundled store's parts, with the token its filer takes reads of the lake's entries by; none for another store.
+  const parts = { LAKE_STORE_FILER_URL: "http://filer:8888", LAKE_STORE_MASTER_URL: "http://master:9333", LAKE_STORE_VOLUME_SERVERS: "2" };
+  assert.throws(() => loadMaintenanceConfig({ ...local, ...parts }), /LAKE_STORE_FILER_TOKEN is not set/);
+  assert.deepEqual(loadMaintenanceConfig({ ...local, ...parts, LAKE_STORE_FILER_TOKEN: "reads" }).store, { filer: "http://filer:8888", filerToken: "reads", master: "http://master:9333", volumeServers: 2 });
+  assert.equal(loadMaintenanceConfig(local).store, null);
   // Through Neon's proxy, every connection names its compute; straight to a Postgres, none.
   assert.equal(loadConfig({ ...local, ...LOADER_LOG }).catalog.options, "");
   assert.equal(loadConfig({ ...local, ...LOADER_LOG, LAKE_DATABASE_ENDPOINT: "branch-try" }).catalog.options, "endpoint=branch-try");

@@ -2,8 +2,9 @@
  * Prepares alasio's stack on Kubernetes, as a Job that runs before it starts: the secrets
  * it runs on, made once and kept in one Secret, and what each service is given from them,
  * as a Secret of its own, rendered from them on every install and upgrade: the log's, the
- * webhook intake's, Neon's, the object store's beside it, workspace storage's and the node
- * agents'. Idempotent, and never rotating.
+ * webhook intake's, Neon's, the object store's beside it (its identities, its filer store's
+ * users', and each of its parts' certificate and keys: ./store-security.ts), workspace
+ * storage's and the node agents'. Idempotent, and never rotating.
  *
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
  * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PROXY_HOST and
@@ -31,6 +32,7 @@ import { makeS3Bucket, type S3Bucket, S3Error } from "../../src/node-agent/s3.ts
 import { BRANCHES_SCOPE, computeId, MAIN, PROXY_SCOPE } from "./branches.ts";
 import { type Certificate, webhookCertificate } from "./certificate.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
+import { filerReadToken, STORE_PARTS, type StorePart } from "./store-security.ts";
 import {
   CODEX_LOGIN_ROLE,
   completeSecrets,
@@ -65,6 +67,8 @@ export interface SecretNames {
   filerStoreFiler: string;
   filerStoreCollector: string;
   filerStoreBackup: string;
+  /** Each part's of the bundled object store: its certificate and its authority's, and the filers' their signing keys too (./store-security.ts). */
+  storeParts: Record<StorePart, string>;
   s3Admin: string;
   /**
    * Neon's bucket's expiry's (./expiry.ts): the bucket's admin's keys, and a token of the scrubber's scope. The storage
@@ -194,6 +198,7 @@ export function secretNames(prefix: string): SecretNames {
     filerStoreFiler: `${prefix}-seaweedfs-filer-store-filer`,
     filerStoreCollector: `${prefix}-seaweedfs-filer-store-collector`,
     filerStoreBackup: `${prefix}-seaweedfs-filer-store-backup`,
+    storeParts: Object.fromEntries(STORE_PARTS.map((part) => [part, `${prefix}-seaweedfs-${part}-security`])) as Record<StorePart, string>,
     s3Admin: `${prefix}-neon-s3-admin`,
     neonExpiry: `${prefix}-neon-expiry`,
     s3Backups: `${prefix}-neon-s3-backups`,
@@ -298,6 +303,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
       // What it asks neon-control which branches there are with, which can do nothing else.
       LAKE_BRANCHES_TOKEN: token(BRANCHES_SCOPE),
+      // What its reconciliation reads the bundled store's filers' entries of its bucket with, which reads nothing else.
+      ...(config.external ? {} : { LAKE_STORE_FILER_TOKEN: filerReadToken(secrets.storeSecurity.filerReadSigningKey, config.lakeBucket) }),
     },
     [names.grafana]: {
       GF_DATABASE_PASSWORD: secrets.grafanaPassword,
@@ -382,6 +389,17 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
     rendered[names.filerStoreFiler] = { password: secrets.filerStoreFilerPassword };
     rendered[names.filerStoreCollector] = { password: secrets.filerStoreCollectorPassword };
     rendered[names.filerStoreBackup] = { password: secrets.filerStoreBackupPassword };
+    // Each part's: its certificate, and its authority's, which it takes the others' by; and the
+    // filers', which take requests over HTTP signed with them alone, the filers' signing keys too.
+    const { authority, parts, filerSigningKey, filerReadSigningKey } = secrets.storeSecurity;
+    for (const part of STORE_PARTS) {
+      rendered[names.storeParts[part]] = {
+        "ca.crt": authority.cert,
+        "tls.crt": parts[part].cert,
+        "tls.key": parts[part].key,
+        ...(part === "filer" ? { "filer-signing-key": filerSigningKey, "filer-signing-read-key": filerReadSigningKey } : {}),
+      };
+    }
   }
   return rendered;
 }

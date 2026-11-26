@@ -8,6 +8,7 @@
 import type { V1NetworkPolicy, V1NetworkPolicyEgressRule, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
 import { COMPUTE_CTL_PORT, COMPUTE_PORT } from "../../../neon/control/branches.ts";
+import type { StorePart } from "../../../neon/control/store-security.ts";
 import type { ApiServer } from "../api-server.ts";
 import { POOL_LABEL } from "../../../src/binder/names.ts";
 import { NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
@@ -42,9 +43,10 @@ import {
   FILER,
   FILER_STORE,
   GATEWAY,
-  LIFECYCLE_COMPONENT,
   MASTER,
   METRICS_PORT,
+  PART_COMPONENTS,
+  PEERS,
   RESTORE_COMPONENTS,
   RESTORE_SOURCE,
   VOLUME_SERVER,
@@ -220,46 +222,32 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
 
 /**
  * The bundled object store's parts behind its gateways, each reached by what talks to it
- * alone, on its HTTP and gRPC ports (SeaweedFS's gRPC port is the HTTP port's plus 10000),
- * and by the collector's scraper on its metrics port:
+ * alone (PEERS), on its HTTP and gRPC ports (SeaweedFS's gRPC port is the HTTP port's plus
+ * 10000), which takes those parts' certificates alone besides (storeSecurityToml), and by the
+ * collector's scraper on its metrics port.
  *
- * - the masters, by each other, in Raft, and by every part that asks them where volumes
- *   are, or registers: the volume servers, the filers, the gateways (whose sidecar makes
- *   the buckets through `weed shell`), and the lifecycle pass;
- * - the volume servers, by each other, which copy what they are written to the others,
- *   the masters, which compact their volumes, the filers and gateways, which read and
- *   write objects' chunks there, and the lifecycle pass, which copies volumes again;
- * - the filers, by each other, which follow each other's changes, the gateways, and the
- *   lifecycle pass, which replays their log.
- *
- * And each environment's lake's reconciliation, main's and branch environments', reaches the
- * filers, masters and volume servers on their HTTP ports alone, which it asks whether a file
- * the store fails a read of has its data still (neon/lake/src/reconcile.ts's gone). The
- * stack's other pods, which reach the store through its gateways, reach none of them.
+ * And main's lake's reconciliation reaches the filers, masters and volume servers on their HTTP
+ * ports alone, which it asks whether a file the store fails a read of has its data still
+ * (neon/lake/src/reconcile.ts's gone), the filers with a token that reads the lake's bucket
+ * alone. A branch environment's reaches none of them, nor does anything else of a branch
+ * environment's: a master's HTTP port deletes a bucket's volumes whole, as it is asked, for
+ * whatever reaches it. The stack's other pods, which reach the store through its gateways,
+ * reach none of them.
  */
 function partPolicies(): NetworkPolicy[] {
-  const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
+  const of = (part: StorePart): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(PART_COMPONENTS[part]) } });
   const ports = (http: number) => [http, http + 10_000].map((port) => ({ protocol: "TCP", port }));
-  const reconciliations: V1NetworkPolicyPeer[] = [
-    ofMain(RECONCILE_COMPONENT),
-    { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels(RECONCILE_COMPONENT) } },
-  ];
-  const part = (name: string, component: string, http: number, from: readonly string[]) =>
-    policy(name, NAMESPACE, component, {
-      podSelector: { matchLabels: selectorLabels(component) },
+  const part = (name: string, served: keyof typeof PEERS, http: number) =>
+    policy(name, NAMESPACE, PART_COMPONENTS[served], {
+      podSelector: { matchLabels: selectorLabels(PART_COMPONENTS[served]) },
       policyTypes: ["Ingress"],
       ingress: [
-        { from: from.map(of), ports: ports(http) },
-        { from: reconciliations, ports: [{ protocol: "TCP", port: http }] },
-        { from: [of(SCRAPER_COMPONENT)], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
+        { from: PEERS[served].map(of), ports: ports(http) },
+        { from: [ofMain(RECONCILE_COMPONENT)], ports: [{ protocol: "TCP", port: http }] },
+        { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
       ],
     });
-  const { gateway, master, volumeServer, filer } = COMPONENTS;
-  return [
-    part(MASTER, master, 9333, [master, volumeServer, filer, gateway, LIFECYCLE_COMPONENT]),
-    part(VOLUME_SERVER, volumeServer, 8080, [volumeServer, master, filer, gateway, LIFECYCLE_COMPONENT]),
-    part(FILER, filer, 8888, [filer, gateway, LIFECYCLE_COMPONENT]),
-  ];
+  return [part(MASTER, "master", 9333), part(VOLUME_SERVER, "volume", 8080), part(FILER, "filer", 8888)];
 }
 
 /**
@@ -274,7 +262,7 @@ function gatewayPolicy(): NetworkPolicy {
     policyTypes: ["Ingress"],
     ingress: [
       { from: [{ podSelector: { matchLabels: STACK } }], ports: [{ protocol: "TCP", port: 8333 }] },
-      { from: [{ podSelector: { matchLabels: selectorLabels(LIFECYCLE_COMPONENT) } }], ports: [{ protocol: "TCP", port: 18_333 }] },
+      { from: PEERS.gateway.map((part) => ({ podSelector: { matchLabels: selectorLabels(PART_COMPONENTS[part]) } })), ports: [{ protocol: "TCP", port: 18_333 }] },
       { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
     ],
   });
