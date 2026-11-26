@@ -15,7 +15,7 @@
     "restoresIntoStandbySince": "20261102.0-eaucoin.5",
     "savesWithLoadWaitSince": "20261102.0-eaucoin.10",
     "savesSummarySince": "20261102.0-eaucoin.11",
-    "hooksOverSocketSince": "",
+    "hooksOverSocketSince": "20261102.0-eaucoin.10",
     "releases": [
       {
         "release": "20261102.0-eaucoin.10",
