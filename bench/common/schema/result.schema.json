@@ -70,6 +70,8 @@
         "policy_wait_ms": { "$ref": "#/$defs/ms" },
         "probe_exec_ms": { "$ref": "#/$defs/ms" },
         "orchestration_ms": { "type": ["number", "null"] },
+        "orchestration_how": { "enum": ["front", "client", null] },
+        "orchestration_with_client_ms": { "type": ["number", "null"] },
         "loaded_bytes": { "$ref": "#/$defs/bytes" },
         "store_received_bytes": { "$ref": "#/$defs/bytes" },
         "disk_read_bytes": { "$ref": "#/$defs/bytes" },

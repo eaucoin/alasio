@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { checkpointAfter, compactionAtT0, liveDurableMs, releaseDurableMs, resumeSteps, type Span, turnWait } from "../spans.ts";
+import { checkpointAfter, compactionAtT0, frontWindow, liveDurableMs, orchestration, releaseDurableMs, resumeSteps, type Span, turnWait } from "../spans.ts";
 
 /** A span of `name`, from `startMs` to `endMs` on the wall clock. */
 function span(name: string, startMs: number, endMs: number, more: Partial<Omit<Span, "name" | "startNs" | "endNs">> = {}): Span {
@@ -46,6 +46,26 @@ test("a resume says runsc's resume with the hook as its step's length, and the p
   const spans = [resumed, under(resumed, span("alasio.node_agent.resume.runsc", 3300, 4100))];
   assert.deepEqual(resumeSteps(spans, "fs-1", 2900), { runscResumeMs: 800, policyWaitMs: 212 });
   assert.deepEqual(resumeSteps(spans, "fs-1", 3100), { runscResumeMs: null, policyWaitMs: null });
+});
+
+test("a restore's orchestration is of the gateway's part of its first request, from its receipt at the front to bayma's answer of initialize, less runsc's restore and resume; the client's start and handshake are not of it", () => {
+  // The probe's t0 at 1000; its first request at the front 55 ms on; the bind, then bayma's initialize; its answer at 1700.
+  const front = span("alasio.front.request", 1055, 1700, { traceId: "bind", spanId: "front" });
+  const initialize = span("initialize", 1650, 1690, { traceId: "bind", service: "bayma", attributes: {} });
+  const next = span("alasio.front.request", 1740, 1750, { traceId: "next" });
+  // Another workspace's initialize, in its own trace, earlier, which is not this one's.
+  const other = span("initialize", 1100, 1110, { traceId: "other", service: "bayma", attributes: {} });
+  const measured = { firstExecMs: 900, probeExecMs: 100, toRunningMs: 300, runscResumeMs: 150 };
+  const client = { refused: false, requestToAnswerMs: 650 };
+  assert.deepEqual(orchestration([other, front, initialize, next], "fs-1", 1000, measured, client), { orchestrationMs: 645 - 450, withClientMs: 800 - 450, how: "front" });
+  // Without bayma's span, the first request is the one that carried it, unless the client was refused and asked again.
+  assert.deepEqual(frontWindow([front, next], "fs-1", 1000, false), { receivedNs: 1_055_000_000n, answeredNs: 1_700_000_000n });
+  assert.equal(frontWindow([front, next], "fs-1", 1000, true), null);
+  // Without the front's spans, the client's own view of it, said so.
+  assert.deepEqual(orchestration([], "fs-1", 1000, measured, client), { orchestrationMs: 650 - 450, withClientMs: 350, how: "client" });
+  assert.deepEqual(orchestration([], "fs-1", 1000, measured, { refused: false, requestToAnswerMs: null }), { orchestrationMs: null, withClientMs: 350, how: null });
+  // Without runsc's resume, none.
+  assert.deepEqual(orchestration([front, initialize], "fs-1", 1000, { ...measured, runscResumeMs: null }, client), { orchestrationMs: null, withClientMs: null, how: null });
 });
 
 test("a compaction runs at a phase's start where it began before it and its upload ended after", () => {

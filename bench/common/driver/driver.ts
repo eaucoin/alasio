@@ -71,8 +71,31 @@ export interface Endpoint {
   readonly headers: Readonly<Record<string, string>>;
 }
 
-/** How the probe's connection went: each attempt refused, when and why, and when its MCP session was initialized. */
-const connecting: { refusals: string[]; initialized_ns: string | null } = { refusals: [], initialized_ns: null };
+/** When a client first asked anything, and when its MCP initialize was last answered, as timedFetch notes them. */
+export interface Asked {
+  first_request_ns: string | null;
+  initialize_answered_ns: string | null;
+}
+
+/**
+ * How the probe's connection went: each attempt refused, when and why, when it first asked, when
+ * its initialize was answered, and when its MCP session was initialized.
+ */
+const connecting: Asked & { refusals: string[]; initialized_ns: string | null } = { refusals: [], first_request_ns: null, initialize_answered_ns: null, initialized_ns: null };
+
+/**
+ * `fetchImpl`, noting on `asked` when it is first asked anything, and when it answers an MCP
+ * initialize, its answer's headers come: what of a first request is the client's own, its start
+ * before it asks and its handshake after the answer, told from the server's.
+ */
+export function timedFetch(asked: Asked, fetchImpl: typeof fetch = fetch): (url: string | URL, init?: RequestInit) => Promise<Response> {
+  return async (url, init) => {
+    asked.first_request_ns ??= String(now());
+    const response = await fetchImpl(url, init);
+    if (response.ok && typeof init?.body === "string" && /"method"\s*:\s*"initialize"/u.test(init.body)) asked.initialize_answered_ns = String(now());
+    return response;
+  };
+}
 
 /** A connected client of a bayma. */
 class Bayma {
@@ -82,9 +105,9 @@ class Bayma {
     this.client = client;
   }
 
-  static async connect({ url, headers }: Endpoint): Promise<Bayma> {
+  static async connect({ url, headers }: Endpoint, timed?: Asked): Promise<Bayma> {
     const client = new Client({ name: "alasio-bench-driver", version: "1.0.0" });
-    await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { ...headers } } }), { timeout: CALL_TIMEOUT_MS });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { ...headers } }, ...(timed === undefined ? {} : { fetch: timedFetch(timed) }) }), { timeout: CALL_TIMEOUT_MS });
     return new Bayma(client);
   }
 
@@ -93,7 +116,7 @@ class Bayma {
     const deadline = Date.now() + CONNECT_TIMEOUT_MS;
     for (;;) {
       try {
-        const connected = await Bayma.connect(endpoint);
+        const connected = await Bayma.connect(endpoint, connecting);
         connecting.initialized_ns = String(now());
         return connected;
       } catch (error) {
@@ -270,6 +293,8 @@ export async function probe(endpoint: Endpoint, sessionId: string, fixture: Fixt
     return {
       t0_ns: String(t0),
       t0_wall_ms: t0Wall,
+      first_request_ns: connecting.first_request_ns,
+      initialize_answered_ns: connecting.initialize_answered_ns,
       initialized_ns: connecting.initialized_ns,
       refusals: connecting.refusals,
       connected_ns: String(connected),

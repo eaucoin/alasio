@@ -18,13 +18,15 @@ import { agentOk, driver, gone, loggedOf, msBetween, preparedLine, release, rest
 import { bootLog, diskReadBytes, layerCacheBytes, podMemory, sandboxIdOf, storeBytes, storeQuiet } from "./node.ts";
 import type { Metrics } from "./results.ts";
 import { restoreLogged } from "./runsc-log.ts";
-import { compactionAtT0, resumeSteps, type Span } from "./spans.ts";
+import { compactionAtT0, orchestration, resumeSteps, type Span } from "./spans.ts";
 import { PAGE_CACHE, VARIANT } from "./settings.ts";
 
 /** What the driver's probe says of a restore (bench/common/driver/driver.ts probe). */
 export interface Probed {
   readonly t0_ns: string;
   readonly t0_wall_ms: number;
+  readonly first_request_ns: string | null;
+  readonly initialize_answered_ns: string | null;
   readonly initialized_ns: string | null;
   readonly first_exec_end_ns: string;
   readonly first_exec_ms: number;
@@ -134,7 +136,14 @@ export async function restore(node: string, workspace: string, sessionId: string
     page_cache: kind === "cold" ? "dropped" : PAGE_CACHE,
   };
   const window = { fromMs: probed.t0_wall_ms, toMs: probed.t0_wall_ms + probed.first_exec_ms };
+  const client: Client = {
+    refused: probed.refusals.length > 0,
+    first_request_ns: probed.first_request_ns,
+    initialize_answered_ns: probed.initialize_answered_ns,
+    request_to_answer_ms: probed.first_request_ns === null || probed.initialize_answered_ns === null ? null : msBetween(BigInt(probed.first_request_ns), BigInt(probed.initialize_answered_ns)),
+  };
   const details = {
+    client,
     pod: name, node, standby, source, prepared, restored_snapshot: restoredSnapshot, chain: manifest.layers.length, runsc_restore_ms: logged.runscRestoreMs, logged: logged.said,
     memory_stat: memory.stat, agent_memory: agentMemory, lease: { bound: lease }, resident_error: error, logs, refusals: probed.refusals, t0_wall_ms: probed.t0_wall_ms, end_wall_ms: Date.now(),
     ...(timeline === null ? {} : { pod_timeline: await timeline.stop(pod) }),
@@ -145,20 +154,32 @@ export async function restore(node: string, workspace: string, sessionId: string
 /**
  * What alasio's spans of the run say of a restore whose probe began at `t0Ms`: runsc's resume with
  * bayma's hook, the wait for the pod's network policies, whether the release's compaction ran as it
- * began, and what of the first exec is the product's orchestration, neither runsc's restore to
- * runnable, its resume, nor the probe's own MCP session and exec.
+ * began, and what of its first request is the product's orchestration, neither runsc's restore to
+ * runnable, its resume, nor the probe's own client (./spans.ts orchestration), with what its
+ * `client` said of it, where the spans do not, and the orchestration as it was read before, the
+ * client's own start and handshake with it.
  */
-export function restoreSpanMetrics(spans: readonly Span[], workspace: string, t0Ms: number, metrics: Metrics): Metrics {
+export function restoreSpanMetrics(spans: readonly Span[], workspace: string, t0Ms: number, metrics: Metrics, client: Client | null): Metrics {
   const { runscResumeMs, policyWaitMs } = resumeSteps(spans, workspace, t0Ms);
-  const toRunning = typeof metrics.restore_to_running_ms === "number" ? metrics.restore_to_running_ms : null;
-  const probeExec = typeof metrics.probe_exec_ms === "number" ? metrics.probe_exec_ms : null;
-  const first = typeof metrics.first_exec_ms === "number" ? metrics.first_exec_ms : null;
+  const number = (value: number | string | null | undefined) => (typeof value === "number" ? value : null);
+  const measured = { firstExecMs: number(metrics.first_exec_ms), probeExecMs: number(metrics.probe_exec_ms), toRunningMs: number(metrics.restore_to_running_ms), runscResumeMs };
+  const { orchestrationMs, withClientMs, how } = orchestration(spans, workspace, t0Ms, measured, { refused: client?.refused ?? true, requestToAnswerMs: client?.request_to_answer_ms ?? null });
   return {
     runsc_resume_ms: runscResumeMs,
     policy_wait_ms: policyWaitMs,
-    orchestration_ms: first !== null && toRunning !== null && runscResumeMs !== null && probeExec !== null ? first - toRunning - runscResumeMs - probeExec : null,
+    orchestration_ms: orchestrationMs,
+    orchestration_how: how,
+    orchestration_with_client_ms: withClientMs,
     compaction_at_t0: compactionAtT0(spans, workspace, t0Ms),
   };
+}
+
+/** What the probe's client said of its first request (bench/common/driver/driver.ts timedFetch), as a restore's details keep it. */
+export interface Client {
+  readonly refused: boolean;
+  readonly first_request_ns: string | null;
+  readonly initialize_answered_ns: string | null;
+  readonly request_to_answer_ms: number | null;
 }
 
 /** Whether a restore passed: its probe's checks, its image read from `source`, within RESTORE_BOUND_MS; or why not. */

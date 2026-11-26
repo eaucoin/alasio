@@ -25,7 +25,10 @@ export const METRICS = [
   "sandboxes_bound_bytes", "sandboxes_standby_bytes", "sandboxes_free_bytes", "layer_cache_bytes",
   // The mechanism's own splits, from runsc's boot log; the product's, from alasio's spans; what moved, from the node's counters.
   "kernel_save_ms", "memory_save_ms", "overall_save_ms", "durable_store_ms", "store_sent_bytes", "uploaded_over_needed",
-  "restore_kernel_load_ms", "restore_memory_load_ms", "restore_to_running_ms", "runsc_resume_ms", "policy_wait_ms", "probe_exec_ms", "orchestration_ms",
+  "restore_kernel_load_ms", "restore_memory_load_ms", "restore_to_running_ms", "runsc_resume_ms", "policy_wait_ms", "probe_exec_ms",
+  // The orchestration: of the gateway's part of the first request (front), or of the client's view of it where no span says it
+  // (client); and as it was read before, of the probe's first exec, its own client's start and handshake with it.
+  "orchestration_ms", "orchestration_how", "orchestration_with_client_ms",
   "loaded_bytes", "store_received_bytes", "disk_read_bytes", "read_amplification", "page_cache", "compaction_at_t0",
   // The exec on the session running, which the first execs after a restore are reported net of; and a replayed turn's wait.
   "exec_running_ms", "turn_wait_ms", "added_latency_ms", "t_llm_ms",
