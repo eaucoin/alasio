@@ -16,7 +16,8 @@
  *   limited its sandbox, which the limit should leave room for.
  * A trial whose arm's conditions did not come about (the foreign pod's process elsewhere, A's
  * sandbox not limited) is a line of its setup alone, `setup_ok` false, and no result.
- * The cgroup's limit is given back after. Then whether B's pod runs on, the same pod, its process
+ * The cgroup is held so anew every second, as kubelet sets its limit back as pods come and go,
+ * and its limit given back after. Then whether B's pod runs on, the same pod, its process
  * alive, and A's; what the kernel killed, the node agent ended or said of another pod's want and
  * kubelet evicted meanwhile; what the agent's guard set on each sandbox's cgroup, and says it did
  * of each; and whether A's session falls back, bound anew on its workspace: a line of
@@ -148,6 +149,30 @@ async function capBurstable(node: string): Promise<{ readonly path: string; read
   return { path, limitBefore, current: Number(current), reclaimable: Number(held), limit: Number(limit) };
 }
 
+/**
+ * Holds the cgroup `path` on `node` to `limit` every second until stopped, as kubelet's QoS
+ * manager sets the Burstable pods' slice's limit back as pods come and go: once stopped, each
+ * limit it found it set back to, a time it was.
+ */
+function keepCap(node: string, path: string, limit: number): { readonly stop: () => Promise<readonly string[]> } {
+  const found: string[] = [];
+  let stopped = false;
+  const kept = (async () => {
+    while (!stopped) {
+      const said = (await onNode(node, `held=$(cat ${path}/memory.max); [ "$held" = ${limit} ] || { echo ${limit} > ${path}/memory.max; echo "$held"; }`).catch(() => "")).trim();
+      if (said !== "") found.push(said);
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+  })();
+  return {
+    stop: async () => {
+      stopped = true;
+      await kept;
+      return found;
+    },
+  };
+}
+
 /** The memory.max of A's sandbox's scope, as podCgroupsOf says it: its bytes, "max" for none, or null where it says none. */
 const scopeMaxOf = (lines: readonly string[]): string | null => lines.map((line) => / max=(\S+)/u.exec(line)?.[1]).find((max) => max !== undefined) ?? null;
 
@@ -155,8 +180,8 @@ const scopeMaxOf = (lines: readonly string[]): string | null => lines.map((line)
  * The foreign arm's pod: on `node`, in a namespace of no sessions, runc's (no runtime class),
  * Burstable, its requests of CPU and memory under its limits, of `image`. Its process waits until
  * it is seen in a cgroup under `capped`, the Burstable pods' cgroup held, and that cgroup is held to
- * `limit` anew (systemd sets a slice's limits back as it makes a slice under it, as it does the
- * pod's), then grows as GROWER does until it ends or GROWTH_BOUND_MS has gone; the pod is deleted
+ * `limit` anew (kubelet sets the slice's limit back as it makes a pod's slice under it, as for
+ * any pod that comes or goes), then grows as GROWER does until it ends or GROWTH_BOUND_MS has gone; the pod is deleted
  * then. Its uid; its setup: its QoS class and resources as admitted, its process's
  * /proc/<pid>/cgroup, whether that is under `capped`, and the limit `capped` had then and was held
  * to; the most its pod's cgroup held, read every second, its memory.peak, and each limit `capped`
@@ -201,7 +226,7 @@ async function foreignGrown(node: string, image: string, capped: string, limit: 
     ].join("; ")).catch((error: unknown) => `unread: ${errorText(error)}`)).trim();
     const [podCgroup = "", pid = "", procCgroup = ""] = located.split(" ");
     const cgroupPath = procCgroup.startsWith("0::") ? `/sys/fs/cgroup${procCgroup.slice(3)}` : "";
-    // The held cgroup's limit as the pod's making left it, which systemd may have set back as it made the pod's slice under it; and as held anew.
+    // The held cgroup's limit as the pod's making left it, which kubelet may have set back as it made the pod's slice under it; and as held anew.
     const capFound = (await onNode(node, `cat ${capped}/memory.max`)).trim();
     const capSet = (await onNode(node, `echo ${limit} > ${capped}/memory.max; cat ${capped}/memory.max`)).trim();
     const setup = {
@@ -262,16 +287,21 @@ async function trial(number: number): Promise<Record<string, unknown>> {
     // The Burstable pods' cgroup held to what it holds now but its clean page cache and HEADROOM_BYTES more; its limit before given back once A, or the foreign pod, has ended.
     const cap = await capBurstable(b.node);
     const cgroup = cap.path;
-    let givenBack = false;
-    giveBack = async () => {
-      if (!givenBack) await onNode(b.node, `echo ${cap.limitBefore} > ${cgroup}/memory.max`);
-      givenBack = true;
-    };
     const capOk = cgroup !== "" && Number.isFinite(cap.limit) && cap.limit > 0;
+    // Held so every second until given back, as kubelet sets the slice's limit back as pods come and go.
+    const kept = capOk ? keepCap(b.node, cgroup, cap.limit) : null;
+    let givenBack = false;
+    let capResets: readonly string[] = [];
+    giveBack = async () => {
+      if (givenBack) return;
+      givenBack = true;
+      capResets = (await kept?.stop()) ?? [];
+      await onNode(b.node, `echo ${cap.limitBefore} > ${cgroup}/memory.max`);
+    };
     // A setup that failed: its line, of what was set up alone, the limit given back.
     const setupFailed = async (setup: Record<string, unknown>) => {
       await giveBack();
-      return { trial: number, arm: ARM, setup_ok: false, cap, setup, took_ms: Date.now() - started };
+      return { trial: number, arm: ARM, setup_ok: false, cap, cap_resets: capResets.length, setup, took_ms: Date.now() - started };
     };
     if (!capOk) return await setupFailed({ cap: "not set" });
     // The burst arm's A takes its GiB once the guard has limited its sandbox, its scope's memory.max a number.
@@ -362,7 +392,7 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       cgroups_at_end: cgroupsAtEnd,
       fallback,
       report,
-      cgroup: { path: cgroup, limit_before: cap.limitBefore, current: cap.current, reclaimable: cap.reclaimable, limit: cap.limit, events },
+      cgroup: { path: cgroup, limit_before: cap.limitBefore, current: cap.current, reclaimable: cap.reclaimable, limit: cap.limit, events, resets: capResets.length, reset_to: [...new Set(capResets)] },
       kernel,
       evicted,
       took_ms: Date.now() - started,
