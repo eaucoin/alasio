@@ -10,8 +10,7 @@ import { join } from "node:path";
 
 import type { V1Pod, V1Service } from "@kubernetes/client-node";
 
-import { NODE_PINS } from "../../cli/src/cluster/node.ts";
-import { STARGZ_ROOT } from "../../cli/src/cluster/stargz.ts";
+import { NODE_PINS, STARGZ_SERVICE } from "../../cli/src/cluster/node.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.ts";
@@ -62,7 +61,8 @@ export async function podMemory(node: string, uid: string): Promise<{
     `echo "peak $(cat "$dir/memory.peak")"`,
     `echo "current $(cat "$dir/memory.current")"`,
     `grep -E '^(anon|file) ' "$dir/memory.stat"`,
-    `scope=$(for each in "$dir"/*/; do [ -s "$each/cgroup.procs" ] && echo "$each"; done | head -n 1)`,
+    // A cgroup's files say no size: its processes, read.
+    `scope=$(for each in "$dir"/*/; do [ -n "$(cat "$each/cgroup.procs" 2>/dev/null)" ] && echo "$each"; done | head -n 1)`,
     `[ -n "$scope" ] || exit 0`,
     `echo "oom_group $(cat "$scope/memory.oom.group")"`,
     `echo "max $(cat "$scope/memory.max")"`,
@@ -75,18 +75,18 @@ export async function podMemory(node: string, uid: string): Promise<{
 }
 
 /**
- * What the node's page cache holds of the files of stargz-snapshotter's daemon on `node`, its
- * root's on the node's own filesystem (fincore), not the layers it mounts through FUSE: the chunks
- * it fetched of every pod's image, and, with FUSE passthrough, the files it merged of them, which
- * the pods read themselves, each page charged to the first that read it and shared by all. Without
- * passthrough the pods read the image through FUSE, whose pages are charged to each pod, the first
- * to read each, and are not these. Null where it cannot be read.
+ * What the node's page cache holds of the image layers' files that stargz-snapshotter's daemon on
+ * `node` keeps, as its service's cgroup, its FUSE manager's with it, is charged for them
+ * (memory.stat's file): the chunks it fetched and wrote of every pod's image, and, with FUSE
+ * passthrough, the files it merged of them, which the pods then read themselves, shared by all. A
+ * page is charged to the cgroup that first touched it, so a chunk a pod read through FUSE first is
+ * its own, not this. Null where the service or its cgroup is not there.
  */
 export async function layerCacheBytes(node: string): Promise<number | null> {
-  const printed = await onNode(node, `[ -d ${STARGZ_ROOT} ] && command -v fincore >/dev/null && find ${STARGZ_ROOT} -xdev -type f -print0 | xargs -0 -r fincore --bytes --noheadings --output RES 2>/dev/null | awk '{ sum += $1 } END { print sum + 0 }' || true`)
+  const printed = await onNode(node, `group=$(systemctl show --property=ControlGroup --value ${STARGZ_SERVICE} 2>/dev/null); [ -n "$group" ] && awk '$1 == "file" { print $2 }' "/sys/fs/cgroup$group/memory.stat" 2>/dev/null || true`)
     .catch(() => "");
-  const sum = printed.trim();
-  return /^[0-9]+$/u.test(sum) ? Number(sum) : null;
+  const file = printed.trim();
+  return /^[0-9]+$/u.test(file) ? Number(file) : null;
 }
 
 /**

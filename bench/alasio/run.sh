@@ -20,7 +20,7 @@ mkdir -p "$BENCH_DIR/logs"
 done) >"$BENCH_DIR/logs/node.log" 2>/dev/null &
 # k3s's journal, its kubelet's and containerd's, and the image snapshotter's, over the job, as it ends however it ends.
 since=$(date -u '+%F %T')
-trap 'sudo journalctl -u k3s -u "containerd-stargz-grpc*" --since "$since" --utc --no-pager -o short-iso-precise 2>/dev/null | gzip >"$BENCH_DIR/logs/journal.txt.gz"' EXIT
+trap 'sudo journalctl -u k3s -u stargz-snapshotter --since "$since" --utc --no-pager -o short-iso-precise 2>/dev/null | gzip >"$BENCH_DIR/logs/journal.txt.gz"' EXIT
 # The runner's writeback held to 256 MiB dirty, 64 MiB before it starts: a save of 3 GiB left gigabytes dirty on the
 # disk the store and the node's cache share with k3s, and the stall of the fsyncs behind them ended k3s ("Transaction
 # commit failed"). Said in logs/writeback.txt.
