@@ -11,6 +11,7 @@ import { join } from "node:path";
 import type { V1Pod, V1Service } from "@kubernetes/client-node";
 
 import { NODE_PINS } from "../../cli/src/cluster/node.ts";
+import { STARGZ_ROOT } from "../../cli/src/cluster/stargz.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY as STORE_GATEWAY } from "../../cli/src/manifests/object-store.ts";
@@ -56,6 +57,21 @@ export async function podMemory(node: string, uid: string): Promise<{ readonly p
     return value === undefined ? null : Number(value);
   };
   return { peak: field("peak"), current: field("current"), stat: { anon: field("anon") ?? 0, file: field("file") ?? 0 } };
+}
+
+/**
+ * What the node's page cache holds of the files of stargz-snapshotter's daemon on `node`, its
+ * root's on the node's own filesystem (fincore), not the layers it mounts through FUSE: the chunks
+ * it fetched of every pod's image, and, with FUSE passthrough, the files it merged of them, which
+ * the pods read themselves, each page charged to the first that read it and shared by all. Without
+ * passthrough the pods read the image through FUSE, whose pages are charged to each pod, the first
+ * to read each, and are not these. Null where it cannot be read.
+ */
+export async function layerCacheBytes(node: string): Promise<number | null> {
+  const printed = await onNode(node, `[ -d ${STARGZ_ROOT} ] && command -v fincore >/dev/null && find ${STARGZ_ROOT} -xdev -type f -print0 | xargs -0 -r fincore --bytes --noheadings --output RES 2>/dev/null | awk '{ sum += $1 } END { print sum + 0 }' || true`)
+    .catch(() => "");
+  const sum = printed.trim();
+  return /^[0-9]+$/u.test(sum) ? Number(sum) : null;
 }
 
 /**

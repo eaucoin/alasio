@@ -10,12 +10,12 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
 import { STANDBY_ANNOTATION, STANDBY_LABEL } from "../../src/kube/sandbox-shape.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import type { NodeMemory } from "../../src/node-agent/memory.ts";
+import type { NodeMemory, SandboxState } from "../../src/node-agent/memory.ts";
 import { SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { boundPodOf, kube, onNode, ref, SESSIONS } from "../../test/e2e/harness.ts";
 import { agentOk, driver, gone, loggedOf, msBetween, preparedLine, release, restores, sleep, sourceOf, watchRestore } from "./alasio.ts";
-import { bootLog, diskReadBytes, podMemory, sandboxIdOf, storeBytes, storeQuiet } from "./node.ts";
+import { bootLog, diskReadBytes, layerCacheBytes, podMemory, sandboxIdOf, storeBytes, storeQuiet } from "./node.ts";
 import type { Metrics } from "./results.ts";
 import { restoreLogged } from "./runsc-log.ts";
 import { compactionAtT0, resumeSteps, type Span } from "./spans.ts";
@@ -53,6 +53,8 @@ const RESTORE_BOUND_MS = 300_000;
 export async function restore(node: string, workspace: string, sessionId: string, fixture: string, runId: string, manifest: Manifest, kind: "warm" | "cold") {
   const storeBefore = await storeBytes(node);
   const diskBefore = await diskReadBytes(node);
+  // What the node's standbys hold idle, one of which the restore may claim.
+  const memoryBefore = await agentOk(node, "GET", "/memory").then((said) => JSON.parse(said) as NodeMemory, () => null);
   // Settled whatever comes of the probe, which fails a restore that never answers before its pod is seen.
   const watching = watchRestore(workspace, manifest.release).then((watched) => ({ watched }), (error: unknown) => ({ error }));
   const timeline = VARIANT === "trace" ? podTimeline(workspace) : null;
@@ -69,6 +71,8 @@ export async function restore(node: string, workspace: string, sessionId: string
   // What the node agent reads of the node's memory (src/node-agent/memory.ts): this sandbox's, as its pod's cgroup and its Sentry
   // say it, and the node's budget of what is held ahead; none from an agent that does not answer it.
   const nodeMemory = await agentOk(node, "GET", "/memory").then((said) => JSON.parse(said) as NodeMemory, () => null);
+  // Its node's sandboxes', by their pods' state: the states alasio has, its tiers (frozen, reclaimed) yet to come with their control.
+  const byState = (state: SandboxState) => nodeMemory?.sandboxes.filter((sandbox) => sandbox.state === state).reduce((sum, { bytes }) => sum + (bytes ?? 0), 0) ?? null;
   const agentMemory = nodeMemory === null ? null : {
     sandbox: nodeMemory.sandboxes.find((sandbox) => sandbox.pod === name) ?? null,
     available_bytes: nodeMemory.availableBytes,
@@ -84,6 +88,9 @@ export async function restore(node: string, workspace: string, sessionId: string
   };
   // Restored into a standby of its node's (src/gateway/standbys.ts), or into a pod made for it.
   const standby = pod.metadata?.annotations?.[STANDBY_ANNOTATION] !== undefined;
+  // What the standby it claimed held, idle, before.
+  const standbyIdle = standby ? (memoryBefore?.sandboxes.find((sandbox) => sandbox.pod === name && sandbox.state === "standby")?.bytes ?? null) : null;
+  const layerCache = await layerCacheBytes(node);
   const logged = restoreLogged(await bootLog(node, await sandboxIdOf(node, name)), standby);
   const { line: prepared, snapshot: restoredSnapshot } = await preparedLine(node, workspace, manifest.snapshot);
   const source = await sourceOf(node, pod, `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/${restoredSnapshot}`);
@@ -104,6 +111,13 @@ export async function restore(node: string, workspace: string, sessionId: string
     node_agent_anon_bytes: agentMemory?.agent_anon_bytes ?? null,
     node_agent_file_bytes: agentMemory?.agent_file_bytes ?? null,
     gofer_bytes: agentMemory?.sandbox?.goferBytes ?? null,
+    // Resident, its MemoryFile's, against what it touched before its pages were read, which runsc says; what it touched after is not said.
+    awaited_bytes: logged.awaitedBytes,
+    standby_idle_bytes: standbyIdle,
+    sandboxes_bound_bytes: byState("bound"),
+    sandboxes_standby_bytes: byState("standby"),
+    sandboxes_free_bytes: byState("free"),
+    layer_cache_bytes: layerCache,
     restore_kernel_load_ms: logged.kernelLoadMs,
     restore_memory_load_ms: logged.memoryLoadMs,
     restore_to_running_ms: logged.toRunningMs,

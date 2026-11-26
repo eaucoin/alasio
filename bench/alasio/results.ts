@@ -18,8 +18,10 @@ export const METRICS = [
   // application's memory with its page cache and tmpfs, and the rest, its Sentry's, gofer's and shims'; and the agent's own, of it
   // its anonymous memory and its page cache.
   "memory_file_bytes", "sandbox_overhead_bytes", "node_agent_memory_bytes", "node_agent_anon_bytes", "node_agent_file_bytes",
-  // Of the overhead, its gofers'.
-  "gofer_bytes",
+  // Of the overhead, its gofers'; of what it holds resident, what it touched before its pages were read; what the standby it
+  // claimed held idle; its node's sandboxes' by their pods' state; and the page cache of the image snapshotter's files on the node.
+  "gofer_bytes", "awaited_bytes", "standby_idle_bytes",
+  "sandboxes_bound_bytes", "sandboxes_standby_bytes", "sandboxes_free_bytes", "layer_cache_bytes",
   // The mechanism's own splits, from runsc's boot log; the product's, from alasio's spans; what moved, from the node's counters.
   "kernel_save_ms", "memory_save_ms", "overall_save_ms", "durable_store_ms", "store_sent_bytes", "uploaded_over_needed",
   "restore_kernel_load_ms", "restore_memory_load_ms", "restore_to_running_ms", "runsc_resume_ms", "policy_wait_ms", "probe_exec_ms", "orchestration_ms",
