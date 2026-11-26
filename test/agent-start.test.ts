@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { WARMED_FILE } from "../src/kube/sandbox-shape.ts";
+import { SANDBOX_STOP_REASON_VARIABLE, WARMED_FILE } from "../src/kube/sandbox-shape.ts";
 import { SAVE_HOOK_SECONDS } from "../src/node-agent/names.ts";
 
 const START = new URL("../sandbox/agent/start.sh", import.meta.url).pathname;
@@ -64,6 +64,25 @@ test("bayma's hook is the image's without Node, given what follows sandbox-hook,
         "",
       ]);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bayma's hook, run as the sandbox is restored, is told why it stopped, as the binding's variables say it, and of them that alone", () => {
+  const { root, env } = pod('echo "${BAYMA_SANDBOX_STOP_REASON:-unsaid} ${BAYMA_EXAMPLE:-unset}"');
+  try {
+    const hook = (mode: string) =>
+      spawnSync("sh", [START, "node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/attach/ws/home/.bayma"], {
+        env: { ...env, GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE: mode },
+        encoding: "utf8",
+      }).stdout.trim();
+    // A restore of a sandbox its host stopped for no reason it says is told none.
+    assert.equal(hook("restore"), "unsaid unset");
+    writeFileSync(join(root, "attach", "env"), `BAYMA_EXAMPLE='bound'\n${SANDBOX_STOP_REASON_VARIABLE}='it ran out of its memory (1Gi)'\n`);
+    assert.equal(hook("restore"), "it ran out of its memory (1Gi) unset");
+    // A save is told nothing of it.
+    assert.equal(hook("save"), "unsaid unset");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
