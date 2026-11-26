@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test, type TestContext } from "node:test";
 
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1CronJob, V1DaemonSet, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Container, V1CronJob, V1DaemonSet, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -30,6 +30,7 @@ import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { GATEWAY, GATEWAY_COMPONENT, GATEWAY_PORT, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { pageserverName } from "../../cli/src/manifests/neon.ts";
+import { FILER, MASTER, masterAddresses } from "../../cli/src/manifests/object-store.ts";
 import { HOST_BAYMA_IMAGE } from "../../cli/src/manifests/config.ts";
 import { environmentAccess } from "../../cli/src/manifests/log.ts";
 import { WEBHOOK, WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
@@ -84,6 +85,7 @@ import {
   cutOver,
   gatewayCall,
   inCutOverRecord,
+  inCutOverRecordOnCluster,
   dumpClusterState,
   ESTARGZ,
   type Forward,
@@ -195,6 +197,44 @@ const answered = (call: RecordedCall, chat?: number) =>
 const deliversATurn = (call: RecordedCall) =>
   call.method === "sendRichMessage" ||
   ((call.method === "sendMessage" || call.method === "editMessageText") && / is (working|waiting on) /u.test(String(call.payload.text ?? "")));
+
+/**
+ * The buckets of the object store an object is put in, by the place the gateways make each
+ * (cli/src/manifests/object-store.ts): Neon's, the backups', workspace storage's and the
+ * snapshots'; and the Secret of each one's writer's keys, and those keys' names.
+ */
+const PROBED_BUCKETS = ["neon", "backups", "workspaces", "snapshots"] as const;
+const WRITERS: Record<(typeof PROBED_BUCKETS)[number], readonly [secret: string, id: string, key: string]> = {
+  neon: [neonName("safekeeper"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+  backups: [neonName("s3-backups"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+  workspaces: [componentName("workspaces-juicefs"), "access-key", "secret-key"],
+  snapshots: [componentName("snapshots"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+};
+/**
+ * Shell, of the bucket "$1", through a gateway, that puts 6 MiB at .alasio-e2e/upgrade-probe, and that reads it back: its
+ * SHA-256 either way. Each bucket's in a file of its own, as every bucket's runs at once in the one container.
+ */
+const PROBE_PUT = 'head -c 6291456 /dev/urandom >"/tmp/probe-$1" && aws s3api --endpoint-url http://127.0.0.1:8333 put-object --bucket "$1" --key .alasio-e2e/upgrade-probe --body "/tmp/probe-$1" >/dev/null && sha256sum "/tmp/probe-$1" | cut -c1-64';
+const PROBE_GET = 'aws s3api --endpoint-url http://127.0.0.1:8333 get-object --bucket "$1" --key .alasio-e2e/upgrade-probe "/tmp/probe-$1" >/dev/null && sha256sum "/tmp/probe-$1" | cut -c1-64';
+/** `script` run of each probed bucket, in a gateway's pod beside it, as the bucket's writer, with the aws CLI of its lifecycle container: what it printed of each, trimmed. */
+const inEveryBucket = async (script: string) => {
+  const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
+  const made = (await kube.get<V1Deployment>(ref("Deployment", componentName("seaweedfs"), NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "buckets")?.command?.[2] ?? "";
+  // The buckets the gateways make, Neon's, the lake's, the backups', workspace storage's and the snapshots', in that order.
+  const [neon, , backups, workspaces, snapshots] = /for bucket in ([^;]+); do/u.exec(made)?.[1]?.split(" ") ?? [];
+  const names = { neon, backups, workspaces, snapshots };
+  return Promise.all(PROBED_BUCKETS.map(async (probed) => {
+    const bucket = names[probed] ?? assert.fail(`the gateways make no ${probed} bucket: ${made}`);
+    const [secret, id, key] = WRITERS[probed];
+    const keys = [`AWS_ACCESS_KEY_ID=${await kube.secret(NAMESPACE, secret, id)}`, `AWS_SECRET_ACCESS_KEY=${await kube.secret(NAMESPACE, secret, key)}`];
+    const said = await kube.execOk(NAMESPACE, gateway, ["env", ...keys, "sh", "-c", script, "probe", bucket], { container: "lifecycle" });
+    return { bucket: probed, said: said.trim() };
+  }));
+};
+/** The claims of the store's parts that keep a volume, the masters', the volume servers' and the filers' store's, as the cut-over snapshots them. */
+const STORE_CLAIMS = ["data-alasio-seaweedfs-filer-store-0", "data-alasio-seaweedfs-master-0", "data-alasio-seaweedfs-volume-0"];
+/** The object put in each bucket on the release before, by the upgrade shard. */
+let probes: Awaited<ReturnType<typeof inEveryBucket>>;
 
 if (inShard("upgrade")) {
   describe(`alasio upgraded from ${PREVIOUS}`, () => {
@@ -367,40 +407,6 @@ if (inShard("upgrade")) {
       writeFileSync(configFile, JSON.stringify(config));
       await alasioOk("up", "--timeout", "20m");
     };
-    /**
-     * The buckets of the object store an object is put in, by the place the gateways make each
-     * (cli/src/manifests/object-store.ts): Neon's, the backups', workspace storage's and the
-     * snapshots'; and the Secret of each one's writer's keys, and those keys' names.
-     */
-    const PROBED_BUCKETS = ["neon", "backups", "workspaces", "snapshots"] as const;
-    const WRITERS: Record<(typeof PROBED_BUCKETS)[number], readonly [secret: string, id: string, key: string]> = {
-      neon: [neonName("safekeeper"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-      backups: [neonName("s3-backups"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-      workspaces: [componentName("workspaces-juicefs"), "access-key", "secret-key"],
-      snapshots: [componentName("snapshots"), "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-    };
-    /**
-     * Shell, of the bucket "$1", through a gateway, that puts 6 MiB at .alasio-e2e/upgrade-probe, and that reads it back: its
-     * SHA-256 either way. Each bucket's in a file of its own, as every bucket's runs at once in the one container.
-     */
-    const PROBE_PUT = 'head -c 6291456 /dev/urandom >"/tmp/probe-$1" && aws s3api --endpoint-url http://127.0.0.1:8333 put-object --bucket "$1" --key .alasio-e2e/upgrade-probe --body "/tmp/probe-$1" >/dev/null && sha256sum "/tmp/probe-$1" | cut -c1-64';
-    const PROBE_GET = 'aws s3api --endpoint-url http://127.0.0.1:8333 get-object --bucket "$1" --key .alasio-e2e/upgrade-probe "/tmp/probe-$1" >/dev/null && sha256sum "/tmp/probe-$1" | cut -c1-64';
-    /** `script` run of each probed bucket, in a gateway's pod beside it, as the bucket's writer, with the aws CLI of its lifecycle container: what it printed of each. */
-    const inEveryBucket = async (script: string) => {
-      const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
-      const made = (await kube.get<V1Deployment>(ref("Deployment", componentName("seaweedfs"), NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "buckets")?.command?.[2] ?? "";
-      // The buckets the gateways make, Neon's, the lake's, the backups', workspace storage's and the snapshots', in that order.
-      const [neon, , backups, workspaces, snapshots] = /for bucket in ([^;]+); do/u.exec(made)?.[1]?.split(" ") ?? [];
-      const names = { neon, backups, workspaces, snapshots };
-      return Promise.all(PROBED_BUCKETS.map(async (probed) => {
-        const bucket = names[probed] ?? assert.fail(`the gateways make no ${probed} bucket: ${made}`);
-        const [secret, id, key] = WRITERS[probed];
-        const keys = [`AWS_ACCESS_KEY_ID=${await kube.secret(NAMESPACE, secret, id)}`, `AWS_SECRET_ACCESS_KEY=${await kube.secret(NAMESPACE, secret, key)}`];
-        const said = await kube.execOk(NAMESPACE, gateway, ["env", ...keys, "sh", "-c", script, "probe", bucket], { container: "lifecycle" });
-        return { bucket: probed, sha256: said.trim() };
-      }));
-    };
-    let probes: Awaited<ReturnType<typeof inEveryBucket>>;
     const scenarios: readonly Scenario[] = [
       {
         // First, as its check is of the first restore after the cut-over.
@@ -780,17 +786,19 @@ if (inShard("upgrade")) {
         seeds: "an object in each bucket of the object store but the lake's, whose own the lake's scenarios read, each put as its bucket's writer, beside what the stack wrote there",
         seed: async () => {
           probes = await inEveryBucket(PROBE_PUT);
-          for (const { bucket, sha256 } of probes) assert.match(sha256, /^[0-9a-f]{64}$/u, bucket);
-          assert.equal(new Set(probes.map(({ sha256 }) => sha256)).size, probes.length, "two buckets were put the same object");
+          for (const { bucket, said } of probes) assert.match(said, /^[0-9a-f]{64}$/u, bucket);
+          assert.equal(new Set(probes.map(({ said }) => said)).size, probes.length, "two buckets were put the same object");
         },
-        keeps: "each bucket's object, read back whole as its writer reads it, through the store upgraded to SeaweedFS 4.54; and the store's volumes, copied whole before it, as SeaweedFS 4.48 left them, each said copied, the store started again on 4.48 before the upgrade",
+        keeps: "each bucket's object, read back whole as its writer reads it, through the store upgraded to SeaweedFS 4.54; and the store's volumes, snapshotted before it, as SeaweedFS 4.48 left them, each said snapshotted, the store started again on 4.48 before the upgrade, and the snapshot said by status",
         check: async () => {
           assert.deepEqual(await inEveryBucket(PROBE_GET), probes);
-          const copies = (await inCutOverRecord("ls -1 object-store")).split("\n").filter(Boolean);
-          assert.deepEqual(copies, ["data-alasio-seaweedfs-filer-store-0", "data-alasio-seaweedfs-master-0", "data-alasio-seaweedfs-volume-0"]);
+          const listed = (await inCutOverRecord("ls -1 object-store")).split("\n").filter(Boolean).sort();
+          assert.deepEqual(listed, [...STORE_CLAIMS, "claims", "counts", "delete.sh", "image", "restore.sh", "taken", "volumes"].sort());
           const events = await inCutOverRecord("cat events.log");
-          for (const claim of copies) assert.match(events, new RegExp(`copied the object store's ${claim}, \\d+ bytes, in \\d+ s`, "u"), claim);
-          assert.match(events, /the object store started again, each part ready, on SeaweedFS 4\.48, as it was, for the upgrade to start it on 4\.54\n[^\n]* upgrading, from the cut-over/u);
+          for (const claim of STORE_CLAIMS) assert.match(events, new RegExp(`snapshotted the object store's ${claim}, \\d+ volumes' data linked and \\d+ bytes copied, in \\d+ s`, "u"), claim);
+          assert.match(events, /the object store snapshotted, to \S+: restore\.sh there puts it back, its parts stopped; delete\.sh deletes it from \S+\n[^\n]* the object store started again, each part ready, on SeaweedFS 4\.48, as it was, for the upgrade to start it on 4\.54\n[^\n]* upgrading, from the cut-over/u);
+          // Status says it, and what of the disk it holds, read by the owner.
+          assert.match(await alasioOk("status"), /^ {2}its snapshot, taken \S+ before its upgrade, at \S+\/cut-over\/object-store: holding \d+(\.\d)? [MG]iB of the disk of its own, /mu);
         },
       },
     ];
@@ -5532,6 +5540,89 @@ if (inShard("wake")) {
       assert.match(logged, asleep);
       assert.match(logged, lastRun);
       assert.match(status, statusAsleep);
+    });
+  });
+}
+
+if (inShard("upgrade")) {
+  // Last before alasio is removed, as the store put back as it was before the upgrade has lost what the stack wrote to it
+  // since, Neon's uploads among it, which nothing after reads.
+  describe("the object store put back by the snapshot the cut-over took, and run on SeaweedFS 4.48 again", () => {
+    /** The store's parts, by their StatefulSets, in the order the cut-over stops them; and its gateways' Deployment. */
+    const PARTS = ["filer", "volume", "master", "filer-store"].map((part) => componentName(`seaweedfs-${part}`));
+    const GATEWAYS = ref("Deployment", componentName("seaweedfs"), NAMESPACE);
+    /**
+     * Shell, of the bucket "$1", through a gateway, as its writer: an object put that was not there before the upgrade, the
+     * probe put anew, and another put and deleted, those last two leaving garbage for a compaction.
+     */
+    const WRITE_AFTER = [
+      'head -c 2097152 /dev/urandom >"/tmp/after-$1"',
+      ...[".alasio-e2e/after-upgrade", ".alasio-e2e/upgrade-probe", ".alasio-e2e/garbage"].map((key) => `aws s3api --endpoint-url http://127.0.0.1:8333 put-object --bucket "$1" --key ${key} --body "/tmp/after-$1" >/dev/null`),
+      'aws s3api --endpoint-url http://127.0.0.1:8333 delete-object --bucket "$1" --key .alasio-e2e/garbage >/dev/null',
+      "echo written",
+    ].join(" && ");
+    /** Shell, of the bucket "$1": whether it holds the object put after the upgrade. */
+    const AFTER_HELD = 'if aws s3api --endpoint-url http://127.0.0.1:8333 head-object --bucket "$1" --key .alasio-e2e/after-upgrade >/dev/null 2>&1; then echo held; else echo absent; fi';
+    /**
+     * Each volume's data file the snapshot links, as the volume servers keep it now: the size the snapshot kept of it, its size
+     * now, and whether it is the very file the snapshot links still, or one a compaction renamed over it, or gone.
+     */
+    const volumesNow = async () => (await inCutOverRecord([
+      "tab=$(printf '\\t')",
+      'while IFS="$tab" read -r claim directory; do',
+      '  case "$claim" in data-alasio-seaweedfs-volume-*)',
+      '    while IFS="$tab" read -r path kept; do',
+      '      if [ "object-store/$claim/files/$path" -ef "$directory/$path" ]; then held=linked; elif [ -e "$directory/$path" ]; then held=replaced; else held=gone; fi',
+      '      echo "$path $kept $(stat -c %s "$directory/$path" 2>/dev/null || echo 0) $held"',
+      '    done <"object-store/$claim/sizes" ;;',
+      "  esac",
+      "done <object-store/claims",
+    ].join("\n"))).split("\n").filter(Boolean).map((line) => {
+      const [path = "", kept = "", now = "", held = ""] = line.split(" ");
+      return { path, kept: Number(kept), now: Number(now), held };
+    });
+    /** Whether alasio's namespace runs no pod of the store's part `part`. */
+    const stopped = async (part: string) =>
+      (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: `app.kubernetes.io/component=${part.slice(`${RELEASE}-`.length)}` })).length === 0 ? true : undefined;
+
+    test("what the store held before the upgrade, read back whole, and nothing written since, once the store, written to and compacted on SeaweedFS 4.54, is stopped, put back by the snapshot's restore, and started on 4.48", { timeout: 60 * 60_000 }, async (t) => {
+      // Written after the upgrade: appended to the volumes the snapshot links.
+      for (const { bucket, said } of await inEveryBucket(WRITE_AFTER)) assert.equal(said, "written", bucket);
+      const appended = await volumesNow();
+      assert.ok(appended.some(({ kept, now, held }) => held === "linked" && now > kept), `no volume the snapshot links was appended to: ${JSON.stringify(appended)}`);
+      // Every volume holding garbage compacted, each written anew and renamed over the file the snapshot links.
+      const master = await kube.get<V1StatefulSet>(ref("StatefulSet", MASTER, NAMESPACE));
+      const vacuum = `printf 'lock\\nvolume.vacuum -garbageThreshold=0.0001\\nunlock\\n' | weed shell -master=${masterAddresses(master?.spec?.replicas ?? 1)} -filer=${FILER}:8888`;
+      t.diagnostic(await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("seaweedfs")), ["sh", "-c", vacuum], { container: "buckets" }));
+      const compacted = await volumesNow();
+      assert.ok(compacted.some(({ held }) => held === "replaced"), `no volume the snapshot links was compacted: ${JSON.stringify(compacted)}`);
+      // The store stopped, writers first, as the cut-over stops it.
+      for (const part of PARTS) {
+        await kube.patch(ref("StatefulSet", part, NAMESPACE), { spec: { replicas: 0 } });
+        await until(`the object store's ${part} stopped`, () => stopped(part), 600_000);
+      }
+      const restored = await inCutOverRecordOnCluster("bash object-store/restore.sh");
+      t.diagnostic(restored);
+      assert.match(restored, /the object store restored as it was snapshotted, \S+; start it on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}, as 10\.0\.26 ran it/u);
+      // Each container of its parts and its gateways that runs SeaweedFS on the image 10.0.26 ran, each part at its count again,
+      // those its peers need first, as the restore says.
+      const image = (await inCutOverRecord("cat object-store/image")).trim();
+      const counts = new Map((await inCutOverRecord("cat object-store/counts")).split("\n").filter(Boolean).map((line) => line.split("\t") as [string, string]));
+      const onImage = (containers: readonly V1Container[]) => containers.map((container) => (container.image?.startsWith("chrislusf/seaweedfs:") ? { ...container, image } : container));
+      for (const target of [...PARTS.map((part) => ref("StatefulSet", part, NAMESPACE)), GATEWAYS]) {
+        const spec = (await kube.get<V1StatefulSet | V1Deployment>(target))?.spec?.template.spec;
+        await kube.patch(target, { spec: { template: { spec: { containers: onImage(spec?.containers ?? []), ...(spec?.initContainers ? { initContainers: onImage(spec.initContainers) } : {}) } } } });
+      }
+      for (const part of [...PARTS].reverse()) {
+        await kube.patch(ref("StatefulSet", part, NAMESPACE), { spec: { replicas: Number(counts.get(part) ?? 1) } });
+        await kube.awaitReady([ref("StatefulSet", part, NAMESPACE)], "10 minutes");
+      }
+      await kube.awaitReady([GATEWAYS], "10 minutes");
+      const masters = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=seaweedfs-master" });
+      assert.deepEqual(masters.map(({ spec }) => spec?.containers.find(({ name }) => name === "master")?.image), masters.map(() => image));
+      // What each bucket held before the upgrade, whole; and nothing put after it.
+      assert.deepEqual(await inEveryBucket(PROBE_GET), probes);
+      for (const { bucket, said } of await inEveryBucket(AFTER_HELD)) assert.equal(said, "absent", bucket);
     });
   });
 }

@@ -3,8 +3,8 @@
  * keeps, and of each volume server, how near its disk is to its taking no more writes, as
  * the volume server's own metrics say. A volume server takes none once its disk has less
  * free than its minFreeSpace; once none takes any, nor does the store, as each of its
- * filers' writes is logged to a volume. Pure, for tests; ./commands/status.ts reads the
- * cluster.
+ * filers' writes is logged to a volume. And the snapshot of its volumes a cut-over took before
+ * an upgrade, while it is kept. Pure, for tests; ./commands/status.ts reads the cluster.
  */
 import { memoryText } from "./capacity.ts";
 
@@ -89,6 +89,58 @@ export function describeGrowthFrozen(frozen: readonly string[], shell: string): 
     `the store writes on to the volumes it has until they fill, and makes none; once its volume servers are all seen, and its masters' state is the one they hold, ` +
     `resume it in weed shell (${shell}) with volume.growth.resume`,
   ];
+}
+
+/**
+ * The ConfigMap of alasio's namespace by which a cut-over (upgrades/from-<release>.sh) names
+ * the snapshot it took of the store's volumes before an upgrade, on this machine; deleted with
+ * the snapshot, by the deletion the snapshot carries.
+ */
+export const STORE_SNAPSHOT_CONFIGMAP = "alasio-object-store-snapshot";
+
+/**
+ * A snapshot of the store's volumes, as its ConfigMap says it: where it is, when it was taken
+ * and until when it is kept, what it copied, and the data files of the volumes it links, each
+ * shared with the store until the store compacts or deletes its volume, its own from then.
+ */
+export interface StoreSnapshot {
+  readonly path: string;
+  readonly taken: string;
+  readonly keepUntil: string;
+  readonly copiedBytes: number;
+  readonly volumes: readonly string[];
+}
+
+/** The snapshot the ConfigMap's `data` says, or null where it says none whole. */
+export function storeSnapshotOf(data: Readonly<Record<string, string>> | undefined): StoreSnapshot | null {
+  const { path, taken, keepUntil, copiedBytes, volumes = "" } = data ?? {};
+  if (!path || !taken || !keepUntil || !copiedBytes || !/^\d+$/u.test(copiedBytes)) return null;
+  return { path, taken, keepUntil, copiedBytes: Number(copiedBytes), volumes: volumes.split("\n").filter(Boolean) };
+}
+
+/**
+ * How much of the disk `snapshot` holds of its own: what it copied, and each data file it links
+ * that the store no longer does, as `linked` says each one's links and blocks, the store's
+ * compaction having renamed a new file over it, or its deletion unlinked it.
+ */
+export function storeSnapshotHolds(snapshot: StoreSnapshot, linked: readonly { readonly nlink: number; readonly blocks: number }[]): number {
+  return linked.reduce((total, { nlink, blocks }) => total + (nlink === 1 ? blocks * 512 : 0), snapshot.copiedBytes);
+}
+
+/**
+ * What `status` says of `snapshot`, as of `now`: where it is and when it was taken, what of the
+ * disk it holds of its own as `holds` says, or why that is not known; how to put the store back as
+ * it was; and until when it is kept, and how to delete it then, or, once that has passed, now.
+ */
+export function describeStoreSnapshot(snapshot: StoreSnapshot, holds: number | { readonly unread: string }, now: Date): string {
+  const { path, taken, keepUntil } = snapshot;
+  const held = typeof holds === "number"
+    ? `holding ${memoryText(holds)} of the disk of its own, more as the store compacts or deletes the volumes it shares with it`
+    : `what it holds of the disk not read: ${holds.unread}`;
+  const kept = now.getTime() < Date.parse(keepUntil)
+    ? `kept until ${keepUntil}, then deleted by sudo ${path}/delete.sh`
+    : `kept until ${keepUntil}, which has passed: delete it with sudo ${path}/delete.sh`;
+  return `its snapshot, taken ${taken} before its upgrade, at ${path}: ${held}; sudo ${path}/restore.sh puts the store back as it was, its parts stopped; ${kept}`;
 }
 
 /** The copies of each object a replication, `000` or `00N`, keeps, as said. */

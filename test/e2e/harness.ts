@@ -1058,6 +1058,12 @@ export async function inCutOverRecord(script: string): Promise<string> {
   return (await sudo("sh", "-c", `cd ${shellWord(cutOverRecord())} && ${script}`)).stdout;
 }
 
+/** `inCutOverRecord`, kubectl reaching the cluster as the cut-over's does: what `script` printed, on stdout and stderr both. */
+export async function inCutOverRecordOnCluster(script: string): Promise<string> {
+  const { kubeconfig } = current();
+  return (await sudo("env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, "sh", "-c", `cd ${shellWord(cutOverRecord())} && { ${script}; } 2>&1`)).stdout;
+}
+
 /** A line k3s, containerd, stargz-snapshotter's daemon or kubelet logs as an error: logrus's level, as text or JSON, or klog's E or F. */
 export const LOGGED_ERROR = /level=(?:error|fatal)|"level":"(?:error|fatal)"|[EF]\d{4} \d{2}:/u;
 

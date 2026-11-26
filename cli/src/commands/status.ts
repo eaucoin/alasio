@@ -1,5 +1,7 @@
 /** `alasio status`: what runs, and whether it is healthy; how it is scaled and sized, and the cluster's memory. */
-import type { KubernetesObject, V1Deployment, V1Node, V1Pod, V1Secret, V1StatefulSet } from "@kubernetes/client-node";
+import { statSync } from "node:fs";
+
+import type { KubernetesObject, V1ConfigMap, V1Deployment, V1Node, V1Pod, V1Secret, V1StatefulSet } from "@kubernetes/client-node";
 import { Console, Effect, Option, Redacted, Schema } from "effect";
 import { Command } from "effect/cli";
 
@@ -23,7 +25,17 @@ import { FILER, GATEWAY, MASTER, masterAddresses, METRICS_PORT, VOLUME_SERVER } 
 import { GATEWAY_COMPONENT, GATEWAY_PORT } from "../manifests/sandbox-gateway.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
-import { describeGrowthFrozen, describeReplication, describeVolumeServer, growthFrozen, volumeServerDisk } from "../object-store.ts";
+import {
+  describeGrowthFrozen,
+  describeReplication,
+  describeStoreSnapshot,
+  describeVolumeServer,
+  growthFrozen,
+  STORE_SNAPSHOT_CONFIGMAP,
+  storeSnapshotHolds,
+  storeSnapshotOf,
+  volumeServerDisk,
+} from "../object-store.ts";
 import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { branchNamespaces } from "../branches.ts";
@@ -128,8 +140,9 @@ const statefulSet = (workloads: readonly KubernetesObject[], name: string): V1St
 /**
  * What the bundled object store keeps, where it runs among `workloads`: the copies of
  * each object, as its masters are told; of each volume server, its disk, as its metrics say
- * it, read in its pod, or why it is not measured; and whether a master holds volume growth
- * frozen, as its metrics say, and how to resume it.
+ * it, read in its pod, or why it is not measured; whether a master holds volume growth
+ * frozen, as its metrics say, and how to resume it; and the snapshot of its volumes a cut-over
+ * took, while its ConfigMap names it, what it holds of the disk read of its files on this machine.
  */
 const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<string[], KubeApiError, KubeApi> =>
   Effect.gen(function*() {
@@ -160,7 +173,15 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
         Effect.orElseSucceed(() => []),
       ));
     const shell = `kubectl -n ${NAMESPACE} exec -it deployment/${GATEWAY} -c buckets -- weed shell -master=${masterAddresses(master.spec?.replicas ?? 1)} -filer=${FILER}:8888`;
-    return [describeReplication(replication), ...disks.map((line) => `  ${line}`), ...describeGrowthFrozen(frozen.flat().sort(), shell).map((line) => `  ${line}`)];
+    const named = yield* seen(kube.get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: STORE_SNAPSHOT_CONFIGMAP }));
+    const snapshot = storeSnapshotOf(Option.getOrNull(named)?.data);
+    // What it holds of the disk, read of the data files it links, on this machine, where the cut-over took it.
+    const holds = snapshot === null ? null : yield* Effect.try({
+      try: () => storeSnapshotHolds(snapshot, snapshot.volumes.map((path) => statSync(path))),
+      catch: (error) => ({ unread: error instanceof Error ? error.message : String(error) }),
+    }).pipe(Effect.catch((unread) => Effect.succeed(unread)));
+    const snapshotSaid = snapshot === null || holds === null ? [] : [describeStoreSnapshot(snapshot, holds, new Date())];
+    return [describeReplication(replication), ...[...disks, ...describeGrowthFrozen(frozen.flat().sort(), shell), ...snapshotSaid].map((line) => `  ${line}`)];
   });
 
 /** Whether `workload` is a sandbox pool's, ready once its pods run, each ready only once bound. */
