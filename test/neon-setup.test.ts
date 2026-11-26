@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { X509Certificate } from "node:crypto";
+import { createHmac, createPrivateKey, X509Certificate } from "node:crypto";
+import { connect, createServer } from "node:tls";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
@@ -9,6 +10,7 @@ import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { clusterId, type SeaweedS3Config, type StackSecrets, type StoredSecrets } from "../neon/control/secrets.ts";
+import { makeAuthority, makePartCertificate, STORE_PARTS, VALID_DAYS as STORE_VALID_DAYS } from "../neon/control/store-security.ts";
 import { environmentKey } from "../src/binder/names.ts";
 import { poolLoginKey } from "../src/harness/names.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
@@ -171,6 +173,34 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.filerStoreBackup, "password"), root.filerStoreBackupPassword);
   assert.equal(new Set([root.filerStoreFilerPassword, root.filerStoreCollectorPassword, root.filerStoreBackupPassword]).size, 3);
   assert.deepEqual([names.filerStoreFiler, names.filerStoreCollector, names.filerStoreBackup], ["q-seaweedfs-filer-store-filer", "q-seaweedfs-filer-store-collector", "q-seaweedfs-filer-store-backup"]);
+  // Each of the store's parts its certificate, of the store's authority, its name its common name, for a TLS server and client
+  // alike, and that authority's, whose key no part holds; the filers' signing keys the filers' alone.
+  const { authority } = root.storeSecurity;
+  const authorityCertificate = new X509Certificate(authority.cert);
+  assert.deepEqual([authorityCertificate.subject, authorityCertificate.ca], ["CN=alasio-seaweedfs", true]);
+  for (const part of STORE_PARTS) {
+    const name = names.storeParts[part];
+    assert.equal(name, `q-seaweedfs-${part}-security`);
+    assert.equal(value(kube, name, "ca.crt"), authority.cert);
+    const certificate = new X509Certificate(value(kube, name, "tls.crt"));
+    assert.deepEqual([certificate.subject, certificate.ca, certificate.checkIssued(authorityCertificate), certificate.verify(authorityCertificate.publicKey)], [`CN=seaweedfs-${part}`, false, true, true], part);
+    assert.deepEqual(certificate.keyUsage, ["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"], part);
+    assert.ok(certificate.checkPrivateKey(createPrivateKey(value(kube, name, "tls.key"))), part);
+    assert.equal(Math.round((Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 86_400_000), STORE_VALID_DAYS);
+    const keys = Object.keys(kube.secrets.get(name)?.data ?? {}).sort();
+    const signing = part === "filer" ? ["filer-signing-key", "filer-signing-read-key"] : [];
+    assert.deepEqual(keys, ["ca.crt", ...signing, "tls.crt", "tls.key"], part);
+    const of = { "filer-signing-key": root.storeSecurity.filerSigningKey, "filer-signing-read-key": root.storeSecurity.filerReadSigningKey };
+    for (const key of signing) assert.equal(value(kube, name, key), of[key as keyof typeof of], `${part}: ${key}`);
+  }
+  assert.equal(new Set(STORE_PARTS.map((part) => root.storeSecurity.parts[part].key)).size, STORE_PARTS.length);
+  assert.notEqual(root.storeSecurity.filerSigningKey, root.storeSecurity.filerReadSigningKey);
+  assert.ok(![...kube.secrets.entries()].some(([name, secret]) => name !== names.root && Object.values(secret.data ?? {}).some((data) => Buffer.from(data, "base64").toString("utf8").includes(authority.key))));
+  // The lake's token for the filers: signed with their read key, of reads of the lake's entries alone.
+  const [header, claims, signature] = value(kube, names.lake, "LAKE_STORE_FILER_TOKEN").split(".");
+  assert.deepEqual(JSON.parse(Buffer.from(header ?? "", "base64url").toString()), { alg: "HS256", typ: "JWT" });
+  assert.deepEqual(JSON.parse(Buffer.from(claims ?? "", "base64url").toString()), { allowed_prefixes: ["/buckets/lake"], allowed_methods: ["GET", "HEAD"] });
+  assert.equal(signature, createHmac("sha256", root.storeSecurity.filerReadSigningKey).update(`${header}.${claims}`).digest("base64url"));
 
   // The lake's query endpoint reads as a reader, in the catalog and in the object store, and Grafana queries it with its token.
   assert.equal(value(kube, names.lake, "LAKE_READER_PASSWORD"), root.lakeReaderPassword);
@@ -344,6 +374,76 @@ test("a root predating an S3 identity gains its credentials, and the store the i
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "snapshots")?.credentials, [snapshots]);
 });
 
+test("a root predating the store's security gains it, a part's certificate missing alone made of the authority kept, and an authority missing every part's anew", async () => {
+  const kube = fakeKube();
+  const config = setupConfig(ENV);
+  await setupKube({ kube, config, log: () => {} });
+  const names = secretNames("q");
+  const made: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
+  const rewrite = (root: StoredSecrets) => {
+    const current = kube.secrets.get(names.root);
+    assert.ok(current?.data);
+    current.data["secrets.json"] = Buffer.from(JSON.stringify(root)).toString("base64");
+  };
+  const completed = async () => {
+    await setupKube({ kube, config, log: () => {} });
+    const root: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
+    return root.storeSecurity;
+  };
+  // A part's certificate missing: made of the authority kept, every other kept.
+  const withoutVolume: StoredSecrets = structuredClone(made);
+  delete withoutVolume.storeSecurity?.parts?.volume;
+  rewrite(withoutVolume);
+  const partly = await completed();
+  assert.deepEqual({ ...partly, parts: { ...partly.parts, volume: made.storeSecurity.parts.volume } }, made.storeSecurity);
+  assert.notEqual(partly.parts.volume.cert, made.storeSecurity.parts.volume.cert);
+  assert.ok(new X509Certificate(partly.parts.volume.cert).verify(new X509Certificate(made.storeSecurity.authority.cert).publicKey));
+  // The authority missing: every part's made anew, of the new one; the signing keys kept.
+  const withoutAuthority: StoredSecrets = { ...made, storeSecurity: structuredClone(partly) };
+  delete withoutAuthority.storeSecurity?.authority;
+  rewrite(withoutAuthority);
+  const anew = await completed();
+  assert.notEqual(anew.authority.cert, made.storeSecurity.authority.cert);
+  for (const part of STORE_PARTS) {
+    assert.notEqual(anew.parts[part].cert, partly.parts[part].cert, part);
+    assert.ok(new X509Certificate(anew.parts[part].cert).verify(new X509Certificate(anew.authority.cert).publicKey), part);
+  }
+  assert.deepEqual([anew.filerSigningKey, anew.filerReadSigningKey], [made.storeSecurity.filerSigningKey, made.storeSecurity.filerReadSigningKey]);
+  // None at all, as a root of a release before: all of it made, and nothing else changed.
+  const before: StoredSecrets = structuredClone(made);
+  delete before.storeSecurity;
+  rewrite(before);
+  const gained = await completed();
+  const after: StoredSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
+  delete after.storeSecurity;
+  assert.deepEqual(after, before);
+  assert.deepEqual(Object.keys(gained.parts), [...STORE_PARTS]);
+});
+
+test("a part's certificate is taken over mutual TLS by another part's, and one of another authority is not", async () => {
+  const authority = makeAuthority();
+  const [filer, lifecycle] = [makePartCertificate(authority, "filer"), makePartCertificate(authority, "lifecycle")];
+  const stranger = makePartCertificate(makeAuthority(), "lifecycle");
+  // As SeaweedFS's servers take a client: its certificate required, of the authority; and as its clients take a server, the name unchecked.
+  const server = createServer({ cert: filer.cert, key: filer.key, ca: authority.cert, requestCert: true, rejectUnauthorized: true }, (socket) => socket.end(String(socket.getPeerCertificate().subject.CN)));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const dial = ({ cert, key }: { cert: string; key: string }) =>
+    new Promise<string>((resolve) => {
+      const socket = connect({ host: "127.0.0.1", port, cert, key, ca: authority.cert, checkServerIdentity: () => undefined });
+      let said = "";
+      socket.on("data", (data) => (said += String(data)));
+      socket.on("end", () => resolve(said || "refused"));
+      socket.on("error", () => resolve("refused"));
+    });
+  try {
+    assert.equal(await dial(lifecycle), "seaweedfs-lifecycle");
+    assert.equal(await dial(stranger), "refused");
+  } finally {
+    server.close();
+  }
+});
+
 /** Secrets as the root holds them, every S3 identity's credentials `s3`. */
 function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecrets {
   return {
@@ -367,6 +467,12 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     filerStoreFilerPassword: "p",
     filerStoreCollectorPassword: "c",
     filerStoreBackupPassword: "b",
+    storeSecurity: {
+      authority: { cert: "authority", key: "authority-key" },
+      parts: Object.fromEntries(STORE_PARTS.map((part) => [part, { cert: part, key: `${part}-key` }])) as StackSecrets["storeSecurity"]["parts"],
+      filerSigningKey: "fw",
+      filerReadSigningKey: "fr",
+    },
     monitorKey: "m",
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g", harness: "SCRAM-SHA-256$h", codex_login: "SCRAM-SHA-256$x" },
     nodeAgentToken: "n",
@@ -402,6 +508,9 @@ test("with an external object store, every service uses its credentials, but the
   assert.equal(rendered[names.filerStoreFiler], undefined);
   assert.equal(rendered[names.filerStoreCollector], undefined);
   assert.equal(rendered[names.filerStoreBackup], undefined);
+  // Nor what the bundled store's parts prove themselves with, nor the lake's token for its filers.
+  for (const part of STORE_PARTS) assert.equal(rendered[names.storeParts[part]], undefined, part);
+  assert.equal(rendered[names.lake]?.["LAKE_STORE_FILER_TOKEN"], undefined);
   assert.equal(rendered[names.safekeeper]?.["AWS_ACCESS_KEY_ID"], "AK");
   assert.equal(rendered[names.lake]?.["LAKE_S3_SECRET"], "SK");
   assert.match(rendered[names.safekeeper]?.["REMOTE_STORAGE"] ?? "",/bucket_name="my-neon", bucket_region="eu-west-1"/u);

@@ -6,6 +6,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
 import { scramVerifier } from "./scram.ts";
+import { completeStoreSecurity, type StoreSecurity, type StoredStoreSecurity } from "./store-security.ts";
 
 /**
  * The availability zone every pageserver is in: one, the tenant's home zone, as alasio's
@@ -82,6 +83,8 @@ export interface StackSecrets {
   filerStoreFilerPassword: string;
   filerStoreCollectorPassword: string;
   filerStoreBackupPassword: string;
+  /** What the bundled object store's parts prove themselves to each other with, and its filers take requests by (./store-security.ts). */
+  storeSecurity: StoreSecurity;
   /** The lake's query endpoint's: its reader's role's, and the token its queries carry. */
   lakeReaderPassword: string;
   lakeQueryToken: string;
@@ -123,10 +126,11 @@ export interface StackSecrets {
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
-export type StoredSecrets = Partial<Omit<StackSecrets, "s3" | "verifiers" | "log">> & {
+export type StoredSecrets = Partial<Omit<StackSecrets, "s3" | "verifiers" | "log" | "storeSecurity">> & {
   s3?: Partial<Record<S3Identity, S3Credentials>>;
   verifiers?: Partial<Record<ClientRole, string>>;
   log?: Partial<StackSecrets["log"]>;
+  storeSecurity?: StoredStoreSecurity;
 };
 
 /** Where Neon keeps its files: an S3 bucket at an endpoint. */
@@ -243,6 +247,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     filerStoreFilerPassword: kept(stored.filerStoreFilerPassword, () => secret()),
     filerStoreCollectorPassword: kept(stored.filerStoreCollectorPassword, () => secret()),
     filerStoreBackupPassword: kept(stored.filerStoreBackupPassword, () => secret()),
+    storeSecurity: completeStoreSecurity(stored.storeSecurity, kept, secret),
     monitorKey: kept(stored.monitorKey, () => secret()),
     // Each of its password above, whether that was kept or made now.
     verifiers: {

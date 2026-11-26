@@ -44,7 +44,7 @@ import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
 import { alasioObjects, alasioScaling } from "../src/manifests/alasio.ts";
 import { branchEnvironment, branchObjects } from "../src/manifests/branch.ts";
-import { MAIN_ENVIRONMENT } from "../src/manifests/common.ts";
+import { MAIN_ENVIRONMENT, sha256 } from "../src/manifests/common.ts";
 import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
@@ -1034,7 +1034,11 @@ describe("the lake's writers", () => {
     const config = configOf();
     // No object of the installation's runs it on a schedule.
     assert.equal(install().some(({ kind, metadata }) => kind === "CronJob" && metadata?.name === "alasio-lake-reconcile"), false);
-    for (const [environment, endpoint, replica] of [[MAIN_ENVIRONMENT, "alasio", "alasio-ro"], [branchEnvironment("try"), "branch-try", "branch-try-ro"]] as const) {
+    for (const [environment, endpoint, replica, store] of [
+      [MAIN_ENVIRONMENT, "alasio", "alasio-ro", ["http://alasio-seaweedfs-filer.alasio.svc:8888", "alasio-lake/LAKE_STORE_FILER_TOKEN", "http://alasio-seaweedfs-master.alasio.svc:9333", "1"]],
+      // A branch environment's reaches none of the store's parts (./network-policies.ts), so it is given none.
+      [branchEnvironment("try"), "branch-try", "branch-try-ro", [undefined, undefined, undefined, undefined]],
+    ] as const) {
       const job = lakeReconcile(config, environment);
       const pass = job.spec?.template.spec?.containers[0];
       assert.ok(pass);
@@ -1044,18 +1048,16 @@ describe("the lake's writers", () => {
       assert.deepEqual([env["LAKE_DATABASE_ENDPOINT"], env["LAKE_SOURCE_ENDPOINT"], env["LAKE_DATABASE_PASSWORD"]], [endpoint, replica, "alasio-lake/LAKE_DATABASE_PASSWORD"]);
       // Its DuckDB sized as the other passes' are.
       assert.equal(env["LAKE_MEMORY_LIMIT"], "614MiB");
-      // The bundled store's filer and masters, which it asks whether a file the store fails a read of is gone, as the reconciliation's pod, which they admit.
-      assert.deepEqual(
-        [env["LAKE_STORE_FILER_URL"], env["LAKE_STORE_MASTER_URL"], env["LAKE_STORE_VOLUME_SERVERS"]],
-        ["http://alasio-seaweedfs-filer.alasio.svc:8888", "http://alasio-seaweedfs-master.alasio.svc:9333", "1"],
-      );
+      // The bundled store's filer and masters, which it asks whether a file the store fails a read of is gone, as the reconciliation's pod, which they admit,
+      // the filer with a token of the lake's Secret.
+      assert.deepEqual([env["LAKE_STORE_FILER_URL"], env["LAKE_STORE_FILER_TOKEN"], env["LAKE_STORE_MASTER_URL"], env["LAKE_STORE_VOLUME_SERVERS"]], store);
       assert.equal(job.spec?.template.metadata?.labels?.["app.kubernetes.io/component"], "lake-reconcile");
       // A branch environment's telemetry, main's as of its branch point, which main's reads again from the log.
       assert.equal(env["LAKE_BRANCH"], environment.branch ?? undefined);
     }
     // Another store: no parts to ask.
     const external = variables(lakeReconcile(configOf({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } } })).spec?.template.spec?.containers[0] ?? { name: "" });
-    assert.deepEqual([external["LAKE_STORE_FILER_URL"], external["LAKE_STORE_MASTER_URL"], external["LAKE_STORE_VOLUME_SERVERS"]], [undefined, undefined, undefined]);
+    assert.deepEqual([external["LAKE_STORE_FILER_URL"], external["LAKE_STORE_FILER_TOKEN"], external["LAKE_STORE_MASTER_URL"], external["LAKE_STORE_VOLUME_SERVERS"]], [undefined, undefined, undefined, undefined]);
     // As many as the store runs.
     assert.equal(variables(lakeReconcile(configOf({ objectStore: { bundled: { replication: "001", volumeServers: { scaling: { min: 3, max: 3 } } } } })).spec?.template.spec?.containers[0] ?? { name: "" })["LAKE_STORE_VOLUME_SERVERS"], "3");
   });
@@ -1156,8 +1158,8 @@ describe("object store", () => {
       assert.deepEqual(part.command, ["/bin/sh", "-c", oneAtATime(lock, server), "/entrypoint.sh"], name);
       assert.equal(part.args?.[0], first, name);
       assert.ok(part.command?.[2]?.includes(`waiting for the ${server} that holds ${lock} to end`), name);
-      // The lock on its volume, as its claim's.
-      assert.deepEqual(part.volumeMounts, [{ name: "data", mountPath: "/data" }], name);
+      // The lock on its volume, as its claim's, beside its configuration.
+      assert.deepEqual(part.volumeMounts, [{ name: "config", mountPath: "/etc/seaweedfs", readOnly: true }, { name: "data", mountPath: "/data" }], name);
       assert.deepEqual(workload.spec?.volumeClaimTemplates?.map(({ metadata }) => metadata?.name), ["data"], name);
       // A server waiting for the one before it on its volume, which ends within its pod's grace, is not ended by its liveness probe as it waits.
       const grace = workload.spec?.template.spec?.terminationGracePeriodSeconds ?? 30;
@@ -1182,6 +1184,77 @@ describe("object store", () => {
       one<V1ConfigMap>(objects, "ConfigMap", "alasio-seaweedfs-filer").data?.["filer.toml"],
       '[redis2]\nenabled = true\naddress = "alasio-seaweedfs-filer-store:6379"\nusername = "filer"\ndatabase = 0\nkeyPrefix = "seaweedfs:"\nsuperLargeDirectories = []\n',
     );
+  });
+
+  test("has each part prove itself to the others on their gRPC ports by its certificate, taking the certificates of those its NetworkPolicy admits there alone, and the filers take requests over HTTP signed with their keys alone", () => {
+    const objects = install();
+    const toml = one<V1ConfigMap>(objects, "ConfigMap", "alasio-seaweedfs-security").data?.["security.toml"] ?? "";
+    const section = (name: string, names?: string) => [
+      `[grpc.${name}]`,
+      'cert = "/etc/seaweedfs/tls/tls.crt"',
+      'key = "/etc/seaweedfs/tls/tls.key"',
+      ...(names ? [`allowed_commonNames = "${names}"`] : []),
+      "",
+    ];
+    assert.equal(toml, [
+      "[grpc]",
+      'ca = "/etc/seaweedfs/tls/ca.crt"',
+      "",
+      ...section("master", "seaweedfs-master,seaweedfs-volume,seaweedfs-filer,seaweedfs-gateway,seaweedfs-lifecycle"),
+      ...section("volume", "seaweedfs-volume,seaweedfs-master,seaweedfs-filer,seaweedfs-gateway,seaweedfs-lifecycle"),
+      ...section("filer", "seaweedfs-filer,seaweedfs-gateway,seaweedfs-lifecycle"),
+      ...section("s3", "seaweedfs-lifecycle"),
+      ...section("client"),
+    ].join("\n"));
+    // Each server's names are of the parts its NetworkPolicy admits on its gRPC port, its pods' components.
+    const named = Object.fromEntries(toml.split("\n[").map((part) => [/^grpc\.(\w+)\]/u.exec(part)?.[1], /allowed_commonNames = "([^"]*)"/u.exec(part)?.[1]?.split(",")]));
+    const component = (name: string) => ({ "seaweedfs-master": "seaweedfs-master", "seaweedfs-volume": "seaweedfs-volume", "seaweedfs-filer": "seaweedfs-filer", "seaweedfs-gateway": "seaweedfs", "seaweedfs-lifecycle": "seaweedfs-lifecycle" })[name];
+    type Rule = { from: { podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] };
+    for (const [policy, server, port] of [["alasio-seaweedfs-master", "master", 19333], ["alasio-seaweedfs-volume", "volume", 18080], ["alasio-seaweedfs-filer", "filer", 18888], ["alasio-seaweedfs", "s3", 18333]] as const) {
+      const admitted = one<KubernetesObject & { spec: { ingress: Rule[] } }>(objects, "NetworkPolicy", policy).spec.ingress
+        .filter(({ ports }) => ports.some((each) => each.port === port))
+        .flatMap(({ from }) => from.map(({ podSelector }) => podSelector.matchLabels["app.kubernetes.io/component"]));
+      assert.deepEqual(named[server]?.map(component), admitted, server);
+    }
+    // Each part reads it beside its certificate and its authority's, its Secret's, which its user alone reads, where SeaweedFS looks for it.
+    const template = (kind: string, name: string) =>
+      kind === "CronJob" ? one<V1CronJob>(objects, kind, name).spec?.jobTemplate.spec?.template : one<V1StatefulSet>(objects, kind, name).spec?.template;
+    for (
+      const [kind, name, containerName, part, others] of [
+        ["StatefulSet", "alasio-seaweedfs-master", "master", "master", []],
+        ["StatefulSet", "alasio-seaweedfs-volume", "volume", "volume", []],
+        ["StatefulSet", "alasio-seaweedfs-filer", "filer", "filer", [{ configMap: { name: "alasio-seaweedfs-filer" } }]],
+        ["Deployment", "alasio-seaweedfs", "s3", "gateway", [{ secret: { name: "alasio-neon-seaweedfs" } }]],
+        // The buckets' shell, beside the gateway, as the gateway, but for its identities.
+        ["Deployment", "alasio-seaweedfs", "buckets", "gateway", []],
+        ["CronJob", "alasio-seaweedfs-lifecycle", "lifecycle", "lifecycle", []],
+      ] as const
+    ) {
+      const spec = template(kind, name)?.spec;
+      const mount = spec?.containers.find((each) => each.name === containerName)?.volumeMounts?.find(({ mountPath }) => mountPath === "/etc/seaweedfs");
+      assert.equal(mount?.readOnly, true, `${name}/${containerName}`);
+      assert.deepEqual(spec?.volumes?.find((volume) => volume.name === mount?.name)?.projected, {
+        defaultMode: 0o440,
+        sources: [
+          ...others,
+          { configMap: { name: "alasio-seaweedfs-security" } },
+          { secret: { name: `alasio-seaweedfs-${part}-security`, items: [{ key: "ca.crt", path: "tls/ca.crt" }, { key: "tls.crt", path: "tls/tls.crt" }, { key: "tls.key", path: "tls/tls.key" }] } },
+        ],
+      }, `${name}/${containerName}`);
+    }
+    // The filers' signing keys, of writes and of reads, in the filers' environment, which take requests over HTTP signed with them alone, and in nothing else's.
+    const key = (name: string, part: string, of: string) => ({ name, valueFrom: { secretKeyRef: { name: `alasio-seaweedfs-${part}-security`, key: of } } });
+    const keyed = (object: KubernetesObject) => JSON.stringify(object).match(/WEED_JWT_\w+/gu) ?? [];
+    const filer = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer"));
+    assert.deepEqual(filer.env?.filter(({ name }) => name.startsWith("WEED_JWT_")), [
+      key("WEED_JWT_FILER_SIGNING_KEY", "filer", "filer-signing-key"),
+      key("WEED_JWT_FILER_SIGNING_READ_KEY", "filer", "filer-signing-read-key"),
+    ]);
+    assert.equal(objects.flatMap(keyed).length, 2);
+    // Each part restarts as the file changes, which it reads as it starts alone.
+    for (const [kind, name] of [["StatefulSet", "alasio-seaweedfs-master"], ["StatefulSet", "alasio-seaweedfs-volume"], ["StatefulSet", "alasio-seaweedfs-filer"], ["Deployment", "alasio-seaweedfs"]] as const) {
+      assert.equal(template(kind, name)?.metadata?.annotations?.["checksum/security"], sha256(toml), name);
+    }
   });
 
   test("sizes the filer store's memory from the entries it holds, and refuses a limit that leaves no room for its snapshots", () => {
@@ -1315,20 +1388,21 @@ describe("object store", () => {
         from.map(({ namespaceSelector, podSelector }) => `${podSelector.matchLabels["app.kubernetes.io/component"]}${namespaceSelector ? ` in ${JSON.stringify(namespaceSelector)}` : ""}`),
         ports.map(({ port }) => port),
       ]);
-    // Each environment's lake's reconciliation, on their HTTP port alone.
+    // Main's lake's reconciliation, on their HTTP port alone; no branch environment's, as a master's deletes a bucket's volumes for whatever asks.
     const main = `lake-reconcile in ${JSON.stringify({ matchLabels: { "kubernetes.io/metadata.name": "alasio" } })}`;
-    const branches = `lake-reconcile in ${JSON.stringify({ matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] })}`;
     assert.deepEqual(admitted("alasio-seaweedfs-master"), [
       [["seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [9333, 19333]],
-      [[main, branches], [9333]],
+      [[main], [9333]],
       [["collector-scraper"], [9327]],
     ]);
     assert.deepEqual(admitted("alasio-seaweedfs-volume"), [
       [["seaweedfs-volume", "seaweedfs-master", "seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8080, 18080]],
-      [[main, branches], [8080]],
+      [[main], [8080]],
       [["collector-scraper"], [9327]],
     ]);
-    assert.deepEqual(admitted("alasio-seaweedfs-filer"), [[["seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8888, 18888]], [[main, branches], [8888]], [["collector-scraper"], [9327]]]);
+    assert.deepEqual(admitted("alasio-seaweedfs-filer"), [[["seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8888, 18888]], [[main], [8888]], [["collector-scraper"], [9327]]]);
+    // Nothing of a branch environment's reaches any part.
+    for (const name of ["alasio-seaweedfs-master", "alasio-seaweedfs-volume", "alasio-seaweedfs-filer"]) assert.doesNotMatch(JSON.stringify(admitted(name)), /alasio\.dev\/branch/u, name);
     // The gateways take the data stack's pods on their S3 port, the lifecycle pass alone on their gRPC port, and the collector's scraper alone on their metrics port.
     const gateway = one<KubernetesObject & { spec: { ingress: { from: { podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] }[] } }>(objects, "NetworkPolicy", "alasio-seaweedfs").spec.ingress;
     assert.deepEqual(gateway.map(({ from, ports }) => [from.map(({ podSelector }) => podSelector.matchLabels), ports.map(({ port }) => port)]), [

@@ -27,7 +27,7 @@ import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manif
 import { pageserverName, REPLICA_NAME } from "../../cli/src/manifests/neon.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
-import { AGENTS, alasioOk, type Forward, inContainer, kube, lakeQuery, paths, reachability, ref, runCronJob } from "../../test/e2e/harness.ts";
+import { AGENTS, alasioOk, type Forward, inContainer, kube, lakeQuery, nodeAgents, paths, reachability, ref, runCronJob } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SERVING_LABEL, SUSPEND_AFTER } from "../control/endpoints.ts";
@@ -81,19 +81,24 @@ async function gateways(): Promise<string[]> {
 /**
  * The tests' own S3 identity, admin of every bucket, which no part of alasio is: each of
  * the stack's identities reaches its own buckets alone, and the tests make buckets of their
- * own. It is added as an operator would add one, through weed shell, to the filer's
- * identities, which the gateways take beside those of their file, and removed after.
+ * own. It is added as an operator would add one, through weed shell, signing its calls with
+ * the filers' signing key, which their IAM service takes calls signed with alone, to the
+ * filer's identities, which the gateways take beside those of their file, and removed after.
  */
 const E2E_S3 = { user: "e2e", accessKey: `e2e${randomUUID().replaceAll("-", "").slice(0, 16)}`, secretKey: randomUUID() };
 
 /** A shell's prelude that makes its aws commands the tests' own identity's. */
 const AS_E2E = `export AWS_ACCESS_KEY_ID=${E2E_S3.accessKey} AWS_SECRET_ACCESS_KEY=${E2E_S3.secretKey}`;
 
-/** What weed shell answers `command`, run in a gateway's buckets container, as alasio makes its buckets there. */
+/**
+ * What weed shell answers `command`, run in a gateway's buckets container, as alasio makes its
+ * buckets there, with the filers' signing key, as an operator who administers the store has it.
+ */
 async function weedShell(command: string): Promise<string> {
   const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+  const key = await kube.secret(NAMESPACE, componentName("seaweedfs-filer-security"), "filer-signing-key");
   const shell = `printf '%s\\n' "$1" | weed shell -master=${componentName("seaweedfs-master")}:9333 -filer=${componentName("seaweedfs-filer")}:8888`;
-  return kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", shell, "sh", command], { container: "buckets" });
+  return kube.execOk(NAMESPACE, gateway, ["env", `WEED_JWT_FILER_SIGNING_KEY=${key}`, "/bin/sh", "-c", shell, "sh", command], { container: "buckets" });
 }
 
 /** Adds the tests' own S3 identity, and waits until every gateway takes it. */
@@ -179,6 +184,91 @@ async function secondServer(name: string, server: string): Promise<string> {
   }
   return second;
 }
+
+/** The object store's parts behind its gateways, by component, on each of their ports but their metrics'. */
+const STORE_PARTS_PORTS = [["seaweedfs-master", 9333], ["seaweedfs-master", 19333], ["seaweedfs-volume", 8080], ["seaweedfs-volume", 18080], ["seaweedfs-filer", 8888], ["seaweedfs-filer", 18888]] as const;
+
+/**
+ * A pod the object store's parts admit as they do the lifecycle pass, on every port of theirs
+ * (cli/src/manifests/network-policies.ts), of the pass's own template: idle, with alasio's
+ * image, the pass's configuration where it reads it, and a volume server's certificate at
+ * /probe/volume. Its name, once it runs.
+ */
+async function storeProbe(): Promise<string> {
+  const template = (await kube.get<V1CronJob>(ref("CronJob", componentName("seaweedfs-lifecycle"), NAMESPACE)))?.spec?.jobTemplate.spec?.template;
+  const expiry = template?.spec?.containers.find(({ name }) => name === "neon-expiry");
+  assert.ok(template?.spec && expiry, "the lifecycle pass has no expiry");
+  const name = componentName("seaweedfs-probe");
+  const pod: V1Pod = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} },
+    spec: {
+      ...template.spec,
+      restartPolicy: "Never",
+      containers: [{
+        name: "probe",
+        image: expiry.image ?? assert.fail("the expiry names no image"),
+        imagePullPolicy: expiry.imagePullPolicy ?? "IfNotPresent",
+        args: ["sleep", "infinity"],
+        securityContext: expiry.securityContext ?? {},
+        resources: expiry.resources ?? {},
+        volumeMounts: [{ name: "config", mountPath: "/etc/seaweedfs", readOnly: true }, { name: "volume", mountPath: "/probe/volume", readOnly: true }],
+      }],
+      volumes: [
+        ...(template.spec.volumes ?? []),
+        { name: "volume", secret: { secretName: componentName("seaweedfs-volume-security"), defaultMode: 0o440, items: ["tls.crt", "tls.key"].map((key) => ({ key, path: key })) } },
+      ],
+    },
+  };
+  await kube.apply(pod);
+  try {
+    for (const deadline = Date.now() + 300_000; !(await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.containerStatuses?.[0]?.state?.running; await sleep(2000)) {
+      assert.ok(Date.now() < deadline, `${name} does not run: ${await eventsOf(name, 5)}`);
+    }
+  } catch (error) {
+    await kube.remove(ref("Pod", name, NAMESPACE)).catch(() => {});
+    throw error;
+  }
+  return name;
+}
+
+/**
+ * Node code that makes a gRPC call to the host:port its first argument names, of a method no
+ * server has, and prints "answered" where the server answers it, as it does past its TLS, with
+ * a gRPC status, and "refused" where the connection ends first, as a TLS server's refusal does:
+ * in plaintext, where its second argument says "plaintext"; over TLS, trusting the store's
+ * authority alone, without a certificate where it says "anonymous", and with the certificate
+ * of the directory it names otherwise. The server's name is not checked, as SeaweedFS's
+ * clients do not check it. "unanswered" after ten seconds.
+ */
+const GRPC_CALL = String.raw`
+const http2 = require("node:http2");
+const fs = require("node:fs");
+const [target, as] = process.argv.slice(1);
+const done = (said) => { console.log(said); process.exit(0); };
+const tls = as === "plaintext" ? null : {
+  ca: fs.readFileSync("/etc/seaweedfs/tls/ca.crt"),
+  ...(as === "anonymous" ? {} : { cert: fs.readFileSync(as + "/tls.crt"), key: fs.readFileSync(as + "/tls.key") }),
+  checkServerIdentity: () => undefined,
+};
+setTimeout(() => done("unanswered"), 10000);
+const session = http2.connect((tls ? "https://" : "http://") + target, tls ?? {});
+session.on("error", () => done("refused"));
+session.on("close", () => done("refused"));
+const call = session.request({ ":method": "POST", ":path": "/alasio.Probe/Probe", "content-type": "application/grpc", te: "trailers" });
+call.on("response", (headers) => { if (headers["grpc-status"] !== undefined) done("answered"); });
+call.on("trailers", (trailers) => done(trailers["grpc-status"] === undefined ? "refused" : "answered"));
+call.on("error", () => done("refused"));
+call.end(Buffer.alloc(5));
+`;
+
+/** Node code that asks its second argument, a URL, by its first, a method, with its third as its bearer token where it is one: the status it is answered. */
+const HTTP_CALL = String.raw`
+const [method, url, bearer] = process.argv.slice(1);
+fetch(url, { method, headers: bearer ? { authorization: "Bearer " + bearer } : {}, ...(method === "PUT" ? { body: "probe" } : {}) })
+  .then((response) => console.log(response.status), (error) => console.log("unanswered: " + error.message));
+`;
 
 let privateKey: string;
 const token = (scope: string) => signToken(privateKey, scope);
@@ -1325,15 +1415,48 @@ export function neonStack(): void {
         }
       });
 
-      test("the object store's parts refuse the stack's other pods: the lake reaches a gateway's S3 port, and neither its gRPC and metrics ports, nor any master, volume server or filer", async () => {
+      test("the object store's parts refuse the stack's other pods and the node agents: the lake reaches a gateway's S3 port, and neither reaches its gRPC and metrics ports, nor any master, volume server or filer on any port", async () => {
         const lake = await kube.runningPod(NAMESPACE, componentName("lake-query"));
+        const [agent] = (await nodeAgents()).values();
+        assert.ok(agent, "no node agent runs");
         const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
-        const reached = async (pod: string, port: number) => reachability(inContainer(NAMESPACE, lake, "query"), JSON.stringify(await addressOf(pod)), port);
         const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
-        assert.equal(await reached(gateway, 8333), "open");
-        for (const port of [18333, 9327]) assert.equal(await reached(gateway, port), "blocked", `seaweedfs:${port}`);
-        for (const [part, port] of [["seaweedfs-master", 9333], ["seaweedfs-master", 19333], ["seaweedfs-volume", 8080], ["seaweedfs-filer", 8888], ["seaweedfs-filer", 18888]] as const) {
-          assert.equal(await reached(`${componentName(part)}-0`, port), "blocked", `${part}:${port}`);
+        assert.equal(await reachability(inContainer(NAMESPACE, lake, "query"), JSON.stringify(await addressOf(gateway)), 8333), "open");
+        for (const [source, run] of [["the lake", inContainer(NAMESPACE, lake, "query")], ["a node agent", inContainer(NAMESPACE, agent, "node-agent")]] as const) {
+          for (const [pod, port] of [[gateway, 18333] as const, [gateway, 9327] as const, ...STORE_PARTS_PORTS.map(([part, port]) => [`${componentName(part)}-0`, port] as const)]) {
+            assert.equal(await reachability(run, JSON.stringify(await addressOf(pod)), port), "blocked", `${source}: ${pod}:${port}`);
+          }
+        }
+      });
+
+      test("the object store's parts take gRPC from one another alone, over mutual TLS: none answers a plaintext call or one without a certificate, nor one of a part its port does not take, though the network admits each; and the filers answer no request over HTTP that their keys did not sign, the lake's token reading the lake's entries alone", async () => {
+        const probe = await storeProbe();
+        try {
+          const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
+          const [master, volume, filer, gateway] = await Promise.all([`${componentName("seaweedfs-master")}-0`, `${componentName("seaweedfs-volume")}-0`, `${componentName("seaweedfs-filer")}-0`, kube.runningPod(NAMESPACE, componentName("seaweedfs"))].map(async (pod) => addressOf(await pod)));
+          const called = async (address: string | undefined, port: number, as: string) => (await kube.execOk(NAMESPACE, probe, ["node", "-e", GRPC_CALL, `${address}:${port}`, as])).trim();
+          for (const [address, port] of [[master, 19333], [volume, 18080], [filer, 18888], [gateway, 18333]] as const) {
+            // The network admits the probe as the lifecycle pass, which every gRPC port takes.
+            assert.equal(await reachability(inContainer(NAMESPACE, probe, "probe"), JSON.stringify(address), port), "open", `${address}:${port}`);
+            assert.equal(await called(address, port, "plaintext"), "refused", `plaintext to ${port}`);
+            assert.equal(await called(address, port, "anonymous"), "refused", `no certificate to ${port}`);
+            assert.equal(await called(address, port, "/etc/seaweedfs/tls"), "answered", `the lifecycle pass's to ${port}`);
+          }
+          // A volume server's certificate, which the masters take, but neither the filers nor the gateways' gRPC port.
+          assert.equal(await called(master, 19333, "/probe/volume"), "answered");
+          assert.equal(await called(filer, 18888, "/probe/volume"), "refused");
+          assert.equal(await called(gateway, 18333, "/probe/volume"), "refused");
+          // The filers' HTTP port: nothing unsigned, and the lake's token reads the lake's entries, and nothing else.
+          const token = await kube.secret(NAMESPACE, componentName("lake"), "LAKE_STORE_FILER_TOKEN");
+          const { allowed_prefixes: [lake] = [] } = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString()) as { allowed_prefixes?: string[] };
+          const asked = async (method: string, path: string, bearer = "") => Number((await kube.execOk(NAMESPACE, probe, ["node", "-e", HTTP_CALL, method, `http://${filer}:8888${path}`, bearer])).trim());
+          assert.equal(await asked("GET", `${lake}/?limit=1`), 401);
+          assert.equal(await asked("PUT", `${lake}/unsigned`), 401);
+          assert.equal(await asked("GET", `${lake}/?limit=1`, token), 200);
+          assert.equal(await asked("GET", "/buckets/neon/?limit=1", token), 401);
+          assert.equal(await asked("PUT", `${lake}/signed`, token), 401);
+        } finally {
+          await kube.remove(ref("Pod", probe, NAMESPACE));
         }
       });
 

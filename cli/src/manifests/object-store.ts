@@ -23,7 +23,9 @@
  * And the periodic pass that applies the lifecycle rules, expires what of Neon's bucket Neon
  * needs no more, and copies again what has fewer copies than it should; and the filer store's
  * backups. The identities the gateways take are the stack's setup's, as are the filer store's
- * users' passwords.
+ * users' passwords, and what the parts prove themselves to each other with: each its
+ * certificate on their gRPC ports, mutual TLS throughout, and the filers' signing keys on
+ * their HTTP port (storeSecurityToml).
  */
 import type {
   KubernetesObject,
@@ -39,12 +41,14 @@ import type {
   V1ServicePort,
   V1StatefulSet,
   V1Volume,
+  V1VolumeProjection,
   V1WeightedPodAffinityTerm,
 } from "@kubernetes/client-node";
 
+import { commonName, type StorePart } from "../../../neon/control/store-security.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { BACKGROUND_CPU, claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, s3Endpoint, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { BACKGROUND_CPU, claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, s3Endpoint, scaled, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -100,6 +104,115 @@ const PORTS = {
   filer: [{ name: "http", port: 8888 }, { name: "grpc", port: 18888 }],
   gateway: [{ name: "s3", port: 8333 }, { name: "s3-grpc", port: 18333 }],
 };
+
+/** The component of each part that holds a certificate (neon/control/store-security.ts), by which its pods are told. */
+export const PART_COMPONENTS: Record<StorePart, string> = {
+  master: COMPONENTS.master,
+  volume: COMPONENTS.volumeServer,
+  filer: COMPONENTS.filer,
+  gateway: COMPONENTS.gateway,
+  lifecycle: LIFECYCLE_COMPONENT,
+};
+
+/**
+ * The parts each part that serves takes, on its HTTP and gRPC ports alike
+ * (./network-policies.ts partPolicies), and on its gRPC port by their certificates alone
+ * (storeSecurityToml); the gateways, on their gRPC port alone, their S3 port being the stack's
+ * (gatewayPolicy):
+ *
+ * - the masters, by each other, in Raft, and by every part that asks them where volumes
+ *   are, or registers;
+ * - the volume servers, by each other, which copy what they are written to the others, the
+ *   masters, which compact their volumes, the filers and gateways, which read and write
+ *   objects' chunks there, and the lifecycle pass, which copies volumes again;
+ * - the filers, by each other, which follow each other's changes, the gateways, and the
+ *   lifecycle pass, which replays their log;
+ * - the gateways, by the lifecycle pass, which deletes through them.
+ *
+ * The `weed shell` beside each gateway, which makes the buckets, is of the gateway's pod, and
+ * dials as the gateway.
+ */
+export const PEERS: Record<Exclude<StorePart, "lifecycle">, readonly StorePart[]> = {
+  master: ["master", "volume", "filer", "gateway", "lifecycle"],
+  volume: ["volume", "master", "filer", "gateway", "lifecycle"],
+  filer: ["filer", "gateway", "lifecycle"],
+  gateway: ["lifecycle"],
+};
+
+/** The Secret of `part`'s certificate, its authority's, and the filers' signing keys where it takes them, as the stack's setup renders it (neon/control/kube-setup.ts). */
+export const storePartSecret = (part: StorePart): string => componentName(`seaweedfs-${part}-security`);
+
+/** The ConfigMap of the store's security.toml (storeSecurityToml), which every part reads. */
+export const SECURITY = componentName("seaweedfs-security");
+
+/** Where each part reads SeaweedFS's configuration from, its security.toml among it, and its certificate's files under TLS_DIRECTORY. */
+const CONFIG_DIRECTORY = "/etc/seaweedfs";
+const TLS_DIRECTORY = `${CONFIG_DIRECTORY}/tls`;
+
+/**
+ * The store's security.toml, which every part reads, each its own certificate under
+ * TLS_DIRECTORY: its gRPC, mutual TLS, each part presenting its certificate as a server
+ * ([grpc.master], [grpc.volume], [grpc.filer] and the gateways' [grpc.s3]) and as a client
+ * (the same sections, but for the gateways and `weed shell`, which dial as [grpc.client]),
+ * and each server taking the certificates of its authority, ca.crt, of the parts it takes
+ * (PEERS) alone, by their common names; a plaintext connection is refused. And the filers take
+ * requests over HTTP, and calls of their IAM service, signed with their signing keys alone, of
+ * writes and of reads, which no part makes, nor anything but main's lake's reconciliation, its
+ * reads of the lake's entries (neon/control/store-security.ts filerReadToken). The keys are the
+ * filers' environment's (FILER_SIGNING_KEYS), not this file's, which is no Secret. The gateways
+ * hold none: SeaweedFS 4.48's lifecycle pass signs no call of theirs, which a gateway with the
+ * key of writes would take no more; their gRPC port takes the pass's certificate alone.
+ */
+export function storeSecurityToml(): string {
+  const section = (name: string, peers?: readonly StorePart[]) => [
+    `[grpc.${name}]`,
+    `cert = "${TLS_DIRECTORY}/tls.crt"`,
+    `key = "${TLS_DIRECTORY}/tls.key"`,
+    ...(peers ? [`allowed_commonNames = "${peers.map(commonName).join(",")}"`] : []),
+    "",
+  ];
+  return [
+    "[grpc]",
+    `ca = "${TLS_DIRECTORY}/ca.crt"`,
+    "",
+    ...section("master", PEERS.master),
+    ...section("volume", PEERS.volume),
+    ...section("filer", PEERS.filer),
+    ...section("s3", PEERS.gateway),
+    ...section("client"),
+  ].join("\n");
+}
+
+/**
+ * The volume `name` of a part's configuration, mounted at CONFIG_DIRECTORY: the store's
+ * security.toml, `part`'s certificate and its authority's, which the part's user alone reads,
+ * and what of its own `others` project there.
+ */
+function configVolume(name: string, part: StorePart, others: readonly V1VolumeProjection[] = []): V1Volume {
+  return {
+    name,
+    projected: {
+      defaultMode: 0o440,
+      sources: [
+        ...others,
+        { configMap: { name: SECURITY } },
+        { secret: { name: storePartSecret(part), items: ["ca.crt", "tls.crt", "tls.key"].map((key) => ({ key, path: `tls/${key}` })) } },
+      ],
+    },
+  };
+}
+
+/** The mount of a part's configuration volume `name` (configVolume), where SeaweedFS reads it. */
+const configMount = (name: string) => ({ name, mountPath: CONFIG_DIRECTORY, readOnly: true });
+
+/** The annotation of each part's pods, which restarts them as the store's security.toml changes, which they read as they start alone. */
+const securityChecksum = () => ({ "checksum/security": sha256(storeSecurityToml()) });
+
+/** The filers' signing keys, of writes and of reads, of their Secret, which they take requests over HTTP, and calls of their IAM service, signed with alone. */
+const FILER_SIGNING_KEYS: V1EnvVar[] = [
+  { name: "WEED_JWT_FILER_SIGNING_KEY", valueFrom: { secretKeyRef: { name: storePartSecret("filer"), key: "filer-signing-key" } } },
+  { name: "WEED_JWT_FILER_SIGNING_READ_KEY", valueFrom: { secretKeyRef: { name: storePartSecret("filer"), key: "filer-signing-read-key" } } },
+];
 
 /**
  * The lifecycle rule of each bucket a writer puts files larger than a part into, in parts: a
@@ -176,7 +289,7 @@ function partStatefulSet(
       podManagementPolicy: ordered ? "OrderedReady" : "Parallel",
       selector: { matchLabels: selectorLabels(component) },
       template: {
-        metadata: { labels: stackLabels(component) },
+        metadata: { labels: stackLabels(component), annotations: securityChecksum() },
         spec: {
           ...priority(storage ? "bound" : "floor"),
           ...stackPodSpec(config),
@@ -194,7 +307,8 @@ function partStatefulSet(
 
 /**
  * The container of a part, `name`, running `weed` with `args`, probed at `path` on its HTTP
- * port; of a part with a volume, the `server` on it at /data.
+ * port, its configuration the volume "config" (configVolume); of a part with a volume, the
+ * `server` on it at /data.
  */
 function partContainer(
   config: InstallConfig,
@@ -225,7 +339,7 @@ function partContainer(
     livenessProbe: { ...probe, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
     securityContext: restrictedContainer(),
     ...(resources ? { resources } : {}),
-    ...(server ? { volumeMounts: [{ name: "data", mountPath: "/data" }] } : {}),
+    volumeMounts: [configMount("config"), ...(server ? [{ name: "data", mountPath: "/data" }] : [])],
   };
 }
 
@@ -250,7 +364,7 @@ function masterObjects(config: InstallConfig): KubernetesObject[] {
     "-telemetry=false",
   ];
   const container = partContainer(config, "master", args, "/cluster/status", 9333, bundled.masters.resources, "master");
-  const statefulSet = partStatefulSet(config, MASTER, COMPONENTS.master, scaling, { containers: [container] }, bundled.masters.storage);
+  const statefulSet = partStatefulSet(config, MASTER, COMPONENTS.master, scaling, { containers: [container], volumes: [configVolume("config", "master")] }, bundled.masters.storage);
   return [headless(MASTER, COMPONENTS.master, PORTS.master), statefulSet, ...replicaBudget(COMPONENTS.master, NAMESPACE, scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
@@ -275,7 +389,7 @@ function volumeServerObjects(config: InstallConfig): KubernetesObject[] {
     "-rack=rack1",
   ];
   const container = partContainer(config, "volume", args, "/status", 8080, volumeServers.resources, "volume server");
-  const statefulSet = partStatefulSet(config, VOLUME_SERVER, COMPONENTS.volumeServer, volumeServers.scaling, { containers: [container] }, volumeServers.storage, {
+  const statefulSet = partStatefulSet(config, VOLUME_SERVER, COMPONENTS.volumeServer, volumeServers.scaling, { containers: [container], volumes: [configVolume("config", "volume")] }, volumeServers.storage, {
     strictly: bundled.replication !== "000",
   });
   return [
@@ -331,15 +445,15 @@ function filerObjects(config: InstallConfig): KubernetesObject[] {
   const args = ["filer", `-master=${masters(config)}`, ownAddress(FILER_PEERS), "-ip.bind=0.0.0.0", "-defaultStoreDir=/tmp"];
   const container: V1Container = {
     ...partContainer(config, "filer", args, "/healthz", 8888, filers.resources),
-    env: [...POD_ENV, { name: "WEED_REDIS2_PASSWORD", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }],
-    volumeMounts: [{ name: "config", mountPath: "/etc/seaweedfs", readOnly: true }, { name: "tmp", mountPath: "/tmp" }],
+    env: [...POD_ENV, { name: "WEED_REDIS2_PASSWORD", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }, ...FILER_SIGNING_KEYS],
+    volumeMounts: [configMount("config"), { name: "tmp", mountPath: "/tmp" }],
   };
   const statefulSet = partStatefulSet(
     config,
     FILER,
     COMPONENTS.filer,
     filers.scaling,
-    { initContainers, containers: [container], volumes: [{ name: "config", configMap: { name: FILER } }, { name: "tmp", emptyDir: {} }] },
+    { initContainers, containers: [container], volumes: [configVolume("config", "filer", [{ configMap: { name: FILER } }]), { name: "tmp", emptyDir: {} }] },
     undefined,
     { service: FILER_PEERS, ordered: true },
   );
@@ -454,7 +568,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
       ...replicasOf(scaling),
       selector: { matchLabels: selectorLabels(COMPONENTS.gateway) },
       template: {
-        metadata: { labels: stackLabels(COMPONENTS.gateway) },
+        metadata: { labels: stackLabels(COMPONENTS.gateway), annotations: securityChecksum() },
         spec: {
           ...priority("floor"),
           ...stackPodSpec(config),
@@ -494,7 +608,8 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               livenessProbe: { httpGet: { path: "/healthz", port: "s3" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
               securityContext: restrictedContainer(),
               resources: bundled.gateways.resources,
-              volumeMounts: [{ name: "identities", mountPath: "/etc/seaweedfs", readOnly: true }],
+              // Its identities beside its configuration.
+              volumeMounts: [configMount("config")],
             },
             // Makes the buckets, idempotently, as the gateway starts: Neon's versioned (its
             // time-travel recovery needs that), writes fsynced. One a gateway beside it has
@@ -535,7 +650,8 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               readinessProbe: ready,
               securityContext: restrictedContainer(),
               resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
-              volumeMounts: [{ name: "shell-tmp", mountPath: "/tmp" }],
+              // Its configuration, the gateway's, but for its identities.
+              volumeMounts: [configMount("security"), { name: "shell-tmp", mountPath: "/tmp" }],
             },
             // Gives each bucket written in parts its lifecycle rule once it exists.
             {
@@ -573,7 +689,8 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
             },
           ],
           volumes: [
-            { name: "identities", secret: { secretName: neonName("seaweedfs") } },
+            configVolume("config", "gateway", [{ secret: { name: neonName("seaweedfs") } }]),
+            configVolume("security", "gateway"),
             { name: "shell-tmp", emptyDir: {} },
             { name: "lifecycle-tmp", emptyDir: {} },
           ],
@@ -655,7 +772,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                 ],
                 securityContext: restrictedContainer(),
                 resources: { requests: { cpu: BACKGROUND_CPU, memory: "32Mi" }, limits: { memory: "256Mi" } },
-                volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+                volumeMounts: [configMount("config"), { name: "tmp", mountPath: "/tmp" }],
               }, {
                 name: "neon-expiry",
                 image: imageReference(config.images.alasio),
@@ -677,7 +794,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                 securityContext: restrictedContainer(),
                 resources: { requests: { cpu: BACKGROUND_CPU, memory: "128Mi" }, limits: { memory: "512Mi" } },
               }],
-              volumes: [{ name: "tmp", emptyDir: {} }],
+              volumes: [configVolume("config", "lifecycle"), { name: "tmp", emptyDir: {} }],
             },
           },
         },
@@ -914,7 +1031,14 @@ export function filerStoreRestore(config: InstallConfig, file: string): Kubernet
 /** The bundled object store's objects, when it runs. */
 export function objectStoreObjects(config: InstallConfig): KubernetesObject[] {
   if (!config.objectStore.bundled.enabled) return [];
+  const security: V1ConfigMap = {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: { name: SECURITY, namespace: NAMESPACE, labels: stackLabels(COMPONENTS.gateway) },
+    data: { "security.toml": storeSecurityToml() },
+  };
   return [
+    security,
     ...masterObjects(config),
     ...volumeServerObjects(config),
     ...filerStoreObjects(config),

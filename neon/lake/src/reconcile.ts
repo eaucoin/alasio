@@ -195,9 +195,10 @@ export class StoreUndecided extends Error {
 /** How long a part of the store is given to answer. */
 const PART_TIMEOUT_MS = 10_000;
 
-/** A part of the store's answer to `url`: its status, and its body, parsed as JSON where it is. */
-async function asked(url: string, method = "GET"): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(url, { method, headers: { accept: "application/json" }, signal: AbortSignal.timeout(PART_TIMEOUT_MS) });
+/** A part of the store's answer to `url`, asked with `token` where it takes one, as the filer does: its status, and its body, parsed as JSON where it is. */
+async function asked(url: string, { method = "GET", token }: { method?: string; token?: string } = {}): Promise<{ status: number; body: unknown }> {
+  const headers = { accept: "application/json", ...(token === undefined ? {} : { authorization: `Bearer ${token}` }) };
+  const response = await fetch(url, { method, headers, signal: AbortSignal.timeout(PART_TIMEOUT_MS) });
   const text = await response.text();
   let body: unknown = null;
   try {
@@ -221,11 +222,13 @@ async function asked(url: string, method = "GET"): Promise<{ status: number; bod
  * is served, as the failure was then the store's of the moment.
  */
 export async function gone(path: string, store: StoreParts | null, { pulseMs = TOPOLOGY_PULSE_MS }: { pulseMs?: number } = {}): Promise<boolean> {
-  if (store === null) throw new StoreUndecided(path, "the object store is not the bundled one, whose filer and masters would say");
+  if (store === null) {
+    throw new StoreUndecided(path, "no filer and masters of the bundled object store are this reconciliation's to ask: the store is not the bundled one, or the lake is a branch environment's, which reaches none of them");
+  }
   const { bucket, key } = /^s3:\/\/(?<bucket>[^/]+)\/(?<key>.+)$/u.exec(path)?.groups ?? {};
   if (!bucket || !key) throw new StoreUndecided(path, "it is not an s3:// path");
   const undecided = (why: string) => new StoreUndecided(path, why);
-  const entry = await asked(`${store.filer}/buckets/${bucket}/${key.split("/").map(encodeURIComponent).join("/")}?metadata=true`).catch((error: unknown) => {
+  const entry = await asked(`${store.filer}/buckets/${bucket}/${key.split("/").map(encodeURIComponent).join("/")}?metadata=true`, { token: store.filerToken }).catch((error: unknown) => {
     throw undecided(`its filer did not answer: ${error instanceof Error ? error.message : String(error)}`);
   });
   if (entry.status === 404) return true;
@@ -249,7 +252,7 @@ export async function gone(path: string, store: StoreParts | null, { pulseMs = T
     }
     if (lookup.status !== 200 || locations.length === 0) throw undecided(`the masters answered ${lookup.status} for volume ${volume}${error ? `: ${error}` : ""}`);
     const served = await Promise.all(locations.map(({ url }) =>
-      asked(`http://${url}/${fid}`, "HEAD").then(({ status }) => status, () => null)
+      asked(`http://${url}/${fid}`, { method: "HEAD" }).then(({ status }) => status, () => null)
     ));
     if (served.every((status) => status === 404)) return true;
     if (!served.some((status) => status === 200)) throw undecided(`the servers of volume ${volume} answered ${served.map((status) => status ?? "nothing").join(", ")} for chunk ${fid}`);
@@ -298,7 +301,7 @@ async function topologyWhole(store: StoreParts, pulseMs: number): Promise<string
 export async function bucketListed(store: StoreParts, dataPath: string): Promise<void> {
   const bucket = /^s3:\/\/([^/]+)\//u.exec(dataPath)?.[1];
   if (!bucket) return;
-  const listing = await asked(`${store.filer}/buckets/${encodeURIComponent(bucket)}/?limit=1`).catch((error: unknown) => {
+  const listing = await asked(`${store.filer}/buckets/${encodeURIComponent(bucket)}/?limit=1`, { token: store.filerToken }).catch((error: unknown) => {
     throw new Error(`the object store's filer did not answer for /buckets/${bucket}: ${error instanceof Error ? error.message : String(error)}`);
   });
   if (listing.status !== 200) throw new Error(`the object store's filer has no /buckets/${bucket} (${listing.status}), where it keeps the lake's bucket: run the reconciliation again once it does`);

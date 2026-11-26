@@ -563,8 +563,13 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And this release adds none to the stack's.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)), []);
+          // And what the object store's parts prove themselves with, which this release adds to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
+            "storeSecurity.authority",
+            "storeSecurity.filerReadSigningKey",
+            "storeSecurity.filerSigningKey",
+            "storeSecurity.parts",
+          ]);
         },
       },
       {
@@ -4723,6 +4728,16 @@ if (inShard("agents")) {
         ].join("; echo ----; ")).catch(String);
         const answered = await kube.execOk(NAMESPACE, name, ["node", "-e", `fetch("http://${sessionPodIp}:7290/status",{signal:AbortSignal.timeout(3000)}).then(r=>console.log(r.status),e=>console.log(String(e)))`], { container: "harness" }).catch(String);
         assert.fail(`${name} reached ${toTelegram === "blocked" ? "" : `Telegram (its probe answered "${toTelegram}"), `}${toSession === "blocked" ? "" : `the session's pod's port 7290 (its probe answered "${toSession}"), whose bayma answered its /status ${answered.trim()}, `}which its network policies refuse it:\n${said(now)}\n${said(pod)}\nthe rules of ${node}:\n${rules}`);
+      }
+    });
+
+    test("a conversation's harness reaches no part of the object store behind its gateways, on any port, nor the gateways' gRPC port", async () => {
+      const name = (await boundNow()).metadata?.name ?? "";
+      const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
+      const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
+      const parts = [["seaweedfs-master", 9333], ["seaweedfs-master", 19333], ["seaweedfs-volume", 8080], ["seaweedfs-volume", 18080], ["seaweedfs-filer", 8888], ["seaweedfs-filer", 18888]] as const;
+      for (const [pod, port] of [[gateway, 18333] as const, ...parts.map(([part, port]) => [`${componentName(part)}-0`, port] as const)]) {
+        assert.equal(await reachability(inContainer(NAMESPACE, name, "harness"), JSON.stringify(await addressOf(pod)), port), "blocked", `${pod}:${port}`);
       }
     });
 

@@ -50,8 +50,18 @@ interface Store {
   readonly server?: string;
 }
 
-/** What a session must not reach: every store, and the object store's masters, which its writes go through to none of. */
-const UNREACHED: readonly Store[] = [...STORES, { name: MASTER, kind: "StatefulSet", port: 9333 }];
+/**
+ * What a session must not reach: every store, and the object store's masters, which its writes
+ * go through to none of; and every part of the object store's gRPC port.
+ */
+const UNREACHED: readonly Store[] = [
+  ...STORES,
+  { name: MASTER, kind: "StatefulSet", port: 9333 },
+  { name: MASTER, kind: "StatefulSet", port: 19333 },
+  { name: VOLUME_SERVER, kind: "StatefulSet", port: 18080 },
+  { name: FILER, kind: "StatefulSet", port: 18888 },
+  { name: GATEWAY, kind: "Deployment", port: 18333 },
+];
 
 /** A pod of the store `store`'s that runs now. */
 const podOfStore = async ({ name, kind }: Store) => (kind === "Deployment" ? kube.runningPod(NAMESPACE, name) : `${name}-0`);

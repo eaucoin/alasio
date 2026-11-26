@@ -281,10 +281,13 @@ export function lakeReconcile(config: InstallConfig, environment: Environment = 
         sourceEnv(environment),
         // A branch environment's lake's telemetry is main's as of its branch point, which main's reads again.
         ...(environment.branch === null ? [] : [{ name: "LAKE_BRANCH", value: environment.branch }]),
-        // The bundled store's parts, which say whether a file the store fails a read of is gone.
-        ...(config.objectStore.bundled.enabled
+        // The bundled store's parts, which say whether a file the store fails a read of is gone: main's
+        // alone, as a branch environment's reaches none of them (./network-policies.ts partPolicies).
+        ...(config.objectStore.bundled.enabled && environment.branch === null
           ? [
             { name: "LAKE_STORE_FILER_URL", value: `http://${FILER}.${NAMESPACE}.svc:8888` },
+            // What the filers take its reads of the lake's entries by, which reads nothing else.
+            fromSecret("LAKE_STORE_FILER_TOKEN", componentName("lake"), "LAKE_STORE_FILER_TOKEN"),
             { name: "LAKE_STORE_MASTER_URL", value: `http://${MASTER}.${NAMESPACE}.svc:9333` },
             // Every one of which the masters are to know before their not knowing a volume says it is gone.
             { name: "LAKE_STORE_VOLUME_SERVERS", value: String(config.objectStore.bundled.volumeServers.scaling.min) },
