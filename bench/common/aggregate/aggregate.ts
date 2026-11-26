@@ -173,7 +173,7 @@ export function aggregate(results: readonly Result[]): Cell[] {
 
 /** A restore's metrics as its tables show them: its times; the restored sandbox's memory; and its node's. */
 const RESTORE_TABLES: readonly (readonly [string, readonly string[]])[] = [
-  ["", ["first_exec_ms", "orchestration_ms", "policy_wait_ms", "runsc_resume_ms", "resident_ms", "verify_ms"]],
+  ["", ["first_exec_ms", "orchestration_ms", "orchestration_with_client_ms", "policy_wait_ms", "runsc_resume_ms", "resident_ms", "verify_ms"]],
   ["the sandbox's memory", ["memory_peak_bytes", "memory_bytes", "memory_file_bytes", "sandbox_overhead_bytes", "gofer_bytes", "awaited_bytes", "standby_idle_bytes", "sandbox_oom_group", "sandbox_memory_max_bytes"]],
   ["the node's memory", ["node_agent_memory_bytes", "node_agent_anon_bytes", "node_agent_file_bytes", "sandboxes_bound_bytes", "sandboxes_standby_bytes", "sandboxes_free_bytes", "layer_cache_bytes"]],
 ];

@@ -133,6 +133,54 @@ export function resumeSteps(spans: readonly Span[], workspace: string, fromMs: n
 }
 
 /**
+ * A restore's first request at the gateway's front, the probe's MCP initialize: from its receipt,
+ * the start of the first alasio.front.request of `workspace` at or after `t0Ms`, to bayma's answer
+ * of it through the front, the end of the front's request whose trace holds bayma's `initialize`
+ * span within it; where bayma's span is not there, the first request's own end, unless the client
+ * was `refused` and asked again, whose answer then is not told. Null where it is not traced.
+ */
+export function frontWindow(spans: readonly Span[], workspace: string, t0Ms: number, refused: boolean): { readonly receivedNs: bigint; readonly answeredNs: bigint } | null {
+  const fronts = spans.filter((span) => span.name === "alasio.front.request" && span.attributes["alasio.sandbox.name"] === workspace && span.startNs >= msToNs(t0Ms)).toSorted((a, b) => (a.startNs < b.startNs ? -1 : 1));
+  const [first] = fronts;
+  if (first === undefined) return null;
+  const traces = new Set(fronts.map(({ traceId }) => traceId));
+  const initialize = spans.filter((span) => span.name === "initialize" && traces.has(span.traceId) && span.startNs >= first.startNs).reduce<Span | null>((earliest, span) => (earliest === null || span.startNs < earliest.startNs ? span : earliest), null);
+  const carrying = initialize === null ? undefined : fronts.find((span) => span.traceId === initialize.traceId && span.startNs <= initialize.startNs && span.endNs >= initialize.endNs);
+  const answered = carrying ?? (initialize === null && !refused ? first : undefined);
+  return answered === undefined ? null : { receivedNs: first.startNs, answeredNs: answered.endNs };
+}
+
+/** A restore's measures, as its probe and runsc's boot log said them, that its orchestration is read from. */
+export interface Measured {
+  readonly firstExecMs: number | null;
+  readonly probeExecMs: number | null;
+  readonly toRunningMs: number | null;
+  readonly runscResumeMs: number | null;
+}
+
+/**
+ * What of a restore is the product's orchestration, neither runsc's restore to runnable nor its
+ * resume with bayma's hook: of the gateway's part of its first request (frontWindow), from its
+ * receipt to bayma's answer of the MCP initialize, or, where the spans do not say it, of the client's
+ * own view of it, from its first ask to that answer's headers, `requestToAnswerMs` (said `client`);
+ * and, as it was read before, of the probe's first exec from its t0 to its MCP session initialized,
+ * which holds the client's own start, connect and handshake besides (`withClientMs`).
+ */
+export function orchestration(spans: readonly Span[], workspace: string, t0Ms: number, measured: Measured, client: { readonly refused: boolean; readonly requestToAnswerMs: number | null }): {
+  readonly orchestrationMs: number | null;
+  readonly withClientMs: number | null;
+  readonly how: "front" | "client" | null;
+} {
+  const { firstExecMs, probeExecMs, toRunningMs, runscResumeMs } = measured;
+  const excluded = toRunningMs !== null && runscResumeMs !== null ? toRunningMs + runscResumeMs : null;
+  const withClientMs = firstExecMs !== null && probeExecMs !== null && excluded !== null ? firstExecMs - probeExecMs - excluded : null;
+  if (excluded === null) return { orchestrationMs: null, withClientMs, how: null };
+  const front = frontWindow(spans, workspace, t0Ms, client.refused);
+  if (front !== null) return { orchestrationMs: ms(front.answeredNs - front.receivedNs) - excluded, withClientMs, how: "front" };
+  return client.requestToAnswerMs === null ? { orchestrationMs: null, withClientMs, how: null } : { orchestrationMs: client.requestToAnswerMs - excluded, withClientMs, how: "client" };
+}
+
+/**
  * Whether the release's compaction of `workspace`'s chain ran as a phase began at `t0Ms`: started
  * before it, its upload not through by then.
  */

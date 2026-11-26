@@ -48,7 +48,7 @@ import {
 import { mixedLoad } from "./mixed.ts";
 import { bootLog, bootLogs, bucketBytes, countStore, dropPageCache, inAgentNetwork, k3sReady, probeStore, sandboxIdOf, sayK3sRestarted, sayRunner, shapeAgents, storeBytes, vacuum } from "./node.ts";
 import { emit, emitSpans, type Phase, type Result, store } from "./results.ts";
-import { probeExecMs, type Probed, restore, restoreBefore, restoreOutcome, restoreSpanMetrics } from "./restore.ts";
+import { type Client, probeExecMs, type Probed, restore, restoreBefore, restoreOutcome, restoreSpanMetrics } from "./restore.ts";
 import { saveLogged } from "./runsc-log.ts";
 import { awaitSpans, hasSpan, liveDurableMs, releaseDurableMs } from "./spans.ts";
 import { BENCH_DIR, CASES, COMMON, LIVE_SAVES, PAGE_CACHE, PROFILE, RELEASE_UNDER_TEST, RUNS, VARIANT } from "./settings.ts";
@@ -335,7 +335,7 @@ async function written(held: readonly Held[], workspace: string, others: readonl
   for (const { result, fromMs, toMs } of held) {
     const fromSpans = result.phase === "save-live" || result.phase === "save-after-cold" ? { durable_store_ms: liveDurableMs(spans, workspace, fromMs - 1000) }
       : result.phase === "save-stop" ? { durable_store_ms: releaseDurableMs(spans, workspace, key, fromMs - 1000) }
-      : result.phase === "restore-warm" || result.phase === "restore-cold" ? restoreSpanMetrics(spans, workspace, fromMs, result.metrics)
+      : result.phase === "restore-warm" || result.phase === "restore-cold" ? restoreSpanMetrics(spans, workspace, fromMs, result.metrics, (result.details?.["client"] as Client | undefined) ?? null)
       : {};
     const filled: Result = { ...result, metrics: { ...result.metrics, ...fromSpans }, details: { ...result.details, spans: { complete, waited_ms } } };
     emit(filled);
