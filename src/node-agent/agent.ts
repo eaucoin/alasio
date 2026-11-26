@@ -437,6 +437,18 @@ export class Unrestorable extends Schema.TaggedError<Unrestorable>()("Unrestorab
  * The agent is stopping, so it prepares no restore of the workspace from the bucket, which
  * would read through it after it stopped (./store-proxy.ts): the next agent of its node does.
  */
+/** The node was not admitted to the bundled store within a prepare's wait for it, so the restore by URLs that it prepares could not reach the store. */
+export class NodeNotAdmitted extends Schema.TaggedError<NodeNotAdmitted>()("NodeNotAdmitted", {
+  node: Schema.String,
+  environment: Schema.String,
+  workspace: Schema.String,
+  waitedMs: Schema.Number,
+}) {
+  override get message(): string {
+    return `the node agent of ${this.node} prepares no restore of ${this.environment}/${this.workspace} by URLs: the bundled store's policy, which the sandbox gateway keeps, did not admit the node within ${this.waitedMs / 1000} s`;
+  }
+}
+
 export class AgentStopping extends Schema.TaggedError<AgentStopping>()("AgentStopping", {
   environment: Schema.String,
   workspace: Schema.String,
@@ -728,7 +740,7 @@ export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()
 class WrittenMeanwhile extends Schema.TaggedError<WrittenMeanwhile>()("WrittenMeanwhile", {}) {}
 
 /** How preparing a snapshot fails. */
-export type PrepareError = Unrestorable | SnapshotCorrupt | AgentStopping | S3Error | CacheError | RunscError;
+export type PrepareError = Unrestorable | SnapshotCorrupt | AgentStopping | NodeNotAdmitted | S3Error | CacheError | RunscError;
 
 /** How resuming a sandbox fails. */
 export type ResumeError = PodNotRunning | KubeApiError | PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | NotAccepting | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
@@ -794,9 +806,11 @@ export interface NodeAgentOptions {
   readonly goferReads: GoferReads;
   /**
    * Ends once the node is admitted to the store its restores by URLs read, which each such
-   * prepare waits on first (./store-admission.ts); at once unless told.
+   * prepare waits on first (./store-admission.ts), for ADMISSION_WAIT_MS at most
+   * (admissionWaitMs), failing NodeNotAdmitted past it; at once unless told.
    */
   readonly admitted?: Effect.Effect<void>;
+  readonly admissionWaitMs?: number;
   /** The first gVisor release that reads a restore's files by presigned URLs (restoresByUrl); none where empty, each restore then read through storeProxy. */
   readonly restoresByUrlSince: string;
   readonly host: HostCommands;
@@ -863,6 +877,13 @@ export interface NodeAgentOptions {
 
 /** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
 export const GOFER_OPTIONS_FILE = "s3_opts.json";
+/**
+ * How long a prepare of a restore by URLs waits for its node to be admitted to the store at most:
+ * long past the few seconds the gateway takes to admit a node that joined (its rounds 15 s apart),
+ * short of what alasio waits for a prepare, so that one that is not is told as such.
+ */
+export const ADMISSION_WAIT_MS = 30_000;
+
 /** The file, beside the gofer's options of a restore that reads the bucket by URLs, its gofer counts the bytes of pages it read in (served_file), as `served-<nonce>`, a name of its restore's own. */
 export const SERVED_FILE = "served";
 /**
@@ -1255,7 +1276,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, goferReads, admitted = Effect.void, restoresByUrlSince, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, restoresWithETagsSince, restoresWithPagesCacheSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache: given, bucket, storeProxy, goferReads, admitted = Effect.void, admissionWaitMs = ADMISSION_WAIT_MS, restoresByUrlSince, host, restoresFromBucketSince, savesWithLoadWaitSince, savesSummarySince, restoresWithETagsSince, restoresWithPagesCacheSince, loadWait = {}, backgroundReadMs, loadingSave = {}, inspectTimeoutMs = INSPECT_TIMEOUT_MS, pods, onePassSaves = false, compacted: recordCompacted, restores = new Restores() }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   /** How many calls of the cache's may have changed what it holds: what holdingsAfter waits on, and what holdings reads its listing as of. */
   const cacheChanges = yield* SubscriptionRef.make(0);
   const cache = telling(given, SubscriptionRef.update(cacheChanges, (count) => count + 1));
@@ -2784,7 +2805,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           // Straight from the store, by a URL of each file it reads, signed by the agent's keys: its gofer holds none, its
           // reads followed by what it counts beside its options, in a file of this restore's own, as a gofer of an earlier
           // restore of the snapshot may count in the directory made anew yet. The node admitted to the store first.
-          yield* admitted.pipe(step("alasio.node_agent.prepare.admitted", ref));
+          yield* admitted.pipe(
+            Effect.timeoutOrElse({ duration: admissionWaitMs, orElse: () => Effect.fail(new NodeNotAdmitted({ node, environment, workspace, waitedMs: admissionWaitMs })) }),
+            step("alasio.node_agent.prepare.admitted", ref),
+          );
           const servedFile = join(cache.remote(environment, workspace, snapshot), `${SERVED_FILE}-${randomBytes(8).toString("hex")}`);
           const { reader: following, urlsFile } = yield* goferReads.follow(prefixOf(ref), servedFile, objectsRead(ref, manifest)).pipe(step("alasio.node_agent.prepare.urls", ref));
           const etags = checked ? etagsOf(manifest.layers) : null;

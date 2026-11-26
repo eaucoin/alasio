@@ -298,6 +298,7 @@ const STATUS: Readonly<Record<string, number>> = {
   SnapshotCorrupt: 422,
   S3Error: 502,
   AgentStopping: 503,
+  NodeNotAdmitted: 503,
   SnapshotOutlived: 410,
   PoliciesNotInForce: 504,
   PodNotRunning: 504,

@@ -162,7 +162,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     ));
     yield* Effect.forkScoped(Effect.repeat(sessions.collect, Schedule.spaced(COLLECT_MS)));
     // The cluster's nodes admitted to the bundled store, which restores read from the nodes' networks, where they do (./store-admission.ts).
-    if (config.storeFromNodes) yield* Effect.forkScoped(keepNodesAdmitted(yield* KubeClient, config.storeFromNodes.namespace, config.storeFromNodes.name));
+    if (config.storeFromNodes) yield* Effect.forkScoped(keepNodesAdmitted(yield* KubeClient, config.storeFromNodes.namespace, config.storeFromNodes.name, config.storeFromNodes.storeLabels));
     // The folder instances', as often: each idle one released, and each whose bayma ended.
     if (folders) {
       yield* Effect.forkScoped(Effect.repeat(

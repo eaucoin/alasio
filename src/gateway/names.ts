@@ -258,10 +258,10 @@ export const GatewayConfig = Schema.Struct({
   receiver: Schema.NullOr(Schema.Struct({ host: Schema.String, port: Schema.Number })),
   /**
    * The NetworkPolicy that admits the cluster's nodes to the bundled store, by its namespace and
-   * name, which the gateway alone writes (./store-admission.ts); none where restores do not read
-   * the store from the nodes' networks.
+   * name, and the labels of the store's pods, which it selects, which the gateway alone writes
+   * (./store-admission.ts); none where restores do not read the store from the nodes' networks.
    */
-  storeFromNodes: Schema.NullOr(Schema.Struct({ namespace: Schema.String, name: Schema.String })),
+  storeFromNodes: Schema.NullOr(Schema.Struct({ namespace: Schema.String, name: Schema.String, storeLabels: Schema.Record(Schema.String, Schema.String) })),
   /**
    * Folder conversations' instances (./folders.ts): the namespace they run in, the template of
    * their pods, as `alasio up` renders it of the host profile, the directory under which each

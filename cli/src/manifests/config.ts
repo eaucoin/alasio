@@ -353,7 +353,11 @@ const Snapshots = Schema.Struct({
    * store's S3 port, as every node is, by its addresses (src/node-agent/store-urls.ts,
    * src/gateway/store-admission.ts), sparing the agent the work of the proxy. Chosen here, at install time,
    * and said by the agent's metric alasio.node_agent.restore_read_path; a restore never falls
-   * back from one to the other. `proxy` unless said.
+   * back from one to the other. `proxy` unless said. A node's addresses are taken to be those of
+   * k3s's CNI, flannel, whose host-side interfaces a node reaches the store's pods from: under
+   * another, its restores by URLs reach the store on no node but the store's own. So `presigned`
+   * is not to be made the default before a test of two nodes, on a release that reads by URLs,
+   * has shown a restore read the store across them.
    */
   restoreReads: defaulted(Schema.Literals(["proxy", "presigned"]), "proxy"),
   /**

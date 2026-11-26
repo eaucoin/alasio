@@ -1,7 +1,7 @@
 /**
  * The bundled store's admission of the cluster's nodes (src/gateway/store-admission.ts): the
- * sandbox gateway, its one writer, keeps the policy of the store's S3 port admitting each node's
- * addresses, as its Node object says them, and no other.
+ * sandbox gateway, its one writer, keeps the policy of the store's S3 port, its whole spec,
+ * admitting each node's addresses, as its Node object says them, and no other.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -64,6 +64,9 @@ const admitted = (policy: KubernetesObject | null) => {
 
 const PORT = [{ protocol: "TCP", port: 8333 }];
 
+/** The labels of the store's pods, as the gateway is given them. */
+const STORE_LABELS = { "app.kubernetes.io/component": "seaweedfs" };
+
 test("a range's start is its network address and the one after it, of IPv4 and IPv6, nothing of what is not a range", () => {
   assert.deepEqual(rangeStart("10.42.1.0/24"), ["10.42.1.0", "10.42.1.1"]);
   assert.deepEqual(rangeStart("10.42.255.255/32"), ["10.42.255.255", "10.43.0.0"]);
@@ -84,9 +87,9 @@ test("a node's addresses are its InternalIP and ExternalIP ones and the start of
   assert.deepEqual(nodeAddressesOf({ metadata: { name: "node-3" } }), []);
 });
 
-test("the gateway has the policy admit every address the cluster's nodes hold to the store's S3 port and no other, as the nodes are: a node that joins is admitted, one gone is dropped, none leaves no rule that would admit everyone, and a write that finds the policy written since reads it again", async () => {
+test("the gateway has the policy admit every address the cluster's nodes hold to the store's S3 port and no other, as the nodes are, its whole spec its own: a node that joins is admitted, one gone is dropped, none leaves no rule that would admit everyone, a rule, a selector or types changed by anyone else are set back, and a write that finds the policy written since reads it again", async () => {
   const { state, kube } = fakeKube(structuredClone(POLICY), [nodeOf("node-1", ["172.18.0.2"], ["10.42.0.0/24"])]);
-  const admit = () => Effect.runPromise(admitNodes(kube, "alasio", "alasio-seaweedfs-from-nodes"));
+  const admit = () => Effect.runPromise(admitNodes(kube, "alasio", "alasio-seaweedfs-from-nodes", STORE_LABELS));
 
   assert.equal(await admit(), "written");
   assert.deepEqual(admitted(state.policy), { kept: { "node-1": ["10.42.0.0", "10.42.0.1", "172.18.0.2"] }, rules: [{ ports: PORT, from: ["10.42.0.0/32", "10.42.0.1/32", "172.18.0.2/32"] }] });
@@ -101,6 +104,13 @@ test("the gateway has the policy admit every address the cluster's nodes hold to
   state.policy = { ...state.policy, spec: { ...(state.policy as typeof POLICY).spec, ingress: [{}] } } as KubernetesObject;
   assert.equal(await admit(), "written");
   assert.deepEqual(admitted(state.policy).rules[0]?.from.length, 6);
+  // Its selector or its types changed by anyone else, as to admit the namespace's every pod or none: set back too.
+  for (const changed of [{ podSelector: {} }, { policyTypes: ["Ingress", "Egress"] }, { egress: [{}] }]) {
+    state.policy = { ...state.policy, spec: { ...(state.policy as typeof POLICY).spec, ...changed } } as KubernetesObject;
+    assert.equal(await admit(), "written", JSON.stringify(changed));
+    assert.deepEqual((state.policy as typeof POLICY).spec, { podSelector: POLICY.spec["podSelector"], policyTypes: ["Ingress"], ingress: (state.policy as typeof POLICY).spec["ingress"] });
+  }
+  assert.equal(await admit(), "unchanged");
   // A node gone from the cluster is dropped.
   state.nodes = state.nodes.filter(({ metadata }) => metadata?.name !== "node-2");
   assert.equal(await admit(), "written");
@@ -119,7 +129,7 @@ test("the gateway has the policy admit every address the cluster's nodes hold to
     state.beforeWrite = () => {};
     // The other replica writes between this one's read and its write, of a node that joined meanwhile.
     state.nodes.push(nodeOf("node-2", ["172.18.0.3"]));
-    Effect.runSync(admitNodes(kube, "alasio", "alasio-seaweedfs-from-nodes").pipe(Effect.orDie));
+    Effect.runSync(admitNodes(kube, "alasio", "alasio-seaweedfs-from-nodes", STORE_LABELS).pipe(Effect.orDie));
   };
   assert.equal(await admit(), "unchanged");
   assert.equal(raced, true);
@@ -128,6 +138,6 @@ test("the gateway has the policy admit every address the cluster's nodes hold to
 
 test("an installation without the policy, whose restores read through the agent, has nothing admitted", async () => {
   const { state, kube } = fakeKube(null, [nodeOf("node-1", ["172.18.0.2"])]);
-  assert.equal(await Effect.runPromise(admitNodes(kube, "alasio", "alasio-seaweedfs-from-nodes")), null);
+  assert.equal(await Effect.runPromise(admitNodes(kube, "alasio", "alasio-seaweedfs-from-nodes", STORE_LABELS)), null);
   assert.equal(state.writes, 0);
 });

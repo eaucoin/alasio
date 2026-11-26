@@ -70,7 +70,7 @@ import { GROWTH_WINDOW_MS, Restores, SANDBOX_MEMORY_SLACK_BYTES } from "../src/n
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
 import type { NodeMemory } from "../src/node-agent/memory.ts";
-import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags, SandboxGone } from "../src/node-agent/runsc.ts";
+import { type CheckpointOptions, FAIL_LOAD_TIMEOUT_MS, KILL_TIMEOUT_MS, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags, SandboxGone } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
 import { makeStoreUrls, SIGNED_BEFORE_MS } from "../src/node-agent/store-urls.ts";
@@ -277,8 +277,9 @@ interface NodeOptions {
   readonly restoresByUrlSince?: string;
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
-  /** What its agent's prepares by URLs wait on for its node to be admitted to the store (NodeAgentOptions admitted), none unless given. */
+  /** What its agent's prepares by URLs wait on for its node to be admitted to the store, and for how long (NodeAgentOptions admitted, admissionWaitMs), none unless given. */
   readonly admitted?: Effect.Effect<void>;
+  readonly admissionWaitMs?: number;
   /** The pods as the API server says them as they change, as its agent watches one; its `pod` unless given. */
   readonly pods?: NodeAgentOptions["pods"];
   /** Its cache as `cache` changes it. */
@@ -294,7 +295,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, restoresWithETagsSince = "", restoresWithPagesCacheSince = "", restoresByUrlSince = "", backgroundReadMs = BACKGROUND_READ_MS, admitted, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, restoresWithETagsSince = "", restoresWithPagesCacheSince = "", restoresByUrlSince = "", backgroundReadMs = BACKGROUND_READ_MS, admitted, admissionWaitMs, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -324,6 +325,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         storeProxy,
         goferReads,
         ...(admitted === undefined ? {} : { admitted }),
+        ...(admissionWaitMs === undefined ? {} : { admissionWaitMs }),
         restoresByUrlSince,
         host: host.host,
         restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince,
@@ -2777,9 +2779,9 @@ test("a restore from the bucket's images are fetched into the cache once it is d
 /** The served file the gofer of a restore that reads the bucket by URLs counts in, as its options at `imagePath` say, while they are there. */
 const servedFileOf = (imagePath: string): string => goferOptionsOf(imagePath).options["served_file"] as string;
 
-/** Writes what the gofer of a restore that reads the bucket by URLs counts in its served file `file`: `bytes`, the file replaced whole. */
-const servedBy = (file: string, bytes: number): void => {
-  writeFileSync(`${file}.new`, `${bytes}\n`);
+/** Writes what the gofer of a restore that reads the bucket by URLs counts in its served file `file`: `bytes`, and `gets` GETs, the file replaced whole. */
+const servedBy = (file: string, bytes: number, gets = 1): void => {
+  writeFileSync(`${file}.new`, `${bytes} ${gets}\n`);
   renameSync(`${file}.new`, file);
 };
 
@@ -3002,7 +3004,7 @@ test("a release's save of a sandbox whose restore from the bucket by URLs reads 
     })
   ));
 
-test("a prepare of a restore by URLs waits for its node to be admitted to the store before it signs them; one through the proxy waits for nothing", () =>
+test("a prepare of a restore by URLs waits for its node to be admitted to the store before it signs them, for a while at most, failing past it; one through the proxy waits for nothing", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
@@ -3022,6 +3024,14 @@ test("a prepare of a restore by URLs waits for its node to be admitted to the st
 
       const proxied = yield* node("node-3", { admitted: Effect.never });
       assert.equal((yield* preparing(proxied.agent, workspace)).source, "bucket");
+
+      // Never admitted: the prepare fails once its wait is over, said so, having signed nothing.
+      const unadmitted = yield* node("node-4", { restoresByUrlSince: RELEASE, admitted: Effect.never, admissionWaitMs: 300 });
+      writeFileSync(join(unadmitted.releases.releasesDir, RELEASE, "remote-inspect"), "");
+      const refused = yield* Effect.flip(preparing(unadmitted.agent, workspace));
+      assert.equal(refused._tag, "NodeNotAdmitted");
+      assert.equal(refused.message, "the node agent of node-4 prepares no restore of main/fs-abc by URLs: the bundled store's policy, which the sandbox gateway keeps, did not admit the node within 0.3 s");
+      assert.ok(!unadmitted.goferReads.follows("main/fs-abc"));
     })
   ));
 
@@ -5643,6 +5653,21 @@ test("an abandon whose kill through runsc does not end within its bound fails, i
       rmSync(hang);
       yield* here.agent.abandon(abandonRequest);
       assert.equal(yield* Effect.promise(() => sandbox.ended), "SIGKILL");
+    })
+  ));
+
+test("a fail-load is let take longer than a kill and than the 10 s the Sentry waits for the loads it ends to end, and fails, its runsc killed, only past its own bound", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-load-ms"), "700");
+      const options = { releasesDir: here.releases.releasesDir, containerdDir: here.releases.containerdDir, root: RUNSC_ROOT, procRoot: here.releases.procRoot, current: RELEASE };
+      assert.ok(FAIL_LOAD_TIMEOUT_MS > 10_000 && FAIL_LOAD_TIMEOUT_MS > KILL_TIMEOUT_MS);
+      // Longer than a kill may take: ended, as runsc says.
+      assert.equal(yield* makeRunsc({ ...options, killTimeoutMs: 500 }).failLoad(RELEASE, CONTAINER, "the test ends it"), 1);
+      // Past its own bound: failed.
+      const refused = yield* Effect.flip(makeRunsc({ ...options, failLoadTimeoutMs: 300 }).failLoad(RELEASE, CONTAINER, "the test ends it"));
+      assert.equal(refused.message, `runsc fail-load ${CONTAINER} of ${RELEASE} failed: it did not end within 0.3 s`);
     })
   ));
 
