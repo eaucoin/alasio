@@ -108,8 +108,9 @@ async function withStore<A>({ image, args, env, limit, sysctls }: Gateway, use: 
   docker("network", "create", network);
   try {
     const run = (part: string, ...rest: string[]) => docker("run", "-d", "--name", name(part), "--network", network, "--network-alias", part, ...rest);
-    run("master", image, "master", "-ip=master", "-port=9333", "-mdir=/tmp", "-volumeSizeLimitMB=1024");
-    run("volume", image, "volume", "-ip=volume", "-port=8080", "-mserver=master:9333", "-dir=/tmp", "-max=40");
+    // One master, the leader as it starts, as alasio runs one.
+    run("master", image, "master", "-ip=master", "-port=9333", "-mdir=/tmp", "-volumeSizeLimitMB=1024", "-peers=none");
+    run("volume", image, "volume", "-ip=volume", "-port=8080", "-master=master:9333", "-dir=/tmp", "-max=40");
     run("filer", image, "filer", "-ip=filer", "-master=master:9333", "-defaultStoreDir=/tmp");
     // Its own arguments but where it reaches its filer, and no identities: anyone may ask.
     const own = args.filter((arg) => arg !== "s3" && !arg.startsWith("-filer=") && !arg.startsWith("-config="));
@@ -117,13 +118,25 @@ async function withStore<A>({ image, args, env, limit, sysctls }: Gateway, use: 
       ...sysctls.flatMap(({ name: key, value }) => ["--sysctl", `${key}=${value}`]), ...env.flatMap(({ name: key, value }) => ["-e", `${key}=${value ?? ""}`]),
       image, "s3", "-filer=filer:8888", "-debug", "-debug.port=6060", ...own);
     const endpoint = `http://${docker("inspect", "--format", `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`, name("s3"))}:${s3Port(args)}`;
+    // Its bucket made, and an object taken, as the store takes one once a volume server has registered with its leader.
     for (let tries = 0; ; tries += 1) {
-      const answered = await ask(`${endpoint}/load`, { method: "PUT" }).then(({ status }) => status, () => 0);
-      if (answered === 200) break;
-      assert.ok(tries < 120, "the gateway never made its bucket");
+      const made = await ask(`${endpoint}/load`, { method: "PUT" }).then(({ status }) => status, () => 0);
+      const taken = made === 200 ? await ask(`${endpoint}/load/ready`, { method: "PUT", body: bodyOf(1024) }).then(({ status }) => status, () => 0) : 0;
+      if (taken === 200) break;
+      assert.ok(tries < 120, `the store took no object: its bucket answered ${made}, the object ${taken}`);
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     return await use(endpoint, name("s3"));
+  } catch (error) {
+    // What each part said last, as nothing else of the store says why a request failed.
+    for (const part of ["master", "volume", "filer", "s3"]) {
+      try {
+        console.log(`# ${part}'s last lines:\n${execFileSync("sh", ["-c", `docker logs --tail 40 ${name(part)} 2>&1`], { encoding: "utf8" })}`);
+      } catch (logged) {
+        console.log(`# ${part}'s log could not be read: ${logged instanceof Error ? logged.message : String(logged)}`);
+      }
+    }
+    throw error;
   } finally {
     rmSync(profileOf(name("s3")), { force: true });
     for (const part of ["s3", "filer", "volume", "master"]) {

@@ -597,14 +597,17 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 // What it holds of uploads under way, bounded (gatewayUploadBufferMiB), as
                 // SeaweedFS holds none, part by part, whole.
                 `-concurrentUploadLimitMB=${gatewayUploadBufferMiB(bundled.gateways.resources)}`,
-                // What its GETs hold is not budgeted (no -readerCacheSizeMB): SeaweedFS's
-                // reader budget, short of room, takes back the oldest chunk held, even one a
-                // GET is reading, which that GET then reads again. Each GET holds its chunk
-                // and four ahead, of the filers' 4 MiB, so the box's clients' GETs at once, 86
-                // with eight restores of images of their own, want 1.2 GiB, and 2 with
-                // fifteen, more than a budget a gateway can afford. Unbudgeted, they hold at most SeaweedFS's 256
-                // chunks in flight, 1 GiB, which its limit (2 GiB) has room for beside the
-                // rest: under the load job it held 1.6 GiB at most.
+                // What its GETs hold is not budgeted (no -readerCacheSizeMB). Each GET holds its
+                // chunk and four ahead, of the filers' 4 MiB, so the box's clients' GETs at once, 86
+                // with eight restores of images of their own, want 1.2 GiB, and 2 with fifteen,
+                // more than a budget a gateway can afford; and a budget bought little
+                // under the load job (test/gateway-memory.test.ts, SeaweedFS 4.54, whose reader
+                // keeps the chunk a GET reads from its budget's evictions): of 512 MiB, its most
+                // held fell from 1334 to 1181 MiB with 86 GETs, and from 1424 to 1285 MiB with
+                // 142, whose median GET slowed from 6.6 to 2.7 MiB/s; of 1024 MiB, neither moved.
+                // Unbudgeted, they hold at most SeaweedFS's 256 chunks in flight, 1 GiB, which
+                // its limit (2 GiB) has room for beside the rest: under the load job it held
+                // 1.4 GiB at most.
               ],
               env: [...(goMemoryLimit(bundled.gateways.resources).env ?? []), filerSigningKey("gateway")],
               ports: [...PORTS.gateway.map(({ name, port }) => ({ name, containerPort: port })), { name: "metrics", containerPort: METRICS_PORT }],
