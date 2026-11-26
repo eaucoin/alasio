@@ -4,10 +4,11 @@
  * Each trial binds two new sessions on the node, their pods' limits far above (test/e2e/harness.ts),
  * and holds the cgroup of the node's Burstable pods, theirs, to what it holds then but its clean
  * page cache, which the kernel reclaims as it nears the limit (as the guard's reclaimableIn counts
- * it), and BENCH_OOM_HEADROOM_MIB (2048) more, so that the kernel's OOM is of that cgroup, above
- * both sandboxes, and not of a pod's own nor of the node, which a runner's memory filled whole
- * starves before the kernel kills. B holds 1.5 GiB and charges and frees 4 MiB every 20 ms beside
- * it; then, as BENCH_OOM_ARM says:
+ * it), what B is to hold, and BENCH_OOM_HEADROOM_MIB (2048) more, so that the kernel's OOM is of
+ * that cgroup, above both sandboxes, and not of a pod's own nor of the node, which a runner's
+ * memory filled whole starves before the kernel kills; and 12 s later, past the guard's windows,
+ * so that what the room lost as it was held is no one's growth, B fills 1.5 GiB and charges and
+ * frees 4 MiB every 20 ms beside it; 3 s after, as BENCH_OOM_ARM says:
  * - `grow` (unless said): A grows by BENCH_OOM_GROWTH_MIB (64) every 80 ms until it is killed;
  * - `foreign`: A is left as it is, and a pod of no sandbox, runc's, Burstable, on the same node in
  *   a namespace of no sessions, grows as A would until it ends, so that the want is another pod's;
@@ -16,7 +17,7 @@
  *   limited its sandbox, which the limit should leave room for.
  * A trial whose arm's conditions did not come about (the foreign pod's process elsewhere, A's
  * sandbox not limited) is a line of its setup alone, `setup_ok` false, and no result.
- * The cgroup is held so anew every second, as kubelet sets its limit back as pods come and go,
+ * The cgroup is held so anew every 50 ms, as kubelet sets its limit back as pods come and go,
  * and its limit given back after. Then whether B's pod runs on, the same pod, its process
  * alive, and A's; what the kernel killed, the node agent ended or said of another pod's want and
  * kubelet evicted meanwhile; what the agent's guard set on each sandbox's cgroup, and says it did
@@ -56,6 +57,10 @@ const HOLDER = [
   "let n = 0; setInterval(() => Buffer.allocUnsafe(4 << 20).fill(n++ & 255), 20);",
   "setInterval(() => fs.writeFileSync('/tmp/holder.alive', String(Date.now())), 500);",
 ].join(" ");
+/** What B's sandbox comes to hold more as it runs HOLDER, as trials measured it: its 1.5 GiB, and some 128 MiB of node's and gVisor's beside. */
+const HOLDER_BYTES = 1.5 * 1024 ** 3 + 128 * 1024 ** 2;
+/** How long after the Burstable pods' cgroup is held anything grows: past the guard's window of 10 s over which it measures what the room lost, and by whom. */
+const CAP_SETTLE_MS = 12_000;
 /**
  * A, or the foreign pod: GROWTH_MIB more every 80 ms, every page written, until it is killed, or
  * holds GROWER_MOST_BYTES, three times HEADROOM_BYTES, and stops: one not killed so never fills
@@ -132,8 +137,8 @@ async function guardRecordsOf(node: string, pods: readonly string[]): Promise<un
 /**
  * Holds the Burstable pods' cgroup on `node` to what it holds but its clean page cache (active and
  * inactive file pages, but those dirty or being written back, as the guard's reclaimableIn counts
- * them) and HEADROOM_BYTES more: its path, its limit before, to give back, what it held, of it
- * what was clean page cache, and the limit set.
+ * them), what B is to hold (HOLDER_BYTES), and HEADROOM_BYTES more: its path, its limit before, to
+ * give back, what it held, of it what was clean page cache, and the limit set.
  */
 async function capBurstable(node: string): Promise<{ readonly path: string; readonly limitBefore: string; readonly current: number; readonly reclaimable: number; readonly limit: number }> {
   const reclaimable = `awk '$1 == "active_file" || $1 == "inactive_file" { r += $2 } $1 == "file_dirty" || $1 == "file_writeback" { r -= $2 } END { printf "%.0f", (r > 0 ? r : 0) }' "$dir/memory.stat"`;
@@ -142,7 +147,7 @@ async function capBurstable(node: string): Promise<{ readonly path: string; read
     'before=$(cat "$dir/memory.max")',
     'current=$(cat "$dir/memory.current")',
     `reclaimable=$(${reclaimable})`,
-    `echo $(( current - reclaimable + ${HEADROOM_BYTES} )) > "$dir/memory.max"`,
+    `echo $(( current - reclaimable + ${HOLDER_BYTES + HEADROOM_BYTES} )) > "$dir/memory.max"`,
     'echo "$dir $before $current $reclaimable $(cat "$dir/memory.max")"',
   ].join("; "))).trim();
   const [path = "", limitBefore = "max", current = "", held = "", limit = ""] = said.split(" ");
@@ -150,25 +155,20 @@ async function capBurstable(node: string): Promise<{ readonly path: string; read
 }
 
 /**
- * Holds the cgroup `path` on `node` to `limit` every second until stopped, as kubelet's QoS
- * manager sets the Burstable pods' slice's limit back as pods come and go: once stopped, each
- * limit it found it set back to, a time it was.
+ * Holds the cgroup `path` on `node` to `limit` every 50 ms until stopped, by a loop of the node's
+ * own, as kubelet's QoS manager sets the Burstable pods' slice's limit back as pods come and go:
+ * so seldom seen set back by the guard, which looks every 250 ms, and would take the room it then
+ * finds and loses again for another pod's. Once stopped, each limit it found it set back to, a
+ * time it was.
  */
-function keepCap(node: string, path: string, limit: number): { readonly stop: () => Promise<readonly string[]> } {
-  const found: string[] = [];
-  let stopped = false;
-  const kept = (async () => {
-    while (!stopped) {
-      const said = (await onNode(node, `held=$(cat ${path}/memory.max); [ "$held" = ${limit} ] || { echo ${limit} > ${path}/memory.max; echo "$held"; }`).catch(() => "")).trim();
-      if (said !== "") found.push(said);
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
-    }
-  })();
+async function keepCap(node: string, path: string, limit: number): Promise<{ readonly stop: () => Promise<readonly string[]> }> {
+  const flag = `/run/alasio-oom-cap-${randomBytes(4).toString("hex")}`;
+  const loop = `while [ -e ${flag} ]; do held=$(cat ${path}/memory.max); [ "$held" = ${limit} ] || { echo ${limit} > ${path}/memory.max; echo "$held" >> ${flag}.resets; }; sleep 0.05; done`;
+  await onNode(node, `touch ${flag} ${flag}.resets; setsid nohup sh -c '${loop}' > /dev/null 2>&1 < /dev/null &`);
   return {
     stop: async () => {
-      stopped = true;
-      await kept;
-      return found;
+      const said = await onNode(node, `rm -f ${flag}; sleep 0.3; cat ${flag}.resets; rm -f ${flag}.resets`).catch(() => "");
+      return said.trim().split("\n").filter(Boolean);
     },
   };
 }
@@ -281,15 +281,12 @@ async function trial(number: number): Promise<Record<string, unknown>> {
   // What gives the Burstable pods' cgroup its limit back, once held; called again, it does nothing.
   let giveBack = async (): Promise<void> => {};
   try {
-    await kube.execOk(SESSIONS, b.pod, ["sh", "-c", `nohup node -e "${HOLDER}" > /tmp/holder.log 2>&1 & sleep 3`], { container: "bayma" });
-    // A's workspace marked, for its session's fallback to be told by.
-    await kube.execOk(SESSIONS, a.pod, ["sh", "-c", 'echo kept > "$HOME/oom-marker"'], { container: "bayma" });
-    // The Burstable pods' cgroup held to what it holds now but its clean page cache and HEADROOM_BYTES more; its limit before given back once A, or the foreign pod, has ended.
+    // The Burstable pods' cgroup held to what it holds now but its clean page cache, what B is to hold and HEADROOM_BYTES more; its limit before given back once A, or the foreign pod, has ended.
     const cap = await capBurstable(b.node);
     const cgroup = cap.path;
     const capOk = cgroup !== "" && Number.isFinite(cap.limit) && cap.limit > 0;
-    // Held so every second until given back, as kubelet sets the slice's limit back as pods come and go.
-    const kept = capOk ? keepCap(b.node, cgroup, cap.limit) : null;
+    // Held so until given back, as kubelet sets the slice's limit back as pods come and go.
+    const kept = capOk ? await keepCap(b.node, cgroup, cap.limit) : null;
     let givenBack = false;
     let capResets: readonly string[] = [];
     giveBack = async () => {
@@ -304,6 +301,12 @@ async function trial(number: number): Promise<Record<string, unknown>> {
       return { trial: number, arm: ARM, setup_ok: false, cap, cap_resets: capResets.length, setup, took_ms: Date.now() - started };
     };
     if (!capOk) return await setupFailed({ cap: "not set" });
+    // What the room lost as it was held is past the guard's window before anything grows: no other pod's want of its, nor of the pool's pods made for A's and B's.
+    await new Promise((resolve) => setTimeout(resolve, CAP_SETTLE_MS));
+    // B fills its 1.5 GiB 3 s before anything grows, as a session's REPL loading a dataset beside it.
+    await kube.execOk(SESSIONS, b.pod, ["sh", "-c", `nohup node -e "${HOLDER}" > /tmp/holder.log 2>&1 & sleep 3`], { container: "bayma" });
+    // A's workspace marked, for its session's fallback to be told by.
+    await kube.execOk(SESSIONS, a.pod, ["sh", "-c", 'echo kept > "$HOME/oom-marker"'], { container: "bayma" });
     // The burst arm's A takes its GiB once the guard has limited its sandbox, its scope's memory.max a number.
     let aLimitBefore: string | null = null;
     if (ARM === "burst") {
