@@ -23,7 +23,7 @@
  * nodeMemory answers it, which the agent serves (`GET /memory`). A pod whose cgroup cannot be
  * found is counted for what is known of it.
  */
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { BatchObservableResult } from "@opentelemetry/api";
@@ -52,6 +52,8 @@ export interface SandboxMemory {
   readonly fileBytes: number | null;
   readonly shmemBytes: number | null;
   readonly zswapBytes: number | null;
+  /** Of the overhead, its gofers' own (goferOf); null where none was found or read. */
+  readonly goferBytes: number | null;
 }
 
 /** How often the kernel has said the agent's cgroup reached its memory.high, its memory.max, ran out of memory, and killed in it so (memory.events). */
@@ -170,6 +172,29 @@ export async function ownMemory(proc: string, cgroups: string): Promise<OwnMemor
   };
 }
 
+/** What runsc names a gofer's process, its argv[0], beside its sandbox's runsc-sandbox. */
+const GOFER = "runsc-gofer";
+
+/**
+ * What the gofers of the sandbox whose pod's cgroup is `cgroup` hold, a gofer to each of its
+ * containers: their processes, among those of the cgroup and of its children (its pod sandbox's
+ * scope), named so, as the node's processes say under `proc`; of each, its proportional set size
+ * (smaps_rollup's Pss), so the runsc binary it maps with its sandbox is counted once between them.
+ * Null where none is found or read.
+ */
+export async function goferOf(cgroup: string, proc: string): Promise<number | null> {
+  const children = (await readdir(cgroup, { withFileTypes: true }).catch(() => [])).filter((entry) => entry.isDirectory()).map((entry) => join(cgroup, entry.name));
+  let held: number | null = null;
+  for (const dir of [cgroup, ...children]) {
+    for (const pid of ((await text(join(dir, "cgroup.procs"))) ?? "").split("\n").filter((each) => /^[0-9]+$/u.test(each))) {
+      if ((await text(join(proc, pid, "cmdline")))?.split("\0")[0] !== GOFER) continue;
+      const pss = /^Pss:\s+([0-9]+) kB$/mu.exec((await text(join(proc, pid, "smaps_rollup"))) ?? "")?.[1];
+      if (pss !== undefined) held = (held ?? 0) + Number(pss) * 1024;
+    }
+  }
+  return held;
+}
+
 /** A sandbox's memory, as the module says, with its pod's cgroup, under the node's cgroup root as the agent sees it; null where it was not found. */
 export interface SandboxCgroup extends SandboxMemory {
   readonly cgroup: string | null;
@@ -213,6 +238,7 @@ export const sandboxesOf = ({ runsc, nodeRoot, attachRoot }: Pick<MemoryOptions,
           shmemBytes: statOf(stat, "shmem"),
           // A kernel without zswap's accounting counts none.
           zswapBytes: cgroup === null || !split ? null : (yield* Effect.promise(() => numberIn(join(cgroup, "memory.zswap.current")))) ?? 0,
+          goferBytes: cgroup === null || !split ? null : yield* Effect.promise(() => goferOf(cgroup, join(nodeRoot, "proc"))),
           cgroup,
         } satisfies SandboxCgroup;
       }), { concurrency: 4 });
@@ -238,7 +264,7 @@ export const nodeMemory = ({ runsc, nodeRoot, attachRoot, ownProc = OWN_PROC, ow
   });
 
 const sandboxMemory = meter.createObservableGauge("alasio.node_agent.sandboxes.memory", {
-  description: "The memory the node's gVisor sandboxes hold, by their pods' state (bound, standby, free) and part: as their pods' cgroups count it (cgroup); of it anonymous (anon) and file-backed (file); their MemoryFiles', their applications' memory with its page cache and tmpfs (memoryfile), and the rest, their Sentries', gofers' and shims' (overhead); and zswap's (zswap)",
+  description: "The memory the node's gVisor sandboxes hold, by their pods' state (bound, standby, free) and part: as their pods' cgroups count it (cgroup); of it anonymous (anon) and file-backed (file); their MemoryFiles', their applications' memory with its page cache and tmpfs (memoryfile), and the rest, their Sentries', gofers' and shims' (overhead), of it their gofers' own, as their proportional set size (gofer); and zswap's (zswap)",
   unit: "By",
 });
 const sandboxCount = meter.createObservableGauge("alasio.node_agent.sandboxes", {
@@ -283,6 +309,7 @@ export const observeNodeMemory = (options: MemoryOptions): Effect.Effect<void, n
                 memoryfile: total(({ shmemBytes }) => shmemBytes, split),
                 overhead: total(({ bytes, shmemBytes }) => (bytes ?? 0) - (shmemBytes ?? 0), split),
                 zswap: total(({ zswapBytes }) => zswapBytes),
+                gofer: total(({ goferBytes }) => goferBytes),
               };
               for (const [part, bytes] of Object.entries(parts)) result.observe(sandboxMemory, bytes, { "alasio.sandbox.state": state, "alasio.memory.part": part });
             }
