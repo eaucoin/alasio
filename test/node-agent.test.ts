@@ -144,11 +144,11 @@ const resumeRequest = (snapshot: string): ResumeRequest => ({
   port: BAYMA_PORT,
 });
 
-/** A pod restored into, as the API server says it: running each of `containerIds`, of the addresses `podIPs`; or not yet. */
-const restoredPod = ({ podIPs, containerIds }: { readonly podIPs: readonly string[]; readonly containerIds: readonly string[] }, running = true): V1Pod => ({
+/** A pod restored into, as the API server says it: running each of `containerIds`, of the addresses `podIPs`; or not yet, of those addresses already where `addressed`. */
+const restoredPod = ({ podIPs, containerIds }: { readonly podIPs: readonly string[]; readonly containerIds: readonly string[] }, running = true, addressed = running): V1Pod => ({
   metadata: { name: POD, namespace: SESSIONS },
   status: {
-    ...(running ? { podIPs: podIPs.map((ip) => ({ ip })) } : {}),
+    ...(addressed ? { podIPs: podIPs.map((ip) => ({ ip })) } : {}),
     containerStatuses: containerIds.map((id) => ({ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: `containerd://${id}`, state: running ? { running: {} } : { waiting: {} } })),
   },
 });
@@ -4195,6 +4195,63 @@ test("a resume waits for its pod to run its containers with its addresses, as th
       assert.equal(failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))), `${SESSIONS}/${POD} does not run its containers, so its sandbox is left paused: it is gone`);
       assert.equal(here.releases.calls(RELEASE).filter((args) => args.includes("resume")).length, 4);
     })
+  ));
+
+test("a resume looks for its pod's rules from as the API server says its addresses, beside its wait for its containers to run, and goes on once the later of the two is done; again for other addresses once it runs; and gives up the look where its pod goes", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const changes = yield* Queue.unbounded<V1Pod | null>();
+      const here = yield* node("node-1", { pods: () => Stream.fromQueue(changes) });
+      const snapshot = released(s3);
+      const { host } = here;
+      const programmed = host.ipv4;
+      const listings = () => host.ran.filter(([program]) => program === "iptables" || program === "ip6tables");
+      const pod = { podIPs: [POD_IP], containerIds: [CONTAINER, OTHER_CONTAINER] };
+      host.ipv4 = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-old999", POD_IP)]);
+      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
+      // Of its address, its containers starting: its rules looked for already, not yet in force.
+      yield* Queue.offer(changes, restoredPod(pod, false, true));
+      yield* TestClock.adjust("300 millis");
+      assert.equal(resuming.pollUnsafe(), undefined);
+      assert.deepEqual(listings()[0], listing(4, FORWARD));
+      assert.deepEqual(here.releases.calls(RELEASE), []);
+      // In force 350 ms in, then looked for no more; its containers running 600 ms in: resumed then, with no wait after.
+      host.ipv4 = programmed;
+      yield* TestClock.adjust("50 millis");
+      const looked = listings().length;
+      yield* TestClock.adjust("250 millis");
+      assert.equal(listings().length, looked);
+      assert.equal(resuming.pollUnsafe(), undefined);
+      yield* Queue.offer(changes, restoredPod(pod));
+      yield* Fiber.join(resuming);
+      assert.equal(listings().length, looked);
+      assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
+
+      // Running at another address than the one it was first said of: that one's rules looked for too, before its resume.
+      host.ran.length = 0;
+      const resumingAgain = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
+      yield* Queue.offer(changes, restoredPod(pod, false, true));
+      yield* TestClock.adjust("50 millis");
+      yield* Queue.offer(changes, restoredPod({ ...pod, podIPs: [POD_IPV6] }));
+      yield* TestClock.adjust("50 millis");
+      yield* Fiber.join(resumingAgain);
+      assert.deepEqual(listings().map(([program]) => program), ["iptables", "iptables", "ip6tables", "ip6tables"]);
+      assert.deepEqual(host.ran.filter(([program]) => program === "conntrack"), [["conntrack", "-D", "-s", POD_IPV6, "-f", "ipv6"]]);
+
+      // One whose pod goes as its rules are looked for: refused, and looked for no more, its sandbox left paused.
+      host.ipv4 = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-old999", POD_IP)]);
+      host.ran.length = 0;
+      const goes = yield* Effect.forkChild(Effect.exit(here.agent.resume(resumeRequest(snapshot))));
+      yield* Queue.offer(changes, restoredPod(pod, false, true));
+      yield* TestClock.adjust("200 millis");
+      assert.notEqual(listings().length, 0);
+      yield* Queue.offer(changes, null);
+      assert.equal(failure(yield* Fiber.join(goes)), `${SESSIONS}/${POD} does not run its containers, so its sandbox is left paused: it is gone`);
+      const before = listings().length;
+      yield* TestClock.adjust("1 second");
+      assert.equal(listings().length, before);
+      assert.equal(here.releases.calls(RELEASE).filter((args) => args.includes("resume")).length, 4);
+    }).pipe(Effect.provide(TestClock.layer()))
   ));
 
 test("a resume watches its pod again where its watch fails, as one whose connection drops does, a few times, and watches it by its name alone", () =>

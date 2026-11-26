@@ -63,8 +63,9 @@
  * kube-router puts in force on the node as it next syncs (./kube-router.ts): until then
  * what the pod sends goes through, whatever they say. Its resume, asked as its pod is made,
  * waits for the pod to run its containers, as the API server says it with its addresses,
- * which kube-router reads; then for its policies, then forgets the connections tracked from
- * its addresses, then resumes its containers; then, before it is answered, waits for the
+ * and, beside that, from as it says the addresses, which kube-router reads as soon, for its
+ * policies; then forgets the connections tracked from its addresses, then resumes its
+ * containers; then, before it is answered, waits for the
  * pod to accept connections on the port its bayma serves on, from the node, as kubelet's
  * readiness probe finds it ready, so that what serves the pod once its resume is answered
  * waits on no probe of kubelet's. One whose pod does not run within
@@ -106,7 +107,7 @@ import { Worker } from "node:worker_threads";
 
 import type { V1Pod } from "@kubernetes/client-node";
 import type { BatchObservableResult } from "@opentelemetry/api";
-import { Cause, Clock, type Duration, Effect, Exit, FiberMap, Option, RcMap, Schedule, Schema, type Scope, Semaphore, Stream, SubscriptionRef } from "effect";
+import { Cause, Clock, Deferred, type Duration, Effect, Exit, FiberMap, Option, RcMap, Schedule, Schema, type Scope, Semaphore, Stream, SubscriptionRef } from "effect";
 
 import type { KubeApiError } from "../kube/client.ts";
 import { quantityOf } from "../kube/quantity.ts";
@@ -2661,7 +2662,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const policyGap = (address: PodAddress): Effect.Effect<string | null, HostCommandError> => listedEgressGap(listed(address.ip), address);
 
   /** Waits for every address of the pod's to have its rules, POLICY_WAIT_MS at most: how long it waited, in milliseconds. */
-  const policiesInForce = ({ namespace, pod, podIPs, policies }: ResumeRequest & RunningPod): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
+  const policiesInForce = ({ namespace, pod, podIPs, policies }: ResumeRequest & Pick<RunningPod, "podIPs">): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
     Effect.gen(function*() {
       const start = yield* Clock.currentTimeMillis;
       for (;;) {
@@ -2792,21 +2793,25 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
    * addresses, as the API server says it, whose watch is asked again as it ends, and as it fails,
    * as one whose connection drops does, up to WATCH_TRIES times: refused where it is gone, or has
    * not within RESTORE_RUNNING_WAIT_MS, and where what the API server says of it is none the
-   * agent takes, as an address or a container's id of another form.
+   * agent takes, as an address or a container's id of another form. Its addresses, as the API
+   * server first says them, which it does once its sandbox has them, before its containers run,
+   * are given `addressed` as soon.
    */
-  const runningPod = ({ namespace, pod: name }: ResumeRequest): Effect.Effect<RunningPod, PodNotRunning | KubeApiError> =>
+  const runningPod = ({ namespace, pod: name }: ResumeRequest, addressed: Deferred.Deferred<readonly string[]>): Effect.Effect<RunningPod, PodNotRunning | KubeApiError> =>
     Effect.gen(function*() {
       const refused = (reason: string) => new PodNotRunning({ namespace, pod: name, reason });
-      /** What of `found` a resume needs once it runs, or null while it does not. */
-      const runningOf = (found: V1Pod): Effect.Effect<RunningPod | null, PodNotRunning> => {
-        const statuses = found.status?.containerStatuses ?? [];
-        const podIPs = (found.status?.podIPs ?? []).map(({ ip }) => ip);
-        if (statuses.length === 0 || !statuses.every(({ state }) => state?.running) || podIPs.length === 0) return Effect.succeed(null);
-        const containerIds = statuses.map(({ containerID }) => containerID?.replace(/^[a-z]+:\/\//u, "") ?? "");
-        if (podIPs.some((ip) => isIP(ip) === 0)) return Effect.fail(refused(`its addresses are not all IP addresses: ${podIPs.join(", ")}`));
-        if (containerIds.some((id) => !Schema.is(ContainerId)(id))) return Effect.fail(refused(`its containers' ids are not all containerd's: ${containerIds.join(", ")}`));
-        return Effect.succeed({ podIPs, containerIds });
-      };
+      /** What of `found` a resume needs once it runs, or null while it does not, its addresses given `addressed` once it has them. */
+      const runningOf = (found: V1Pod): Effect.Effect<RunningPod | null, PodNotRunning> =>
+        Effect.gen(function*() {
+          const statuses = found.status?.containerStatuses ?? [];
+          const podIPs = (found.status?.podIPs ?? []).map(({ ip }) => ip);
+          if (podIPs.some((ip) => isIP(ip) === 0)) return yield* refused(`its addresses are not all IP addresses: ${podIPs.join(", ")}`);
+          if (podIPs.length > 0) yield* Deferred.succeed(addressed, podIPs);
+          if (statuses.length === 0 || !statuses.every(({ state }) => state?.running) || podIPs.length === 0) return null;
+          const containerIds = statuses.map(({ containerID }) => containerID?.replace(/^[a-z]+:\/\//u, "") ?? "");
+          if (containerIds.some((id) => !Schema.is(ContainerId)(id))) return yield* refused(`its containers' ids are not all containerd's: ${containerIds.join(", ")}`);
+          return { podIPs, containerIds };
+        });
       for (;;) {
         const found = yield* pods(namespace, name).pipe(
           Stream.mapEffect((each) => (each === null ? Effect.fail(refused("it is gone")) : runningOf(each))),
@@ -2842,11 +2847,20 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       // Restored as its pod is made, before it runs: from images of the bytes its prepare read, until it has read them.
       const preparedFrom = prepared.get(prefixOf(request));
       restores.restoring(request.namespace, request.pod, preparedFrom?.snapshot === request.snapshot ? preparedFrom.bytes : null);
-      const running = yield* runningPod(request).pipe(step("alasio.node_agent.resume.pod_running", request));
-      const waited = yield* policiesInForce({ ...request, ...running }).pipe(
-        Effect.tap((took) => Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": took })),
-        step("alasio.node_agent.resume.policies", request),
-      );
+      const inForce = (podIPs: readonly string[]) =>
+        policiesInForce({ ...request, podIPs }).pipe(
+          Effect.tap((took) => Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": took })),
+          step("alasio.node_agent.resume.policies", request),
+        );
+      // Its rules looked for from as its pod has its addresses, which kube-router syncs as soon, beside its wait for its
+      // containers to run, rather than after it: either refused refuses the resume, the other given up.
+      const addressed = yield* Deferred.make<readonly string[]>();
+      const [running, [checked, first]] = yield* Effect.all([
+        runningPod(request, addressed).pipe(step("alasio.node_agent.resume.pod_running", request)),
+        Deferred.await(addressed).pipe(Effect.flatMap((podIPs) => Effect.map(inForce(podIPs), (took) => [podIPs, took] as const))),
+      ], { concurrency: 2 });
+      // Of other addresses once it runs, as its sandbox made again would have: those looked for too.
+      const waited = checked.join(" ") === running.podIPs.join(" ") ? first : yield* inForce(running.podIPs);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(running.containerIds, (id) => ofPod(id, request.namespace, request.pod)).pipe(step("alasio.node_agent.resume.containers", request));
       const from = yield* restoredFrom(request);
