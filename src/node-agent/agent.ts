@@ -1077,41 +1077,100 @@ async function imageFiles(directory: string, ready?: () => Promise<void>): Promi
 }
 
 /**
- * What hashAhead runs in a thread of its own: the file `workerData.path` read once from its
- * start, its SHA-256 updated as it is, how far it has read posted every HASH_PROGRESS_BYTES,
- * and at its end the SHA-256, in hex; or why it failed.
+ * What hashAhead runs in a thread of its own, one for the agent (hasher): each file it is asked of, `{ id, path }`, read
+ * once from its start into a buffer of HASH_CHUNK_BYTES of its own, used again for each read, so a hash holds that buffer and
+ * no more however large its file; its SHA-256 updated as it is; how far it has read posted every `progressBytes`, and at
+ * its end the SHA-256, in hex; or why it failed. The files it is asked of at once are read at once, each in turn of reads.
  */
 const HASH_WORKER = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { createHash } = require("node:crypto");
-const { createReadStream } = require("node:fs");
-const hash = createHash("sha256");
-let read = 0;
-let told = 0;
-createReadStream(workerData.path, { highWaterMark: 1 << 20 })
-  .on("data", (chunk) => {
-    hash.update(chunk);
-    read += chunk.length;
-    if (read - told >= workerData.progressBytes) {
-      told = read;
-      parentPort.postMessage({ read });
+const { open } = require("node:fs/promises");
+parentPort.on("message", async ({ id, path }) => {
+  let handle = null;
+  try {
+    handle = await open(path, "r");
+    const buffer = Buffer.allocUnsafeSlow(workerData.chunkBytes);
+    const hash = createHash("sha256");
+    let read = 0;
+    let told = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, read);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      read += bytesRead;
+      if (read - told >= workerData.progressBytes) {
+        told = read;
+        parentPort.postMessage({ id, read });
+      }
     }
-  })
-  .on("end", () => parentPort.postMessage({ read, sha256: hash.digest("hex") }))
-  .on("error", (error) => parentPort.postMessage({ error: error.message }));
+    parentPort.postMessage({ id, read, sha256: hash.digest("hex") });
+  } catch (error) {
+    parentPort.postMessage({ id, error: error.message });
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+});
 `;
 
 /** How often a hash ahead of an upload says how far it has read: 8 MiB, a quarter of a part (./names.ts SNAPSHOT_PART_BYTES). */
 const HASH_PROGRESS_BYTES = 8 * 1024 ** 2;
+/** What a hash ahead reads at a time, into one buffer it keeps: 1 MiB. */
+const HASH_CHUNK_BYTES = 1024 ** 2;
+
+/** A file hashed by the hasher's thread: what it is told as the thread reads it. */
+interface HashJob {
+  readonly said: (said: { readonly read: number; readonly sha256?: string; readonly error?: string }) => void;
+}
+
+/**
+ * The agent's one thread of hashes (HASH_WORKER), made as the first is asked, kept for those after: one V8 isolate for every
+ * file hashed, not one each. It holds the process open no longer than its work does. One that fails, or ends, fails each
+ * hash it was reading, and the next is read by a thread made anew.
+ */
+const hasher = (() => {
+  let worker: Worker | null = null;
+  let next = 0;
+  const jobs = new Map<number, HashJob>();
+  const failAll = (cause: string) => {
+    for (const [id, job] of jobs) {
+      jobs.delete(id);
+      job.said({ read: 0, error: cause });
+    }
+    worker = null;
+  };
+  const started = (): Worker => {
+    if (worker !== null) return worker;
+    const made = new Worker(HASH_WORKER, { eval: true, workerData: { progressBytes: HASH_PROGRESS_BYTES, chunkBytes: HASH_CHUNK_BYTES } });
+    made.unref();
+    made.on("message", (said: { readonly id: number; readonly read: number; readonly sha256?: string; readonly error?: string }) => {
+      const job = jobs.get(said.id);
+      if (job === undefined) return;
+      if (said.sha256 !== undefined || said.error !== undefined) jobs.delete(said.id);
+      job.said(said);
+    });
+    made.on("error", (error) => (worker === made ? failAll(error.message) : undefined));
+    made.on("exit", (code) => (worker === made ? failAll(`the hashes' thread ended with ${code}`) : undefined));
+    worker = made;
+    return made;
+  };
+  return {
+    hash: (path: string, said: HashJob["said"]) => {
+      const id = next++;
+      jobs.set(id, { said });
+      started().postMessage({ id, path });
+    },
+  };
+})();
 
 /**
  * The SHA-256 of the file at `path`, in hex, as it is read once from its start, and what
  * resolves once that read has passed the byte `end`, or fails as it does: what each part of an
  * upload of the file waits for (hashedAndPut), so that the file is read from the disk once, by
  * the hash, its upload reading the same bytes after it, from the page cache, as runsc writes an
- * image past it (`--direct`). Read and hashed in a thread of its own (HASH_WORKER), as a hash in
- * the agent's own would hold the thread its uploads send from. Its failure is told by both, and
- * by neither left unhandled.
+ * image past it (`--direct`). Read and hashed in the agent's thread of hashes (hasher), as a hash in
+ * the agent's own would hold the thread its uploads send from, into a buffer it keeps. Its failure
+ * is told by both, and by neither left unhandled.
  */
 export function hashAhead(path: string): { readonly sha256: Promise<string>; readonly through: (end: number) => Promise<void> } {
   let read = 0;
@@ -1126,23 +1185,16 @@ export function hashAhead(path: string): { readonly sha256: Promise<string>; rea
     }
   };
   const sha256 = new Promise<string>((resolve, reject) => {
-    const worker = new Worker(HASH_WORKER, { eval: true, workerData: { path, progressBytes: HASH_PROGRESS_BYTES } });
-    const fail = (cause: unknown) => {
-      failed = { cause };
-      settle();
-      reject(cause);
-      void worker.terminate();
-    };
-    worker.on("message", (said: { readonly read: number; readonly sha256?: string; readonly error?: string }) => {
-      if (said.error !== undefined) return fail(new Error(said.error));
+    hasher.hash(path, (said) => {
+      if (said.error !== undefined) {
+        failed = { cause: new Error(said.error) };
+        settle();
+        return reject(failed.cause);
+      }
       read = said.sha256 === undefined ? said.read : Number.POSITIVE_INFINITY;
       settle();
-      if (said.sha256 !== undefined) {
-        resolve(said.sha256);
-        void worker.terminate();
-      }
+      if (said.sha256 !== undefined) resolve(said.sha256);
     });
-    worker.on("error", fail);
   });
   sha256.catch(() => {});
   return {
