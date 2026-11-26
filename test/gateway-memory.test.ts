@@ -86,7 +86,9 @@ function gatewayContainer(): Gateway {
   const deployment = manifests(decoded.success, NOTHING_CARRIED).find((object: KubernetesObject) => object.kind === "Deployment" && object.metadata?.name === "alasio-seaweedfs") as V1Deployment;
   const s3 = deployment.spec?.template.spec?.containers.find(({ name }) => name === "s3");
   assert.ok(s3?.image && s3.args);
-  return { image: s3.image, args: s3.args, env: s3.env ?? [], limit: s3.resources?.limits?.["memory"] ?? "", sysctls: deployment.spec?.template.spec?.securityContext?.sysctls ?? [] };
+  // Its environment but what it takes of its Secrets, which the store in Docker has none of, as it has no identities.
+  const env = (s3.env ?? []).filter(({ valueFrom }) => valueFrom === undefined);
+  return { image: s3.image, args: s3.args, env, limit: s3.resources?.limits?.["memory"] ?? "", sysctls: deployment.spec?.template.spec?.securityContext?.sysctls ?? [] };
 }
 
 /** Docker's `--memory` of a Kubernetes quantity of Gi or Mi. */

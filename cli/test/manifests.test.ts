@@ -740,7 +740,7 @@ describe("neon", () => {
     assert.equal(statefulSets.length, 9);
     // But the log's, which is alasio's own (alasio-log).
     for (const statefulSet of statefulSets.filter(({ metadata }) => metadata?.name !== "alasio-log")) assert.match(container(statefulSet).image ?? "", /@sha256:[0-9a-f]{64}$/u, statefulSet.metadata?.name);
-    assert.match(container(one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs")).image ?? "", /^chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}$/u);
+    assert.match(container(one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs")).image ?? "", /^chrislusf\/seaweedfs:4\.54@sha256:[0-9a-f]{64}$/u);
   });
 
   test("applies the object store's lifecycle rules every hour, reading the filers' log to now, through its parts, each pass done before the next", () => {
@@ -1129,7 +1129,7 @@ describe("object store", () => {
     assert.equal(s3.resources?.limits?.["memory"], "2Gi");
     assert.deepEqual(s3.args?.filter((arg) => /^-(readerCacheSizeMB|concurrentUploadLimitMB)=/u.test(arg)), ["-concurrentUploadLimitMB=256"]);
     // Three fifths of its limit for Go.
-    assert.deepEqual(s3.env, [{ name: "GOMEMLIMIT", value: "1228MiB" }]);
+    assert.deepEqual(s3.env?.find(({ name }) => name === "GOMEMLIMIT"), { name: "GOMEMLIMIT", value: "1228MiB" });
     // Its connections' kernel buffers at most 1 MiB each.
     assert.deepEqual(one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.securityContext?.sysctls, [
       { name: "net.ipv4.tcp_rmem", value: "4096 131072 1048576" },
@@ -1137,7 +1137,7 @@ describe("object store", () => {
     ]);
     const smaller = gateway(install({ objectStore: { bundled: { gateways: { resources: { limits: { memory: "1Gi" } } } } } }));
     assert.deepEqual(smaller.args?.filter((arg) => /^-concurrentUploadLimitMB=/u.test(arg)), ["-concurrentUploadLimitMB=128"]);
-    assert.deepEqual(smaller.env, [{ name: "GOMEMLIMIT", value: "614MiB" }]);
+    assert.deepEqual(smaller.env?.find(({ name }) => name === "GOMEMLIMIT"), { name: "GOMEMLIMIT", value: "614MiB" });
   });
 
   test("keeps objects on the volume servers' volumes, a fixed count of volumes each, in one rack, so a copy goes to another server", () => {
@@ -1243,7 +1243,9 @@ describe("object store", () => {
         ],
       }, `${name}/${containerName}`);
     }
-    // The filers' signing keys, of writes and of reads, in the filers' environment, which take requests over HTTP signed with them alone, and in nothing else's.
+    // The filers' signing keys, of writes and of reads, in the filers' environment, which take requests over HTTP signed with them alone;
+    // the key of writes in the gateways', whose gRPC port takes an admin's calls signed with it alone, and the lifecycle pass's, which signs its own;
+    // and in nothing else's.
     const key = (name: string, part: string, of: string) => ({ name, valueFrom: { secretKeyRef: { name: `alasio-seaweedfs-${part}-security`, key: of } } });
     const keyed = (object: KubernetesObject) => JSON.stringify(object).match(/WEED_JWT_\w+/gu) ?? [];
     const filer = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer"));
@@ -1251,7 +1253,11 @@ describe("object store", () => {
       key("WEED_JWT_FILER_SIGNING_KEY", "filer", "filer-signing-key"),
       key("WEED_JWT_FILER_SIGNING_READ_KEY", "filer", "filer-signing-read-key"),
     ]);
-    assert.equal(objects.flatMap(keyed).length, 2);
+    const gateway = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "s3");
+    assert.deepEqual(gateway?.env?.filter(({ name }) => name.startsWith("WEED_JWT_")), [key("WEED_JWT_FILER_SIGNING_KEY", "gateway", "filer-signing-key")]);
+    const pass = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
+    assert.deepEqual(pass?.env, [key("WEED_JWT_FILER_SIGNING_KEY", "lifecycle", "filer-signing-key")]);
+    assert.equal(objects.flatMap(keyed).length, 4);
     // Each part restarts as the file changes, which it reads as it starts alone.
     for (const [kind, name] of [["StatefulSet", "alasio-seaweedfs-master"], ["StatefulSet", "alasio-seaweedfs-volume"], ["StatefulSet", "alasio-seaweedfs-filer"], ["Deployment", "alasio-seaweedfs"]] as const) {
       assert.equal(template(kind, name)?.metadata?.annotations?.["checksum/security"], sha256(toml), name);

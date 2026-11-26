@@ -389,16 +389,18 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
     rendered[names.filerStoreFiler] = { password: secrets.filerStoreFilerPassword };
     rendered[names.filerStoreCollector] = { password: secrets.filerStoreCollectorPassword };
     rendered[names.filerStoreBackup] = { password: secrets.filerStoreBackupPassword };
-    // Each part's: its certificate, and its authority's, which it takes the others' by; and the
-    // filers', which take requests over HTTP signed with them alone, the filers' signing keys too.
+    // Each part's: its certificate, and its authority's, which it takes the others' by; the
+    // filers', which take requests over HTTP signed with them alone, the filers' signing keys
+    // too; and the gateways' and the lifecycle pass's, the key of writes, which the gateways'
+    // gRPC port takes an admin's calls signed with alone, as the pass's are.
     const { authority, parts, filerSigningKey, filerReadSigningKey } = secrets.storeSecurity;
+    const keys: Partial<Record<StorePart, Record<string, string>>> = {
+      filer: { "filer-signing-key": filerSigningKey, "filer-signing-read-key": filerReadSigningKey },
+      gateway: { "filer-signing-key": filerSigningKey },
+      lifecycle: { "filer-signing-key": filerSigningKey },
+    };
     for (const part of STORE_PARTS) {
-      rendered[names.storeParts[part]] = {
-        "ca.crt": authority.cert,
-        "tls.crt": parts[part].cert,
-        "tls.key": parts[part].key,
-        ...(part === "filer" ? { "filer-signing-key": filerSigningKey, "filer-signing-read-key": filerReadSigningKey } : {}),
-      };
+      rendered[names.storeParts[part]] = { "ca.crt": authority.cert, "tls.crt": parts[part].cert, "tls.key": parts[part].key, ...keys[part] };
     }
   }
   return rendered;

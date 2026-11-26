@@ -158,10 +158,10 @@ const TLS_DIRECTORY = `${CONFIG_DIRECTORY}/tls`;
  * (PEERS) alone, by their common names; a plaintext connection is refused. And the filers take
  * requests over HTTP, and calls of their IAM service, signed with their signing keys alone, of
  * writes and of reads, which no part makes, nor anything but main's lake's reconciliation, its
- * reads of the lake's entries (neon/control/store-security.ts filerReadToken). The keys are the
- * filers' environment's (FILER_SIGNING_KEYS), not this file's, which is no Secret. The gateways
- * hold none: SeaweedFS 4.48's lifecycle pass signs no call of theirs, which a gateway with the
- * key of writes would take no more; their gRPC port takes the pass's certificate alone.
+ * reads of the lake's entries (neon/control/store-security.ts filerReadToken); and the gateways'
+ * gRPC port takes an admin's calls signed with the key of writes alone, as the lifecycle pass
+ * signs its deletes. The keys are each such part's environment's (filerSigningKey,
+ * FILER_READ_SIGNING_KEY), not this file's, which is no Secret.
  */
 export function storeSecurityToml(): string {
   const section = (name: string, peers?: readonly StorePart[]) => [
@@ -208,11 +208,15 @@ const configMount = (name: string) => ({ name, mountPath: CONFIG_DIRECTORY, read
 /** The annotation of each part's pods, which restarts them as the store's security.toml changes, which they read as they start alone. */
 const securityChecksum = () => ({ "checksum/security": sha256(storeSecurityToml()) });
 
-/** The filers' signing keys, of writes and of reads, of their Secret, which they take requests over HTTP, and calls of their IAM service, signed with alone. */
-const FILER_SIGNING_KEYS: V1EnvVar[] = [
-  { name: "WEED_JWT_FILER_SIGNING_KEY", valueFrom: { secretKeyRef: { name: storePartSecret("filer"), key: "filer-signing-key" } } },
-  { name: "WEED_JWT_FILER_SIGNING_READ_KEY", valueFrom: { secretKeyRef: { name: storePartSecret("filer"), key: "filer-signing-read-key" } } },
-];
+/**
+ * The filers' signing key of writes, of `part`'s Secret: which the filers take requests over
+ * HTTP, and calls of their IAM service, signed with alone, and the gateways' gRPC port an
+ * admin's calls, the lifecycle pass's among them, which the pass signs with it.
+ */
+const filerSigningKey = (part: "filer" | "gateway" | "lifecycle"): V1EnvVar => ({ name: "WEED_JWT_FILER_SIGNING_KEY", valueFrom: { secretKeyRef: { name: storePartSecret(part), key: "filer-signing-key" } } });
+
+/** The filers' signing key of reads, which they take reads over HTTP signed with alone. */
+const FILER_READ_SIGNING_KEY: V1EnvVar = { name: "WEED_JWT_FILER_SIGNING_READ_KEY", valueFrom: { secretKeyRef: { name: storePartSecret("filer"), key: "filer-signing-read-key" } } };
 
 /**
  * The lifecycle rule of each bucket a writer puts files larger than a part into, in parts: a
@@ -445,7 +449,7 @@ function filerObjects(config: InstallConfig): KubernetesObject[] {
   const args = ["filer", `-master=${masters(config)}`, ownAddress(FILER_PEERS), "-ip.bind=0.0.0.0", "-defaultStoreDir=/tmp"];
   const container: V1Container = {
     ...partContainer(config, "filer", args, "/healthz", 8888, filers.resources),
-    env: [...POD_ENV, { name: "WEED_REDIS2_PASSWORD", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }, ...FILER_SIGNING_KEYS],
+    env: [...POD_ENV, { name: "WEED_REDIS2_PASSWORD", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }, filerSigningKey("filer"), FILER_READ_SIGNING_KEY],
     volumeMounts: [configMount("config"), { name: "tmp", mountPath: "/tmp" }],
   };
   const statefulSet = partStatefulSet(
@@ -495,14 +499,14 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
  * past it waits for room, its part held whole as it is read. An eighth of its memory limit,
  * 256 MiB of 2 GiB; 256 where it has no limit.
  *
- * SeaweedFS 4.48 waits for room (s3api_circuit_breaker.go Limit) on a sync.Cond, which an
- * upload that ends signals once it has given back its bytes, by an atomic and without the
- * Cond's lock: a request between its look and its wait misses that signal and sleeps on
- * until the next upload ends. A request woken that finds no room waits again behind those
- * waiting, while one that comes and finds room goes in at once, so one may wait as others
- * pass it; and it looks before it adds its own, so the uploads under way may go past the
- * bound by one request's. Under the load job (test/gateway-memory.test.ts) a PUT waited
- * 22 s at the most.
+ * SeaweedFS 4.54 waits for room (s3api_circuit_breaker.go waitForUploadSlot) on a sync.Cond,
+ * under its lock, which every upload that ends wakes once it has given back its bytes, so no
+ * wait misses it; but one woken that finds no room waits again, while one that comes and finds
+ * room goes in at once, so one may wait as others pass it; and it looks before it adds its own,
+ * so the uploads under way may go past the bound by one request's. One that waits a minute
+ * (-inflightUploadDataTimeout) is answered 503 SlowDown, its body unread, which each of the
+ * store's clients sends again later, the node agents too (src/node-agent/s3.ts
+ * SLOW_DOWN_SENDS), rather than hold its connection and what the kernel buffers of it.
  */
 export function gatewayUploadBufferMiB(resources: { readonly limits?: { readonly memory?: string } }): number {
   const limit = resources.limits?.memory;
@@ -602,7 +606,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 // chunks in flight, 1 GiB, which its limit (2 GiB) has room for beside the
                 // rest: under the load job it held 1.6 GiB at most.
               ],
-              ...goMemoryLimit(bundled.gateways.resources),
+              env: [...(goMemoryLimit(bundled.gateways.resources).env ?? []), filerSigningKey("gateway")],
               ports: [...PORTS.gateway.map(({ name, port }) => ({ name, containerPort: port })), { name: "metrics", containerPort: METRICS_PORT }],
               readinessProbe: { httpGet: { path: "/healthz", port: "s3" }, periodSeconds: 5 },
               livenessProbe: { httpGet: { path: "/healthz", port: "s3" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
@@ -770,6 +774,8 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                   `${oncePolicyApplies(`wget -q -O /dev/null http://${MASTER}:9333/cluster/status`)} && ` +
                   `printf '${commands.map((command) => `${command}\\n`).join("")}' | weed shell -master=${masters(config)} -filer=${FILER}:8888`,
                 ],
+                // What it signs its deletes through the gateways with.
+                env: [filerSigningKey("lifecycle")],
                 securityContext: restrictedContainer(),
                 resources: { requests: { cpu: BACKGROUND_CPU, memory: "32Mi" }, limits: { memory: "256Mi" } },
                 volumeMounts: [configMount("config"), { name: "tmp", mountPath: "/tmp" }],

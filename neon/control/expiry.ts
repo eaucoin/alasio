@@ -38,9 +38,8 @@
  * A key whose versions the bucket lists in a way no S3 lists them, more than one its latest,
  * or one newer than its latest, is left as it is, and said.
  *
- * SeaweedFS's own lifecycle rules would not do it: 4.48 applies an Expiration of a versioned
- * bucket only as the bucket's rules first change (upstream's #11956, from 4.50), and removes
- * expired delete markers only by rules that walk the whole bucket, once a shard, every pass.
+ * SeaweedFS's own lifecycle rules would not do it, which expire by age alone: a full WAL
+ * segment is kept by where its timeline's remote consistent LSNs were, whatever its age.
  * An operator's store (objectStore.external) is expired by none of this: its operator gives
  * Neon's bucket lifecycle rules of these ages.
  *

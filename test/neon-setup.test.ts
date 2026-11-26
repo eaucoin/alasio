@@ -174,7 +174,8 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(new Set([root.filerStoreFilerPassword, root.filerStoreCollectorPassword, root.filerStoreBackupPassword]).size, 3);
   assert.deepEqual([names.filerStoreFiler, names.filerStoreCollector, names.filerStoreBackup], ["q-seaweedfs-filer-store-filer", "q-seaweedfs-filer-store-collector", "q-seaweedfs-filer-store-backup"]);
   // Each of the store's parts its certificate, of the store's authority, its name its common name, for a TLS server and client
-  // alike, and that authority's, whose key no part holds; the filers' signing keys the filers' alone.
+  // alike, and that authority's, whose key no part holds; the filers' signing keys the filers', and the key of writes the gateways'
+  // and the lifecycle pass's, whose gRPC calls through the gateways it signs.
   const { authority } = root.storeSecurity;
   const authorityCertificate = new X509Certificate(authority.cert);
   assert.deepEqual([authorityCertificate.subject, authorityCertificate.ca], ["CN=alasio-seaweedfs", true]);
@@ -188,7 +189,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
     assert.ok(certificate.checkPrivateKey(createPrivateKey(value(kube, name, "tls.key"))), part);
     assert.equal(Math.round((Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 86_400_000), STORE_VALID_DAYS);
     const keys = Object.keys(kube.secrets.get(name)?.data ?? {}).sort();
-    const signing = part === "filer" ? ["filer-signing-key", "filer-signing-read-key"] : [];
+    const signing = { master: [], volume: [], filer: ["filer-signing-key", "filer-signing-read-key"], gateway: ["filer-signing-key"], lifecycle: ["filer-signing-key"] }[part];
     assert.deepEqual(keys, ["ca.crt", ...signing, "tls.crt", "tls.key"], part);
     const of = { "filer-signing-key": root.storeSecurity.filerSigningKey, "filer-signing-read-key": root.storeSecurity.filerReadSigningKey };
     for (const key of signing) assert.equal(value(kube, name, key), of[key as keyof typeof of], `${part}: ${key}`);

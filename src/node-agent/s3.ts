@@ -12,10 +12,12 @@
  * What it asks only while an object is so, the commits of the snapshots, holds only on a
  * store that honours the conditions (If-Match, If-None-Match) of a PUT and a DELETE, checking
  * each with the write it conditions, at once: AWS's S3 does, and the SeaweedFS alasio installs
- * (4.48: on the key's owner filer, under its per-path lock, where it routes the request there,
- * and under its own write lock of the object otherwise, which a write routed to the owner does
- * not take, so that a routed write and one that was not can still interleave; upstream's, not
- * patched here). A store that ignores them is refused as the agent starts (checkConditions).
+ * (4.54: a PUT's, a multipart upload's completion's and a DELETE's in the transaction that
+ * writes it, on the key's owner filer, under its per-path lock, where the gateway routes the
+ * request there, and under the gateway's own write lock of the object otherwise, as while the
+ * owner does not answer, which a write routed to the owner does not take, so that a routed write
+ * and one that was not can still interleave; upstream's, not patched here). A store that
+ * ignores them is refused as the agent starts (checkConditions).
  *
  * A file larger than a part (`partBytes`) is put as a multipart upload, its parts sent
  * `parallel` at a time, and got in ranges of a part, as many at a time: one stream of
