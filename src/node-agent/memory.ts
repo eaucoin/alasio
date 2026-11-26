@@ -9,7 +9,9 @@
  * rest being the sandbox's own: its Sentry's, its gofer's and its shims' (overhead). So counted,
  * its application's memory is the Sentry's own accounting of it, which no process's RSS in the
  * sandbox is, as each counts the pages it shares once more. Beside them the node's memory, as its
- * /proc/meminfo says, and the agent's own, its cgroup's.
+ * /proc/meminfo says, and the agent's own, its cgroup's, split as a sandbox's is: its anonymous
+ * memory, which only the agent's own work holds, and its page cache, which the kernel takes back
+ * as the agent nears its limit; and its cgroup's events.
  *
  * And the budget of what is held ahead of a session's need, standbys and free pods now (frozen
  * and reclaimed sessions as alasio's tiers come): half of what the node's memory leaves once
@@ -52,12 +54,30 @@ export interface SandboxMemory {
   readonly zswapBytes: number | null;
 }
 
+/** How often the kernel has said the agent's cgroup reached its memory.high, its memory.max, ran out of memory, and killed in it so (memory.events). */
+export interface MemoryEvents {
+  readonly high: number;
+  readonly max: number;
+  readonly oom: number;
+  readonly oomKill: number;
+}
+
 /** The node's memory and its sandboxes', in bytes, as the module says. */
 export interface NodeMemory {
   readonly totalBytes: number;
   readonly availableBytes: number;
-  /** The agent's own, as its cgroup counts it; null where it cannot be read. */
+  /**
+   * The agent's own, as its cgroup counts it: all of it; its anonymous memory, which the kernel
+   * reclaims none of without swap; its page cache, mostly its store proxy's reads, of it what is
+   * active and inactive, and dirty; and its cgroup's events. Null where they cannot be read.
+   */
   readonly agentBytes: number | null;
+  readonly agentAnonBytes: number | null;
+  readonly agentFileBytes: number | null;
+  readonly agentActiveFileBytes: number | null;
+  readonly agentInactiveFileBytes: number | null;
+  readonly agentDirtyBytes: number | null;
+  readonly agentEvents: MemoryEvents | null;
   /** What may be held ahead of a session's need, and what is. */
   readonly budgetBytes: number;
   readonly budgetedBytes: number;
@@ -124,15 +144,30 @@ export async function podCgroup(cgroups: string, uid: string): Promise<string | 
   return null;
 }
 
+/** The agent's own memory, as NodeMemory says it. */
+export type OwnMemory = { readonly [K in "agentBytes" | "agentAnonBytes" | "agentFileBytes" | "agentActiveFileBytes" | "agentInactiveFileBytes" | "agentDirtyBytes" | "agentEvents"]: NodeMemory[K] };
+
 /**
  * The memory of the agent's own cgroup, as `proc` (its /proc/self/cgroup, `0::<path>`) names it
  * under the cgroups' root `cgroups`: of the path as it is, where the agent shares the node's
- * cgroup namespace, or of the root itself, where its own namespace's root is its cgroup. Null
+ * cgroup namespace, or of the root itself, where its own namespace's root is its cgroup. None
  * where neither is read.
  */
-export async function ownMemory(proc: string, cgroups: string): Promise<number | null> {
+export async function ownMemory(proc: string, cgroups: string): Promise<OwnMemory> {
   const path = /^0::(\/.*)$/mu.exec((await text(proc)) ?? "")?.[1];
-  return (path === undefined ? null : await numberIn(join(cgroups, path, "memory.current"))) ?? (await numberIn(join(cgroups, "memory.current")));
+  const own = path !== undefined && (await numberIn(join(cgroups, path, "memory.current"))) !== null ? join(cgroups, path) : cgroups;
+  const bytes = await numberIn(join(own, "memory.current"));
+  const [stat, events] = bytes === null ? [null, null] : await Promise.all([text(join(own, "memory.stat")), text(join(own, "memory.events"))]);
+  const event = (key: string) => statOf(events, key) ?? 0;
+  return {
+    agentBytes: bytes,
+    agentAnonBytes: statOf(stat, "anon"),
+    agentFileBytes: statOf(stat, "file"),
+    agentActiveFileBytes: statOf(stat, "active_file"),
+    agentInactiveFileBytes: statOf(stat, "inactive_file"),
+    agentDirtyBytes: statOf(stat, "file_dirty"),
+    agentEvents: events === null ? null : { high: event("high"), max: event("max"), oom: event("oom"), oomKill: event("oom_kill") },
+  };
 }
 
 /** A sandbox's memory, as the module says, with its pod's cgroup, under the node's cgroup root as the agent sees it; null where it was not found. */
@@ -195,7 +230,7 @@ export const nodeMemory = ({ runsc, nodeRoot, attachRoot, ownProc = OWN_PROC, ow
     return {
       totalBytes,
       availableBytes: meminfoOf(meminfo, "MemAvailable") ?? 0,
-      agentBytes: yield* Effect.promise(() => ownMemory(ownProc, ownCgroups)),
+      ...(yield* Effect.promise(() => ownMemory(ownProc, ownCgroups))),
       budgetBytes: Math.max(0, Math.floor((totalBytes - NODE_MEMORY_RESERVED_BYTES - NODE_MEMORY_SOFT_EVICTION_BYTES - sum("bound")) / 2)),
       budgetedBytes: sum(["standby", "free"]),
       sandboxes,
@@ -212,7 +247,14 @@ const sandboxCount = meter.createObservableGauge("alasio.node_agent.sandboxes", 
 });
 const nodeTotal = meter.createObservableGauge("alasio.node.memory.total", { description: "The node's memory, as its /proc/meminfo says (MemTotal)", unit: "By" });
 const nodeAvailable = meter.createObservableGauge("alasio.node.memory.available", { description: "The node's memory available, as its /proc/meminfo says (MemAvailable)", unit: "By" });
-const agentMemory = meter.createObservableGauge("alasio.node_agent.memory", { description: "The node agent's own memory, as its cgroup counts it", unit: "By" });
+const agentMemory = meter.createObservableGauge("alasio.node_agent.memory", {
+  description: "The node agent's own memory, as its cgroup counts it, by part: all of it (cgroup); of it anonymous (anon), which the kernel reclaims none of without swap, and file-backed (file), its page cache, which the kernel reclaims as the agent nears its limit",
+  unit: "By",
+});
+const agentEvents = meter.createObservableCounter("alasio.node_agent.memory.events", {
+  description: "How often the kernel has said the node agent's cgroup reached its memory.high (high) or its limit (max), ran out of memory (oom), and killed in it so (oom_kill), as its memory.events says",
+  unit: "{event}",
+});
 const budget = meter.createObservableGauge("alasio.node_agent.memory.budget", {
   description: "What of the node's memory may be held ahead of a session's need: half of what kubelet's reservations, its soft eviction threshold and the bound sandboxes leave",
   unit: "By",
@@ -224,7 +266,7 @@ export const observeNodeMemory = (options: MemoryOptions): Effect.Effect<void, n
   Effect.gen(function*() {
     // The gauges are read as metrics are exported, outside every fiber of the agent's.
     const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
-    const gauges = [sandboxMemory, sandboxCount, nodeTotal, nodeAvailable, agentMemory, budget, budgeted];
+    const gauges = [sandboxMemory, sandboxCount, nodeTotal, nodeAvailable, agentMemory, agentEvents, budget, budgeted];
     yield* Effect.acquireRelease(
       Effect.sync(() => {
         const observe = (result: BatchObservableResult) =>
@@ -246,7 +288,10 @@ export const observeNodeMemory = (options: MemoryOptions): Effect.Effect<void, n
             }
             result.observe(nodeTotal, memory.totalBytes);
             result.observe(nodeAvailable, memory.availableBytes);
-            if (memory.agentBytes !== null) result.observe(agentMemory, memory.agentBytes);
+            const own: Readonly<Record<string, number | null>> = { cgroup: memory.agentBytes, anon: memory.agentAnonBytes, file: memory.agentFileBytes };
+            for (const [part, bytes] of Object.entries(own)) if (bytes !== null) result.observe(agentMemory, bytes, { "alasio.memory.part": part });
+            const events: Readonly<Record<string, number>> = memory.agentEvents === null ? {} : { high: memory.agentEvents.high, max: memory.agentEvents.max, oom: memory.agentEvents.oom, oom_kill: memory.agentEvents.oomKill };
+            for (const [event, count] of Object.entries(events)) result.observe(agentEvents, count, { "alasio.memory.event": event });
             result.observe(budget, memory.budgetBytes);
             result.observe(budgeted, memory.budgetedBytes);
           }));
