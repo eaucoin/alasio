@@ -3903,17 +3903,18 @@ test("a resume waits for the pod's rules on every address, forgets the connectio
       here.pod.podIPs = [POD_IP, POD_IPV6];
       const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
       yield* TestClock.adjust("1 second");
-      // Looked for every 50 ms, its sandbox untouched meanwhile: KUBE-ROUTER-FORWARD of each family, which has no jump of its IPv4 address's yet.
+      // Looked for every 10 ms, its sandbox untouched meanwhile: KUBE-ROUTER-FORWARD of each family, which has no jump of its IPv4 address's yet.
       assert.equal(resuming.pollUnsafe(), undefined);
       assert.deepEqual(host.ran.slice(0, 3), [listing(4, FORWARD), listing(6, FORWARD), listing(6, podChainOf(host.ipv6))]);
-      assert.equal(host.ran.length, 63);
+      assert.equal(host.ran.length, 303);
       assert.deepEqual(here.releases.calls(RELEASE), []);
 
+      // Found by the look 10 ms after its rules were written.
       host.ipv4 = programmed;
       host.answer = (command) => (command[0] === "conntrack" && command.includes(POD_IPV6) ? { exitCode: 0, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): 2 flow entries have been deleted.\n" } : null);
-      yield* TestClock.adjust("50 millis");
+      yield* TestClock.adjust("10 millis");
       yield* Fiber.join(resuming);
-      assert.deepEqual(host.ran.slice(63), [
+      assert.deepEqual(host.ran.slice(303), [
         listing(4, FORWARD),
         listing(4, podChainOf(programmed)),
         listing(6, FORWARD),

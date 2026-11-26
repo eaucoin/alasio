@@ -942,10 +942,14 @@ const EVICT_POLL: Duration.Input = "1 minute";
 const SPEND_READS = { times: 3, schedule: Schedule.exponential("50 millis") };
 /**
  * How often a resume looks for a restored pod's rules: kube-router writes them a few hundred
- * milliseconds after the pod's address reaches the API server, which the restore waits on.
- * A look lists a chain or two of the node's filter table, some 5 ms each.
+ * milliseconds after the pod's address reaches the API server, which the restore waits on, in
+ * one sync of every pod on the node, its cost some 4 ms a pod on a runner's 4 cores. What the
+ * wait adds past that write is a look and half the time between two: a look lists a chain or
+ * two of the node's filter table, 10 to 25 ms on that runner as it holds 50 to 100 pods; a
+ * pause of 50 ms after each left 57 ms past the write at the median, 189 at the 90th
+ * percentile, and one of 10 ms 35 and 69, of 40 restores each into pods made for them.
  */
-const POLICY_POLL = "50 millis";
+const POLICY_POLL = "10 millis";
 /**
  * How a resume's watch of its pod that fails, as one whose connection drops does, is asked again:
  * five times more in all, 100 ms after it failed, then twice as long each time.
