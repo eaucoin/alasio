@@ -869,3 +869,96 @@ groups:
               type: threshold
               expression: seconds
               conditions: [{evaluator: {type: gt, params: [10]}}]
+
+      # A node agent's own memory, its cgroup's anonymous memory alone: what the kernel cannot
+      # take back without swap. Its page cache, of the store proxy's reads mostly, fills its
+      # cgroup to its limit (512 MiB) after most restores of a large image, and the kernel
+      # takes it back there, as memory.events' max counts, so neither its whole nor max says
+      # it is short; its anonymous memory peaked at 364 MiB in the benchmark's restores.
+      - uid: alasio-node-agent-memory
+        title: A node agent's own memory nears its limit
+        condition: near
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "The node agent {{ $labels.agent }} holds {{ humanize1024 $values.anon.Value }}B of anonymous memory, of its limit of 512 MiB, which page cache cannot make room for."
+        data:
+          - refId: anon
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: anon
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select ResourceAttributes['service.instance.id'] as agent, arg_max(Value, TimeUnix) as anon
+                  from otel.metrics_gauge
+                  where MetricName = 'alasio.node_agent.memory' and Attributes['alasio.memory.part'] = 'anon'
+                    and TimeUnix > now()::timestamp - interval 5 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: agent, text: agent, type: string}
+                - {selector: anon, text: anon, type: number}
+          - refId: near
+            datasourceUid: __expr__
+            model:
+              refId: near
+              type: threshold
+              expression: anon
+              # At or above 448 MiB: above 448 MiB less a byte, as a threshold has no inclusive bound.
+              conditions: [{evaluator: {type: gt, params: [469762047]}}]
+
+      # A node agent's cgroup ran out of memory, or the kernel killed in it so, as its
+      # memory.events counts it (alasio.node_agent.memory.events, running totals of the
+      # cgroup's life): the agent stops, and the saves and restores it serves with it.
+      - uid: alasio-node-agent-oom
+        title: A node agent ran out of memory
+        condition: out
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $values.events }} times in the last ten minutes a node agent's cgroup ran out of memory or had a process killed so: its saves and restores stopped with it."
+        data:
+          - refId: events
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: events
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select coalesce(sum(added), 0)::int as events from (
+                    select greatest(Value - lag(Value) over (partition by ResourceAttributes['service.instance.id'], Attributes['alasio.memory.event'] order by TimeUnix), 0) as added
+                    from otel.metrics_sum
+                    where MetricName = 'alasio.node_agent.memory.events' and Attributes['alasio.memory.event'] in ('oom', 'oom_kill')
+                      and TimeUnix > now()::timestamp - interval 10 minute
+                  )
+              root_selector: ""
+              columns:
+                - {selector: events, text: events, type: number}
+          - refId: out
+            datasourceUid: __expr__
+            model:
+              refId: out
+              type: threshold
+              expression: events
+              conditions: [{evaluator: {type: gt, params: [0]}}]

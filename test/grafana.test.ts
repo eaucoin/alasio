@@ -61,3 +61,33 @@ test("Grafana does not start without a user to alert, or with what is not a user
   assert.equal(start({ TELEGRAM_ALLOWED_USER_IDS: "", TELEGRAM_BOT_TOKEN: "123:secret" }).failed, "TELEGRAM_ALLOWED_USER_IDS names no user to alert");
   assert.equal(start({ TELEGRAM_ALLOWED_USER_IDS: "1001,x: y", TELEGRAM_BOT_TOKEN: "123:secret" }).failed, "TELEGRAM_ALLOWED_USER_IDS holds x:, which is not a Telegram user's id");
 });
+
+/** The rule `uid` of the image's alert rules, as its text says it: its severity, how long it must hold, its threshold, and its query. */
+function ruleOf(uid: string): { readonly severity: string | undefined; readonly for: string | undefined; readonly threshold: string | undefined; readonly query: string } {
+  const rules = readFileSync(new URL("provisioning/alerting/rules.yaml", IMAGE), "utf8");
+  const at = rules.indexOf(`      - uid: ${uid}\n`);
+  assert.ok(at >= 0, `no rule ${uid}`);
+  const next = rules.indexOf("\n      - uid: ", at + 1);
+  const text = rules.slice(at, next === -1 ? undefined : next);
+  return {
+    severity: /labels: \{severity: (\w+)\}/u.exec(text)?.[1],
+    for: /^ {8}for: (\S+)$/mu.exec(text)?.[1],
+    threshold: /conditions: \[\{evaluator: \{type: (\w+), params: \[([^\]]*)\]\}\}\]/u.exec(text)?.slice(1).join(" "),
+    query: text,
+  };
+}
+
+test("a node agent's own memory warns at 448 MiB of anonymous memory for five minutes, and pages on any OOM of its cgroup; never on its whole nor on its cgroup reaching its limit", () => {
+  const memory = ruleOf("alasio-node-agent-memory");
+  assert.deepEqual([memory.severity, memory.for, memory.threshold], ["warning", "5m", "gt 469762047"]);
+  assert.match(memory.query, /MetricName = 'alasio.node_agent.memory' and Attributes\['alasio.memory.part'\] = 'anon'/u);
+  // In bytes as the gauge says them, not rounded: at 448 MiB it fires, at 447.5 MiB not.
+  assert.match(memory.query, /, arg_max\(Value, TimeUnix\) as anon$/mu);
+  const fires = (bytes: number) => bytes > Number(memory.threshold?.split(" ")[1]);
+  assert.deepEqual([fires(448 * 1024 ** 2), fires(447.5 * 1024 ** 2), fires(448 * 1024 ** 2 - 1)], [true, false, false]);
+  const oom = ruleOf("alasio-node-agent-oom");
+  assert.deepEqual([oom.severity, oom.for, oom.threshold], ["critical", "0s", "gt 0"]);
+  assert.match(oom.query, /MetricName = 'alasio.node_agent.memory.events' and Attributes\['alasio.memory.event'\] in \('oom', 'oom_kill'\)/u);
+  // Neither reads the agent's whole, nor its cgroup's high or max events.
+  for (const { query } of [memory, oom]) assert.doesNotMatch(query.replace(/^ *#.*$/gmu, ""), /'cgroup'|'high'|'max'/u);
+});
