@@ -2840,8 +2840,14 @@ describe("node agents", () => {
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     assert.equal(admits(policies, session, store, 8333), false);
     assert.equal(admits(policies, agent, store, 8333), true);
-    // What the gateway writes: each node's addresses, a host's block alone, which no session's pod is of.
-    const written = admitting(policy, { "node-1": ["10.42.0.0", "10.42.0.1", "172.18.0.2"], "node-2": ["fd00:42:1::1"] }) as NetworkPolicyObject;
+    // What the gateway writes, of the store's pods' labels it is given: the selector and types installed, and each node's
+    // addresses, a host's block alone, which no session's pod is of.
+    const gatewayConfigOf = (installed: readonly KubernetesObject[]) =>
+      JSON.parse(one<V1ConfigMap>(installed, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}") as { readonly storeFromNodes: { readonly storeLabels: Record<string, string> } | null };
+    const storeFromNodes = gatewayConfigOf(objects).storeFromNodes;
+    assert.deepEqual(storeFromNodes, { namespace: "alasio", name, storeLabels: store.labels });
+    const written = admitting(policy, { "node-1": ["10.42.0.0", "10.42.0.1", "172.18.0.2"], "node-2": ["fd00:42:1::1"] }, storeFromNodes.storeLabels) as NetworkPolicyObject;
+    assert.deepEqual([written.spec.podSelector, written.spec.policyTypes], [policy.spec.podSelector, policy.spec.policyTypes]);
     const blocks = (written.spec.ingress ?? []).flatMap(({ from = [] }) => from.map(({ ipBlock }) => ipBlock?.cidr));
     assert.deepEqual(blocks, ["10.42.0.0/32", "10.42.0.1/32", "172.18.0.2/32", "fd00:42:1::1/128"]);
     assert.deepEqual(written.spec.ingress?.map(({ ports }) => ports), [[{ protocol: "TCP", port: 8333 }]]);
@@ -2850,8 +2856,6 @@ describe("node agents", () => {
     assert.deepEqual(one<V1Role>(objects, "Role", "alasio-sandbox-gateway-store-admission").rules, [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [name], verbs: ["get", "update"] }]);
     assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-sandbox-gateway-store-admission").rules, [{ apiGroups: [""], resources: ["nodes"], verbs: ["list"] }]);
     for (const kind of ["RoleBinding", "ClusterRoleBinding"]) assert.deepEqual(one<V1RoleBinding>(objects, kind, "alasio-sandbox-gateway-store-admission").subjects, gatewayAccount);
-    const gatewayConfigOf = (installed: readonly KubernetesObject[]) => JSON.parse(one<V1ConfigMap>(installed, "ConfigMap", "alasio-sandbox-gateway").data?.["config.json"] ?? "{}") as { readonly storeFromNodes: unknown };
-    assert.deepEqual(gatewayConfigOf(objects).storeFromNodes, { namespace: "alasio", name });
     // That policy alone, read, by the agents' account, which writes no NetworkPolicy, by any role bound to it.
     assert.deepEqual(one<V1Role>(objects, "Role", "alasio-node-agent-store-admission").rules, [{ apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], resourceNames: [name], verbs: ["get"] }]);
     assert.deepEqual(one<V1RoleBinding>(objects, "RoleBinding", "alasio-node-agent-store-admission").subjects, [{ kind: "ServiceAccount", name: "alasio-node-agent", namespace: "alasio" }]);

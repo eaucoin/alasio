@@ -8,16 +8,26 @@
  * (../node-agent/store-admission.ts), so a node's agent cannot change what the policy admits.
  *
  * As the gateway starts and every ADMISSION_EVERY_MS after, it lists the cluster's nodes and
- * writes the policy, as of the version it read, where it admits other than they hold: on the S3
- * port, each address of each node's, as its Node object says them (its InternalIP and ExternalIP
- * addresses), and the first two of each of its pods' ranges (spec.podCIDRs), from which the
- * node's own processes reach the pods of other nodes (an overlay's interface takes the first, a
- * bridge the second, as flannel's do); none where there are none, as a rule of no peer would admit
- * everyone. What it keeps of each node is in the policy too (NODE_ADDRESSES_ANNOTATION), which
- * the agents read. A session's pod, of another address of its node's range, is not among them;
- * nor is a node gone from the cluster. Each replica of the gateway writes the same, so two at once
- * agree; one whose write finds the policy written since reads it again. What fails is said, and
- * tried again ADMISSION_EVERY_MS on.
+ * writes the policy, as of the version it read, where its spec is other than the gateway's own:
+ * the store's pods selected, by the labels it is given, for ingress alone, admitted on the S3 port
+ * from each address of each node's, as its Node object says them (its InternalIP and ExternalIP
+ * addresses), and the first two of each of its pods' ranges (spec.podCIDRs); none where there are
+ * none, as a rule of no peer would admit everyone. Its whole spec is the gateway's, so that one
+ * changed by anyone else, its selector or its types as its rule, is set back. What it keeps of
+ * each node is in the policy too (NODE_ADDRESSES_ANNOTATION), which the agents read. A session's
+ * pod, of another address of its node's range, is not among them; nor is a node gone from the
+ * cluster. Each replica of the gateway writes the same, so two at once agree; one whose write
+ * finds the policy written since reads it again. What fails is said, and tried again
+ * ADMISSION_EVERY_MS on.
+ *
+ * The addresses of a node's pods' range assume the CNI alasio installs with k3s, flannel, whose
+ * host-side interfaces take them: the overlay's (flannel.1) the range's first, from which the node
+ * reaches another node's pods, a Service's ClusterIP among them; the bridge's (cni0) the second,
+ * from which it reaches its own. Under another CNI, whose host-side addresses are others, a
+ * restore by URLs reaches the store on no node but the store's own, as the store's pods refuse
+ * the rest: so the node agents' restores by URLs are not the default (sessions.snapshots
+ * restoreReads), and not to be made it before a test of two nodes, on a release that reads by
+ * URLs, has shown a restore read the store across nodes.
  */
 import { isIPv6 } from "node:net";
 
@@ -84,16 +94,19 @@ export function nodeAddressesOf(node: V1Node): readonly string[] {
   return [...new Set([...own, ...ranges.flatMap(rangeStart)])].sort();
 }
 
-/** The policy `policy`, of each node's addresses `kept`, as it admits them: on the S3 port, each address any node holds, as a host's of its own; none where there are none. */
-export function admitting(policy: KubernetesObject, kept: Readonly<Record<string, readonly string[]>>): KubernetesObject {
+/**
+ * The policy `policy`, of each node's addresses `kept`, as the gateway has it: its spec its own,
+ * of the store's pods, by their labels `storeLabels`, for ingress alone, admitted on the S3 port
+ * from each address any node holds, as a host's of its own; from none where there are none.
+ */
+export function admitting(policy: KubernetesObject, kept: Readonly<Record<string, readonly string[]>>, storeLabels: Readonly<Record<string, string>>): KubernetesObject {
   const addresses = [...new Set(Object.values(kept).flat())].sort();
-  const spec = (policy as { readonly spec?: Record<string, unknown> }).spec ?? {};
   return {
     ...policy,
     metadata: { ...policy.metadata, annotations: { ...policy.metadata?.annotations, [NODE_ADDRESSES_ANNOTATION]: JSON.stringify(Object.fromEntries(Object.entries(kept).sort(([a], [b]) => a.localeCompare(b)))) } },
     spec: {
-      ...spec,
-      // Its fields in the order the API server gives them back, which a policy read is compared in.
+      podSelector: { matchLabels: { ...storeLabels } },
+      policyTypes: ["Ingress"],
       ingress: addresses.length === 0 ? [] : [{
         ports: [{ protocol: "TCP", port: STORE_S3_PORT }],
         from: addresses.map((address) => ({ ipBlock: { cidr: `${address}/${isIPv6(address) ? 128 : 32}` } })),
@@ -102,21 +115,29 @@ export function admitting(policy: KubernetesObject, kept: Readonly<Record<string
   } as KubernetesObject;
 }
 
+/** `value` as JSON, each object's keys sorted: what two policies' specs are compared by, whatever order the API server gives their fields in. */
+function canonical(value: unknown): string {
+  return JSON.stringify(value, (_key, each: unknown) =>
+    each !== null && typeof each === "object" && !Array.isArray(each)
+      ? Object.fromEntries(Object.entries(each as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+      : each);
+}
+
 /**
  * Has the policy `name` of `namespace` admit the cluster's nodes as they are now, as the module
  * says: whether it wrote it, or found it as it would have; null where there is no policy.
  */
-export const admitNodes = (kube: Pick<KubeClient["Service"], "read" | "list" | "replace">, namespace: string, name: string): Effect.Effect<"written" | "unchanged" | null, KubeApiError> =>
+export const admitNodes = (kube: Pick<KubeClient["Service"], "read" | "list" | "replace">, namespace: string, name: string, storeLabels: Readonly<Record<string, string>>): Effect.Effect<"written" | "unchanged" | null, KubeApiError> =>
   Effect.gen(function*() {
     for (let tries = 1;; tries++) {
       const policy = yield* kube.read("networking.k8s.io/v1", "NetworkPolicy", namespace, name);
       if (policy === null) return null;
       const nodes = (yield* kube.list("v1", "Node", "", "")) as readonly V1Node[];
       const kept = Object.fromEntries(nodes.map((node) => [node.metadata?.name ?? "", nodeAddressesOf(node)] as const).filter(([named]) => named !== ""));
-      const after = admitting(policy, kept);
-      // As it would be written: its kept addresses and its rule, as read.
+      const after = admitting(policy, kept, storeLabels);
+      // As it would be written: its kept addresses, and its whole spec, as read.
       const same = after.metadata?.annotations?.[NODE_ADDRESSES_ANNOTATION] === policy.metadata?.annotations?.[NODE_ADDRESSES_ANNOTATION] &&
-        JSON.stringify((after as { readonly spec?: { readonly ingress?: unknown } }).spec?.ingress) === JSON.stringify((policy as { readonly spec?: { readonly ingress?: unknown } }).spec?.ingress ?? []);
+        canonical((after as { readonly spec?: unknown }).spec) === canonical({ ingress: [], ...(policy as { readonly spec?: object }).spec });
       if (same) return "unchanged";
       const written = yield* kube.replace(after).pipe(
         Effect.as(true),
@@ -127,8 +148,8 @@ export const admitNodes = (kube: Pick<KubeClient["Service"], "read" | "list" | "
   });
 
 /** Keeps the policy `name` of `namespace` admitting the cluster's nodes, as the module says, for as long as the gateway runs. */
-export const keepNodesAdmitted = (kube: Pick<KubeClient["Service"], "read" | "list" | "replace">, namespace: string, name: string, everyMs: number = ADMISSION_EVERY_MS): Effect.Effect<never> =>
-  admitNodes(kube, namespace, name).pipe(
+export const keepNodesAdmitted = (kube: Pick<KubeClient["Service"], "read" | "list" | "replace">, namespace: string, name: string, storeLabels: Readonly<Record<string, string>>, everyMs: number = ADMISSION_EVERY_MS): Effect.Effect<never> =>
+  admitNodes(kube, namespace, name, storeLabels).pipe(
     Effect.tap((done) =>
       done === null
         ? Effect.logWarning(`the bundled store's policy ${namespace}/${name}, which admits the nodes whose restores read it by URLs, is not there: their restores reach it on no node but their own`)

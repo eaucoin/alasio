@@ -2,17 +2,20 @@
  * The reads of the restores whose checkpoint gofers read the snapshots bucket straight from the
  * store, by URLs the agent presigned for each file they read (./agent.ts goferOptions), as the
  * agent follows them: not on their path, as through its proxy (./store-proxy.ts), but by what each
- * gofer counts in a file of its own (its options' `served_file`), the bytes of pages files it read
- * from the store, each counted once, as they arrive, the file replaced whole as the count grows.
+ * gofer counts in a file of its own (its options' `served_file`): the bytes of pages files it read
+ * from the store, each counted once, as they arrive, and the GETs of them it made, answered or
+ * not, the file replaced whole as they grow.
  *
  * A restore is followed from its prepare (follow) for as long as the proxy's token would last
  * (PREPARED_FOR_MS), and from its resume as long as the agent says its background reads may take
- * (resumed), and for as long after as its count keeps growing: each look that finds it grown has
- * it followed ASKED_WINDOW_MS from then at least, never past RESUMED_CEILING_MS from its resume,
- * so that a store away for a while, which its gofer waits for, delays its reads rather than ends
- * its following under them. It is done reading once its gofer has read the bytes of pages its
+ * (resumed), and for as long after as either count keeps growing, as a token asked of again
+ * lasts: each look that finds one grown has it followed ASKED_WINDOW_MS from then at least, never
+ * past RESUMED_CEILING_MS from its resume. A store away for a while, which its gofer asks again
+ * and again, delivering nothing, so delays its reads rather than ends its following, and its URLs'
+ * signing, under them: its URLs are signed on, and taken once the store is back, where they would
+ * have lapsed, and been refused. It is done reading once its gofer has read the bytes of pages its
  * image holds, where the agent told them (expect), which ends its following, said once; where it
- * did not, once it is resumed and its count has not grown for QUIET_MS. Its restore done with
+ * did not, once it is resumed and neither count has grown for QUIET_MS. Its restore done with
  * (revoke), it is followed no more. What it is followed by is kept, where told (file), in a file
  * on the node's tmpfs, which an agent that starts again reads back: its gofer reads on without the
  * agent, and its count is on the node. One read back resumed and within its ceiling is followed
@@ -22,7 +25,8 @@
  * Its URLs, one of each object it reads, by the path its gofer serves it at, are in a file of its
  * own on the node's tmpfs, which only root reads (its options' `urls_file`), each lasting
  * URL_TTL_MS: as long as it is followed, they are signed anew every third of that, and as the agent
- * starts, those of each restore it reads back, and its gofer reads the file again as one nears its
+ * starts, those of each restore it reads back (where they cannot be, again soon, after a while that
+ * doubles from SIGN_RETRY_FIRST_MS), and its gofer reads the file again as one nears its
  * expiry, or once as the store refuses one, where the file changed. A store away for longer than
  * that delays the restore's reads, which go on by new URLs once it is back. Unlike a token, a URL
  * cannot be revoked: once its restore is followed no more, its file is removed and its URLs
@@ -37,6 +41,9 @@ import { Cause, Effect, Schedule, Schema, type Scope } from "effect";
 
 import { S3Error } from "./s3.ts";
 import { ASKED_WINDOW_MS, PREPARED_FOR_MS, QUIET_MS, RESUMED_CEILING_MS } from "./store-proxy.ts";
+
+/** How soon URLs that could not be signed are signed again first, the while doubling each time they cannot be, up to a third of their lifetime. */
+export const SIGN_RETRY_FIRST_MS = 1_000;
 
 /**
  * How long each URL a restore's gofer reads by lasts, as the module says: longer than twice what
@@ -73,14 +80,15 @@ export interface GoferReads {
 /**
  * What makeGoferReads is given: the directory of its restores' files of URLs, on the node's tmpfs,
  * and what signs a URL of an object for so many seconds (./store-urls.ts); the file it keeps what
- * it follows in, if any; and, unless told, URL_TTL_MS, PREPARED_FOR_MS, QUIET_MS, ASKED_WINDOW_MS
- * and RESUMED_CEILING_MS.
+ * it follows in, if any; and, unless told, URL_TTL_MS, SIGN_RETRY_FIRST_MS, PREPARED_FOR_MS,
+ * QUIET_MS, ASKED_WINDOW_MS and RESUMED_CEILING_MS.
  */
 export interface GoferReadsOptions {
   readonly urlsDir: string;
   readonly presign: (key: string, expiresSeconds: number) => Effect.Effect<string, S3Error>;
   readonly file?: string;
   readonly urlTtlMs?: number;
+  readonly signRetryFirstMs?: number;
   readonly preparedForMs?: number;
   readonly quietMs?: number;
   readonly askedWindowMs?: number;
@@ -103,8 +111,9 @@ interface Followed {
   ceiling: number;
   /** The bytes of pages its restore reads, where the agent told them. */
   expected: number | null;
-  /** The bytes its gofer said last it read, and when that last grew, or it was followed or resumed. */
+  /** The bytes its gofer said last it read, and the GETs it said it made; when either last grew, or it was followed or resumed. */
   served: number;
+  gets: number;
   grewAt: number;
 }
 
@@ -123,14 +132,14 @@ const FollowedFile = Schema.fromJsonString(Schema.Struct({
   })),
 }));
 
-/** What a gofer's served file holds: a decimal number and a newline. */
-const SERVED = /^(\d+)\n$/u;
+/** What a gofer's served file holds: the bytes of pages it read and the GETs of them it made, decimal numbers, a space between, and a newline. */
+const SERVED = /^(\d+) (\d+)\n$/u;
 
-/** The bytes the gofer counting in `servedFile` says it read, or null where it says none yet, as one not started has written none. */
-function servedIn(servedFile: string): number | null {
+/** What the gofer counting in `servedFile` says it read, and asked, or null where it says nothing yet, as one not started has written nothing. */
+function servedIn(servedFile: string): { readonly bytes: number; readonly gets: number } | null {
   try {
-    const said = SERVED.exec(readFileSync(servedFile, "utf8"))?.[1];
-    return said === undefined ? null : Number(said);
+    const said = SERVED.exec(readFileSync(servedFile, "utf8"));
+    return said === null ? null : { bytes: Number(said[1]), gets: Number(said[2]) };
   } catch {
     return null;
   }
@@ -148,6 +157,7 @@ export const makeGoferReads = Effect.fnUntraced(function*({
   presign,
   file,
   urlTtlMs = URL_TTL_MS,
+  signRetryFirstMs = SIGN_RETRY_FIRST_MS,
   preparedForMs = PREPARED_FOR_MS,
   quietMs = QUIET_MS,
   askedWindowMs = ASKED_WINDOW_MS,
@@ -213,7 +223,8 @@ export const makeGoferReads = Effect.fnUntraced(function*({
           // Its gofer read on as the agent was away: followed askedWindowMs from now at least, within its ceiling.
           const until = restore.resumed && now < restore.ceiling ? Math.max(restore.until, Math.min(restore.ceiling, now + askedWindowMs)) : restore.until;
           if (until <= now) continue;
-          followed.set(reader, { ...restore, until, served: servedIn(restore.servedFile) ?? 0, grewAt: now });
+          const counted = servedIn(restore.servedFile);
+          followed.set(reader, { ...restore, until, served: counted?.bytes ?? 0, gets: counted?.gets ?? 0, grewAt: now });
           held.set(restore.holder, reader);
         }
         if (followed.size > 0) runSync(Effect.logInfo(`the node agent took back the following of ${followed.size} restores reading the snapshots bucket by URLs`));
@@ -238,16 +249,22 @@ export const makeGoferReads = Effect.fnUntraced(function*({
     keep();
   };
 
-  /** Signs anew the URLs of each restore still followed, as the module says: one not signed is said, and read on by its URLs until they expire. */
-  const signAgain: Effect.Effect<void> = Effect.suspend(() =>
+  /**
+   * Signs anew the URLs of each restore still followed, as the module says: whether every one
+   * was. One not signed is said, and signed again soon (signRetryFirstMs).
+   */
+  const signAgain: Effect.Effect<boolean> = Effect.suspend(() =>
     Effect.forEach([...followed.keys()], (reader) => {
       doneReading(reader);
       const restore = followed.get(reader);
-      if (restore === undefined) return Effect.void;
+      if (restore === undefined) return Effect.succeed(true);
       return sign(reader, restore.objects, () => followed.has(reader)).pipe(
-        Effect.catch((error) => Effect.logWarning(`could not sign anew the URLs the restore of ${restore.holder} reads the snapshots bucket by, so its reads fail once they expire: ${error.message}`)),
+        Effect.as(true),
+        Effect.catch((error) =>
+          Effect.logWarning(`could not sign anew the URLs the restore of ${restore.holder} reads the snapshots bucket by, so its reads fail once they expire unless the next try does: ${error.message}`).pipe(Effect.as(false))
+        ),
       );
-    }, { discard: true })
+    }).pipe(Effect.map((signed) => signed.every(Boolean)))
   );
 
   /**
@@ -259,11 +276,12 @@ export const makeGoferReads = Effect.fnUntraced(function*({
     const restore = followed.get(reader);
     if (restore === undefined) return true;
     const now = Date.now();
-    const served = servedIn(restore.servedFile);
-    if (served !== null && served > restore.served) {
-      restore.served = served;
+    const counted = servedIn(restore.servedFile);
+    if (counted !== null && (counted.bytes > restore.served || counted.gets > restore.gets)) {
+      restore.served = Math.max(restore.served, counted.bytes);
+      restore.gets = Math.max(restore.gets, counted.gets);
       restore.grewAt = now;
-      // Its gofer reading still, it is followed the longer.
+      // Its gofer reading still, or asking still, as of a store away, it is followed the longer.
       if (restore.resumed) restore.until = Math.max(restore.until, Math.min(restore.ceiling, now + askedWindowMs));
     }
     if (now >= restore.until) {
@@ -278,14 +296,21 @@ export const makeGoferReads = Effect.fnUntraced(function*({
   };
 
   // The URLs of those read back signed anew at once, as theirs may have neared their expiry while the agent was away, and
-  // those of restores it follows no more removed; and every third of their lifetime after.
-  yield* signAgain;
+  // those of restores it follows no more removed; and every third of their lifetime after, or, where some were not
+  // signed, again soon, after a while that doubles from signRetryFirstMs up to that third.
+  const signedAll = yield* signAgain;
   try {
     for (const name of readdirSync(urlsDir)) if (!followed.has(name.replace(/\.json(\.new)?$/u, ""))) rmSync(join(urlsDir, name), { force: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") runSync(Effect.logWarning(`the node agent could not remove the URLs of restores it follows no more, in ${urlsDir}, which lapse as they expire: ${error instanceof Error ? error.message : String(error)}`));
   }
-  yield* Effect.forkScoped(Effect.sleep(urlTtlMs / 3).pipe(Effect.andThen(signAgain), Effect.forever));
+  yield* Effect.forkScoped(Effect.gen(function*() {
+    let retryMs: number | null = signedAll ? null : signRetryFirstMs;
+    for (;;) {
+      yield* Effect.sleep(retryMs ?? urlTtlMs / 3);
+      retryMs = (yield* signAgain) ? null : Math.min(urlTtlMs / 3, retryMs === null ? signRetryFirstMs : retryMs * 2);
+    }
+  }));
 
   return {
     follow: (holder, servedFile, objects) => {
@@ -296,7 +321,7 @@ export const makeGoferReads = Effect.fnUntraced(function*({
           const restore = followed.get(before ?? "");
           if (before !== undefined && restore !== undefined) forget(before, restore);
           const now = Date.now();
-          followed.set(reader, { holder, servedFile, objects, until: now + preparedForMs, resumed: false, ceiling: now + preparedForMs, expected: null, served: 0, grewAt: now });
+          followed.set(reader, { holder, servedFile, objects, until: now + preparedForMs, resumed: false, ceiling: now + preparedForMs, expected: null, served: 0, gets: 0, grewAt: now });
           held.set(holder, reader);
           keep();
           return { reader, urlsFile: urlsFileOf(reader) };

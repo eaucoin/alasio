@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Effect, Exit, Fiber, type Scope } from "effect";
+import { Effect, Exit, Fiber, Schedule, type Scope } from "effect";
 
 import { makeGoferReads } from "../src/node-agent/gofer-reads.ts";
 import { S3Error } from "../src/node-agent/s3.ts";
@@ -38,9 +38,9 @@ const OBJECTS = { "pages.img": "main/fs-abc/layers/d1/pages.img", "layers/d0/pag
 /** The URLs in the file `urlsFile`, by path. */
 const urlsIn = (urlsFile: string): Record<string, string> => JSON.parse(readFileSync(urlsFile, "utf8")) as Record<string, string>;
 
-/** Writes `bytes` to the served file `file`, whole, as a gofer replaces it. */
-const serve = (file: string, bytes: number): void => {
-  writeFileSync(`${file}.new`, `${bytes}\n`);
+/** Writes `bytes`, and `gets` GETs, to the served file `file`, whole, as a gofer replaces it. */
+const serve = (file: string, bytes: number, gets = 0): void => {
+  writeFileSync(`${file}.new`, `${bytes} ${gets}\n`);
   renameSync(`${file}.new`, file);
 };
 
@@ -190,5 +190,53 @@ test("a restore's URLs, in a file only root reads, are signed anew every third o
       assert.ok(!unsigned.follows(HOLDER));
       mkdirSync(join(directory, "unsigned"), { recursive: true });
       assert.deepEqual(readdirSync(join(directory, "unsigned")), []);
+    })
+  ));
+
+test("a resumed restore whose gofer asks the store again and again, delivering nothing, as of a store away, is followed on, within its ceiling, as a token asked of again is, and its URLs signed on; once it asks no more, it is followed no more past its window", () =>
+  inDirectory((directory) =>
+    Effect.gen(function*() {
+      const reads = yield* makeGoferReads({ urlsDir: join(directory, "urls"), presign: counting(), preparedForMs: 60_000, askedWindowMs: 300, resumedCeilingMs: 5000 });
+      const served = join(directory, "served");
+      const { reader, urlsFile } = yield* reads.follow(HOLDER, served, OBJECTS);
+      reads.expect(reader, 1_000_000);
+      serve(served, 4096, 1);
+      reads.resumed(HOLDER, 200);
+      // Asking, delivering nothing, for twice its window and more: followed, its bytes as they were.
+      for (let gets = 2; gets <= 12; gets++) {
+        serve(served, 4096, gets);
+        yield* Effect.sleep("100 millis");
+        assert.deepEqual(reads.readingOf(HOLDER), { served: 4096, expected: 1_000_000 }, `after ${gets} GETs`);
+      }
+      assert.ok(existsSync(urlsFile));
+      // Asking no more: followed no more once its window is over, its URLs removed.
+      yield* Effect.sleep("450 millis");
+      assert.equal(reads.readingOf(HOLDER), null);
+      assert.ok(!existsSync(urlsFile));
+    })
+  ));
+
+test("URLs that cannot be signed as the agent starts are signed again soon, not a third of their lifetime later", () =>
+  inDirectory((directory) =>
+    Effect.gen(function*() {
+      const file = join(directory, "run", "gofer-reads.json");
+      const urlsDir = join(directory, "urls");
+      const before = yield* makeGoferReads({ urlsDir, presign: counting(), file, urlTtlMs: 60_000 });
+      const { urlsFile } = yield* before.follow(HOLDER, join(directory, "served"), OBJECTS);
+      const signedBefore = urlsIn(urlsFile);
+      // The store's Service not resolved for the first two URLs the started agent signs.
+      let asked = 0;
+      const presign = (key: string, expiresSeconds: number) =>
+        ++asked <= 2
+          ? Effect.fail(new S3Error({ operation: "signing of a URL", key, reason: "the store's Service did not resolve" }))
+          : Effect.succeed(`https://store.test/snapshots/${key}?expires=${expiresSeconds}&again=${asked}`);
+      const again = yield* makeGoferReads({ urlsDir, presign, file, urlTtlMs: 60_000 });
+      assert.ok(again.follows(HOLDER));
+      assert.deepEqual(urlsIn(urlsFile), signedBefore);
+      yield* Effect.sync(() => urlsIn(urlsFile)["pages.img"] ?? "").pipe(
+        Effect.repeat({ schedule: Schedule.spaced("50 millis"), until: (url) => url.includes("again=") }),
+        Effect.timeout("5 seconds"),
+      );
+      assert.ok(Object.values(urlsIn(urlsFile)).every((url) => url.includes("again=")));
     })
   ));

@@ -368,7 +368,7 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     // Conversations' harnesses' pools, where they run in pools of their own.
     harnesses: harnessesConfig(config),
     // The policy that admits the nodes to the bundled store, which it writes, where restores read the store from the nodes' networks.
-    storeFromNodes: nodesAdmittedToStore(config) ? { namespace: NAMESPACE, name: STORE_FROM_NODES_POLICY } : null,
+    storeFromNodes: nodesAdmittedToStore(config) ? { namespace: NAMESPACE, name: STORE_FROM_NODES_POLICY, storeLabels: selectorLabels("seaweedfs") } : null,
   };
 }
 

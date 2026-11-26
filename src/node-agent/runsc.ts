@@ -35,6 +35,8 @@ export interface RunscOptions {
   readonly current: string;
   /** How long a kill may take, KILL_TIMEOUT_MS unless told. */
   readonly killTimeoutMs?: number;
+  /** How long a fail-load may take, FAIL_LOAD_TIMEOUT_MS unless told. */
+  readonly failLoadTimeoutMs?: number;
 }
 
 /**
@@ -45,6 +47,13 @@ export interface RunscOptions {
  * and of one of another sandbox, end within the 30 s alasio gives an abandon.
  */
 export const KILL_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a fail-load may take: longer than the 10 s the Sentry waits for each of the loads it
+ * ends to end (pgalloc's failAsyncPageLoadsWait), and than runsc's start, so that one that ends
+ * slowly is told as it ends, not taken for one that does not.
+ */
+export const FAIL_LOAD_TIMEOUT_MS = 20_000;
 
 /** What runsc was asked to do and could not, and what it said. */
 export class RunscError extends Schema.TaggedError<RunscError>()("RunscError", {
@@ -305,7 +314,7 @@ export interface Runsc {
    * `reason`, which the sandbox logs, whatever the store answers: the pages not loaded yet are
    * never loaded, and a save of the sandbox that waits for them fails at once ("previous async
    * page loading failed"). How many loads it ended: none where the sandbox loads none. One not
-   * done within KILL_TIMEOUT_MS (RunscOptions.killTimeoutMs) fails, its runsc killed.
+   * done within FAIL_LOAD_TIMEOUT_MS (RunscOptions.failLoadTimeoutMs) fails, its runsc killed.
    */
   readonly failLoad: (release: string, containerId: string, reason: string) => Effect.Effect<number, RunscError | ReleaseNotInstalled>;
   /**
@@ -416,7 +425,7 @@ function runsFor(args: readonly string[], root: string, { id, bundle }: ListedCo
  * other than the one it was found with; a kill reads it again just before, so it kills no
  * process but the one found.
  */
-export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc", current, killTimeoutMs = KILL_TIMEOUT_MS }: RunscOptions): Runsc {
+export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc", current, killTimeoutMs = KILL_TIMEOUT_MS, failLoadTimeoutMs = FAIL_LOAD_TIMEOUT_MS }: RunscOptions): Runsc {
   const releases = Effect.promise(async () => {
     const entries = await readdir(releasesDir, { withFileTypes: true }).catch(() => []);
     const found = await Promise.all(
@@ -544,7 +553,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
 
     failLoad: (release, containerId, reason) =>
       run(release, ["fail-load"], [`--reason=${reason}`, containerId]).pipe(
-        Effect.timeoutOrElse({ duration: killTimeoutMs, orElse: () => Effect.fail(new RunscError({ release, command: `fail-load ${containerId}`, reason: `it did not end within ${killTimeoutMs / 1000} s` })) }),
+        Effect.timeoutOrElse({ duration: failLoadTimeoutMs, orElse: () => Effect.fail(new RunscError({ release, command: `fail-load ${containerId}`, reason: `it did not end within ${failLoadTimeoutMs / 1000} s` })) }),
         Effect.flatMap(({ stdout }) =>
           Effect.try({
             try: () => Schema.decodeUnknownSync(FailedLoads)(JSON.parse(stdout)).ended,
