@@ -61,6 +61,17 @@ test("a restore is timed from its boot log's first line to its success, a standb
   near(made.kernelLoadMs, 61.097902);
   near(made.toRunningMs, 2593.9);
   assert.equal(made.loadedBytes, 36_200_448 + 3_244_572_672);
+  assert.equal(made.awaitedBytes, null);
   const standby = restoreLogged(lines, true);
   near(standby.runscRestoreMs, 8119.522);
+});
+
+test("what a restored sandbox touched before its pages were read, and waited for, is the sum of its layers' waits, as runsc says them", () => {
+  const lines = [
+    "I1125 15:52:29.722498       1 save_restore.go:3578] Async page loading completed in 1.2s (90435584 bytes, 75.363 MB/s; 0 bytes not read, freed or decommitted first); 0 waiters waited 0s~0s for 0 bytes; background reads in flight bounded to 786432 bytes",
+    "I1125 15:52:32.252498       1 save_restore.go:3578] Async page loading completed in 2.53s (1011326976 bytes, 399.796 MB/s; 0 bytes not read, freed or decommitted first); 488 waiters waited 960ms~1.252s for 15323136 bytes; background reads in flight bounded to 786432 bytes",
+  ];
+  const logged = restoreLogged(lines);
+  assert.equal(logged.loadedBytes, 90_435_584 + 1_011_326_976);
+  assert.equal(logged.awaitedBytes, 15_323_136);
 });

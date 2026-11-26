@@ -81,8 +81,9 @@ export function saveLogged(lines: readonly string[]): {
 /**
  * What a restored sandbox's boot log says: how long runsc took from its start to the restore's
  * success, every page loaded; its splits, the kernel's state and the memory files' metadata
- * loaded, and its start to its load's end, runnable; the bytes its layers' loaders loaded; and
- * those lines.
+ * loaded, and its start to its load's end, runnable; the bytes its layers' loaders loaded, and of
+ * them those the sandbox touched first and waited for, as runsc says each layer's; and those
+ * lines.
  */
 export function restoreLogged(lines: readonly string[], standby = false): {
   readonly runscRestoreMs: number | null;
@@ -90,6 +91,7 @@ export function restoreLogged(lines: readonly string[], standby = false): {
   readonly memoryLoadMs: number | null;
   readonly toRunningMs: number | null;
   readonly loadedBytes: number | null;
+  readonly awaitedBytes: number | null;
   readonly said: string[];
 } {
   // A standby's sandbox booted long before its restore: its restore's own start, as its boot process takes it up, instead.
@@ -100,6 +102,8 @@ export function restoreLogged(lines: readonly string[], standby = false): {
   const loading = lines.filter((line) => /Async page loading (completed|read|: )|async loading \d+ bytes from|working set holds/u.test(line));
   const timers = lines.filter((line) => /(Kernel|Memory files|Overall|CPUID) load took|Starting to restore|Restored container|Dirty tracking: armed/u.test(line));
   const completed = loading.flatMap((line) => /Async page loading completed in \S+ \((\d+) bytes/u.exec(line)?.[1] ?? []);
+  // Of each layer's, what the sandbox touched before its loader had read it, and waited for: none where it was all read first.
+  const awaited = loading.flatMap((line) => /Async page loading completed in .* \d+ waiters waited \S+ for (\d+) bytes/u.exec(line)?.[1] ?? []);
   const from = first ? logTimeMs(first) : null;
   const between = (line: string | undefined) => {
     const to = line ? logTimeMs(line) : null;
@@ -111,6 +115,7 @@ export function restoreLogged(lines: readonly string[], standby = false): {
     memoryLoadMs: tookMs(lines, /Memory files load took/u),
     toRunningMs: between(loaded),
     loadedBytes: completed.length === 0 ? null : completed.reduce((sum, bytes) => sum + Number(bytes), 0),
+    awaitedBytes: awaited.length === 0 ? null : awaited.reduce((sum, bytes) => sum + Number(bytes), 0),
     said: [restored, ...timers, ...loading].filter((line): line is string => line !== undefined),
   };
 }
