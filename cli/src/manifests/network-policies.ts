@@ -226,10 +226,11 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
  * 10000), which takes those parts' certificates alone besides (storeSecurityToml), and by the
  * collector's scraper on its metrics port.
  *
- * And main's lake's reconciliation reaches the filers, masters and volume servers on their HTTP
- * ports alone, which it asks whether a file the store fails a read of has its data still
+ * And main's lake's reconciliation reaches the filers and volume servers on their HTTP ports
+ * alone, which it asks whether a file the store fails a read of has its data still
  * (neon/lake/src/reconcile.ts's gone), the filers with a token that reads the lake's bucket
- * alone. A branch environment's reaches none of them, nor does anything else of a branch
+ * alone; not the masters, whose HTTP port takes their own pods' requests alone
+ * (./object-store.ts masterObjects). A branch environment's reaches none of them, nor does anything else of a branch
  * environment's: a master's HTTP port deletes a bucket's volumes whole, as it is asked, for
  * whatever reaches it. The stack's other pods, which reach the store through its gateways,
  * reach none of them.
@@ -237,17 +238,17 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
 function partPolicies(): NetworkPolicy[] {
   const of = (part: StorePart): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(PART_COMPONENTS[part]) } });
   const ports = (http: number) => [http, http + 10_000].map((port) => ({ protocol: "TCP", port }));
-  const part = (name: string, served: keyof typeof PEERS, http: number) =>
+  const part = (name: string, served: keyof typeof PEERS, http: number, reconciled: boolean) =>
     policy(name, NAMESPACE, PART_COMPONENTS[served], {
       podSelector: { matchLabels: selectorLabels(PART_COMPONENTS[served]) },
       policyTypes: ["Ingress"],
       ingress: [
         { from: PEERS[served].map(of), ports: ports(http) },
-        { from: [ofMain(RECONCILE_COMPONENT)], ports: [{ protocol: "TCP", port: http }] },
+        ...(reconciled ? [{ from: [ofMain(RECONCILE_COMPONENT)], ports: [{ protocol: "TCP", port: http }] }] : []),
         { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
       ],
     });
-  return [part(MASTER, "master", 9333), part(VOLUME_SERVER, "volume", 8080), part(FILER, "filer", 8888)];
+  return [part(MASTER, "master", 9333, false), part(VOLUME_SERVER, "volume", 8080, true), part(FILER, "filer", 8888, true)];
 }
 
 /**

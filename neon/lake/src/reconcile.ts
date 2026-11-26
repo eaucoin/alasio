@@ -6,7 +6,7 @@
  * every pass that rewrites its table (./maintain.ts), until it is set right. A file is held
  * lost only on proof: the store answering it has none of it, or bytes of no Parquet file, or,
  * where the store fails its read, as it does both of a file whose chunks are gone and for a
- * moment while a volume server restarts, the bundled store's filer and masters showing a
+ * moment while a volume server restarts, the bundled store's filer and volume servers showing a
  * chunk of it gone (gone); short of that, the reconciliation fails, to be run again.
  *
  * DuckLake has no way to forget a file it cannot read, as a delete reads the rows it deletes.
@@ -212,18 +212,19 @@ async function asked(url: string, { method = "GET", token }: { method?: string; 
 /**
  * Whether the bundled store's parts show the data of the file at `path`, an s3:// path, gone,
  * as a read of it the store failed cannot say: its filer's entry for it, under /buckets, and,
- * of each of its chunks, the masters' location of its volume and that volume server's answer
- * for its id. Gone where the filer has no entry (its /buckets known to be there:
- * bucketListed), an entry of bytes has no chunk, every server of a chunk's volume has no such
- * id, or the volume is not one the masters know while they know every volume server the
- * store runs, read the same TOPOLOGY_PULSES times (topologyWhole): a volume server
- * restarting is dropped from their layout, with its volumes, until it registers again.
- * Throws StoreUndecided where a part does not answer as one of those, or where every chunk
- * is served, as the failure was then the store's of the moment.
+ * of each of its chunks, the volume servers that hold its volume, as each says its volumes
+ * (/status), and their answer for its id. Gone where the filer has no entry (its /buckets
+ * known to be there: bucketListed), an entry of bytes has no chunk, every server of a chunk's
+ * volume has no such id, or no volume server holds the volume while every one the store runs
+ * says its volumes, the same TOPOLOGY_PULSES times `pulseMs` apart (volumesHeld): a volume
+ * server restarting says none until it has loaded them. The masters are not asked, whose HTTP
+ * port takes none but their own pods' (cli/src/manifests/object-store.ts). Throws
+ * StoreUndecided where a part does not answer as one of those, or where every chunk is
+ * served, as the failure was then the store's of the moment.
  */
 export async function gone(path: string, store: StoreParts | null, { pulseMs = TOPOLOGY_PULSE_MS }: { pulseMs?: number } = {}): Promise<boolean> {
   if (store === null) {
-    throw new StoreUndecided(path, "no filer and masters of the bundled object store are this reconciliation's to ask: the store is not the bundled one, or the lake is a branch environment's, which reaches none of them");
+    throw new StoreUndecided(path, "no filer and volume servers of the bundled object store are this reconciliation's to ask: the store is not the bundled one, or the lake is a branch environment's, which reaches none of them");
   }
   const { bucket, key } = /^s3:\/\/(?<bucket>[^/]+)\/(?<key>.+)$/u.exec(path)?.groups ?? {};
   if (!bucket || !key) throw new StoreUndecided(path, "it is not an s3:// path");
@@ -241,54 +242,49 @@ export async function gone(path: string, store: StoreParts | null, { pulseMs = T
   for (const { file_id: fid = "" } of chunks ?? []) {
     const volume = /^(\d+),/u.exec(fid)?.[1];
     if (!volume) throw undecided(`its filer names a chunk ${fid || "with no id"}`);
-    const lookup = await asked(`${store.master}/dir/lookup?volumeId=${volume}`).catch((error: unknown) => {
-      throw undecided(`the masters did not answer for volume ${volume}: ${error instanceof Error ? error.message : String(error)}`);
-    });
-    const { locations = [], error = "" } = (lookup.body ?? {}) as { locations?: { url: string }[]; error?: string };
-    if (/not found/u.test(error)) {
-      const short = await topologyWhole(store, pulseMs);
+    const held = await volumesHeld(store);
+    if (typeof held === "string") throw undecided(held);
+    const holders = store.volumeServers.filter((server) => held.get(server)?.has(Number(volume)));
+    if (holders.length === 0) {
+      const short = await heldByNone(store, Number(volume), pulseMs);
       if (short === null) return true;
-      throw undecided(`the masters know no volume ${volume}, but ${short}`);
+      throw undecided(`no volume server holds volume ${volume}, but ${short}`);
     }
-    if (lookup.status !== 200 || locations.length === 0) throw undecided(`the masters answered ${lookup.status} for volume ${volume}${error ? `: ${error}` : ""}`);
-    const served = await Promise.all(locations.map(({ url }) =>
-      asked(`http://${url}/${fid}`, { method: "HEAD" }).then(({ status }) => status, () => null)
-    ));
+    const served = await Promise.all(holders.map((server) => asked(`${server}/${fid}`, { method: "HEAD" }).then(({ status }) => status, () => null)));
     if (served.every((status) => status === 404)) return true;
     if (!served.some((status) => status === 200)) throw undecided(`the servers of volume ${volume} answered ${served.map((status) => status ?? "nothing").join(", ")} for chunk ${fid}`);
   }
-  throw undecided("its filer, masters and volume servers hold every chunk of it");
+  throw undecided("its filer and volume servers hold every chunk of it");
 }
 
-/** How many times the masters' topology is read before it is held whole, and how far apart. */
+/** How many times the volume servers' volumes are read before a volume none holds is held gone, and how far apart. */
 export const TOPOLOGY_PULSES = 3;
 export const TOPOLOGY_PULSE_MS = 2000;
 
+/** The volumes each of the store's volume servers holds, by its URL, as its /status says them; or why they are not all said. */
+async function volumesHeld(store: StoreParts): Promise<ReadonlyMap<string, ReadonlySet<number>> | string> {
+  const said = await Promise.all(store.volumeServers.map(async (server) => {
+    const status = await asked(`${server}/status`).catch(() => null);
+    const volumes = (status?.body as { Volumes?: { Id?: number }[] | null } | null)?.Volumes;
+    return status?.status === 200 && (volumes === null || Array.isArray(volumes)) ? [server, new Set((volumes ?? []).map(({ Id }) => Id ?? -1))] as const : server;
+  }));
+  const unsaid = said.filter((each): each is string => typeof each === "string");
+  if (unsaid.length > 0) return `the volume servers ${unsaid.join(", ")} did not say their volumes, of the store's ${store.volumeServers.length}`;
+  return new Map(said.filter((each): each is readonly [string, Set<number>] => typeof each !== "string"));
+}
+
 /**
- * Why the masters' topology (/dir/status) is not whole: short of the volume servers the
- * store runs, or not the same servers each of TOPOLOGY_PULSES reads `pulseMs` apart, or not
- * answered; null where it is whole.
+ * Why `volume` is not held gone though no volume server held it once: one of them holding it
+ * since, or not saying its volumes, in TOPOLOGY_PULSES - 1 reads more `pulseMs` apart; null
+ * where none does, every time.
  */
-async function topologyWhole(store: StoreParts, pulseMs: number): Promise<string | null> {
-  let seen: string | null = null;
-  for (let pulse = 0; pulse < TOPOLOGY_PULSES; pulse += 1) {
-    if (pulse > 0) await sleep(pulseMs);
-    const status = await asked(`${store.master}/dir/status`).catch(() => null);
-    if (status?.status !== 200) return `the masters did not say their topology${status ? ` (${status.status})` : ""}`;
-    const servers: string[] = [];
-    const walk = (node: unknown): void => {
-      if (Array.isArray(node)) return node.forEach(walk);
-      if (typeof node !== "object" || node === null) return;
-      for (const [key, value] of Object.entries(node)) {
-        if (key === "DataNodes" && Array.isArray(value)) servers.push(...value.map((server: { Url?: string }) => server.Url ?? ""));
-        else walk(value);
-      }
-    };
-    walk(status.body);
-    if (servers.length < store.volumeServers) return `they know ${servers.length} of the store's ${store.volumeServers} volume servers, as while one restarts`;
-    const now = servers.toSorted().join(",");
-    if (seen !== null && now !== seen) return "their volume servers changed as they were read";
-    seen = now;
+async function heldByNone(store: StoreParts, volume: number, pulseMs: number): Promise<string | null> {
+  for (let pulse = 1; pulse < TOPOLOGY_PULSES; pulse += 1) {
+    await sleep(pulseMs);
+    const held = await volumesHeld(store);
+    if (typeof held === "string") return held;
+    const holder = store.volumeServers.find((server) => held.get(server)?.has(volume));
+    if (holder !== undefined) return `${holder} holds it since`;
   }
   return null;
 }

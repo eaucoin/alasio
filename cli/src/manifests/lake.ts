@@ -55,7 +55,7 @@ import {
 import { replicaBudget, spread } from "./disruption.ts";
 import type { InstallConfig } from "./config.ts";
 import { PROXY_HOST, PROXY_PORT } from "./neon.ts";
-import { FILER, MASTER } from "./object-store.ts";
+import { FILER, volumeServerUrls } from "./object-store.ts";
 import { priority } from "./priorities.ts";
 import { scaledObject, type Trigger } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -288,9 +288,8 @@ export function lakeReconcile(config: InstallConfig, environment: Environment = 
             { name: "LAKE_STORE_FILER_URL", value: `http://${FILER}.${NAMESPACE}.svc:8888` },
             // What the filers take its reads of the lake's entries by, which reads nothing else.
             fromSecret("LAKE_STORE_FILER_TOKEN", componentName("lake"), "LAKE_STORE_FILER_TOKEN"),
-            { name: "LAKE_STORE_MASTER_URL", value: `http://${MASTER}.${NAMESPACE}.svc:9333` },
-            // Every one of which the masters are to know before their not knowing a volume says it is gone.
-            { name: "LAKE_STORE_VOLUME_SERVERS", value: String(config.objectStore.bundled.volumeServers.scaling.min) },
+            // Each volume server the store runs, every one of which is to say its volumes before none holding one says it is gone.
+            { name: "LAKE_STORE_VOLUME_URLS", value: volumeServerUrls(config.objectStore.bundled.volumeServers.scaling.min).join(",") },
           ]
           : []),
       ]),

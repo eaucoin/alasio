@@ -41,6 +41,7 @@ import type {
   V1ServicePort,
   V1StatefulSet,
   V1Volume,
+  V1VolumeMount,
   V1VolumeProjection,
   V1WeightedPodAffinityTerm,
 } from "@kubernetes/client-node";
@@ -244,6 +245,10 @@ const podAddresses = (name: string, service: string, count: number, port: number
 /** The `count` masters, as the other parts, and `weed shell`, reach them. */
 export const masterAddresses = (count: number): string => podAddresses(MASTER, MASTER, count, 9333);
 
+/** The `count` volume servers, by their HTTP URLs, as a client asks each of what it holds. */
+export const volumeServerUrls = (count: number): string[] =>
+  Array.from({ length: count }, (_, ordinal) => `http://${podAddress(VOLUME_SERVER, VOLUME_SERVER, ordinal, 8080)}`);
+
 /** The masters, as the other parts reach them. */
 const masters = ({ objectStore }: InstallConfig) => masterAddresses(objectStore.bundled.masters.scaling.min);
 
@@ -366,6 +371,13 @@ function masterObjects(config: InstallConfig): KubernetesObject[] {
     // volume's live rest, at about half a gigabyte a second.
     "-garbageThreshold=0.1",
     "-telemetry=false",
+    // Its HTTP port's requests that read or change where volumes are, or delete a bucket's
+    // volumes whole (/dir/*, /col/delete, /vol/*), taken from its own pod alone, as an
+    // operator's shell in it asks them, not from whatever else reaches the port: the store's
+    // parts reach each other through gRPC, of mutual TLS, and the filers' wait for a volume
+    // server, the lake's reconciliation and alasio's checks ask through it, or the volume
+    // servers, or in a master's pod. Its probes, /cluster/status, are no such request.
+    "-whiteList=127.0.0.1,::1",
   ];
   const container = partContainer(config, "master", args, "/cluster/status", 9333, bundled.masters.resources, "master");
   const statefulSet = partStatefulSet(config, MASTER, COMPONENTS.master, scaling, { containers: [container], volumes: [configVolume("config", "master")] }, bundled.masters.storage);
@@ -427,14 +439,15 @@ function filerObjects(config: InstallConfig): KubernetesObject[] {
   const { filers } = bundled;
   const image = imageReference(bundled.image);
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: FILER, namespace: NAMESPACE, labels: stackLabels(COMPONENTS.filer) }, data: { "filer.toml": filerToml() } };
-  const waiting = (name: string, waitImage: string, line: string, env: V1EnvVar[] = []): V1Container => ({
+  const waiting = (name: string, waitImage: string, line: string, { env = [], memory = "64Mi", mounts = [] }: { env?: V1EnvVar[]; memory?: string; mounts?: V1VolumeMount[] } = {}): V1Container => ({
     name: `wait-for-${name}`,
     image: waitImage,
     imagePullPolicy: "IfNotPresent",
     command: ["/bin/sh", "-c", line],
     ...(env.length > 0 ? { env } : {}),
     securityContext: restrictedContainer(),
-    resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "64Mi" } },
+    resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory } },
+    ...(mounts.length > 0 ? { volumeMounts: mounts } : {}),
   });
   const initContainers = [
     // Answers PONG once it has loaded its append-only file, LOADING before.
@@ -442,9 +455,17 @@ function filerObjects(config: InstallConfig): KubernetesObject[] {
       "filer-store",
       imageReference(bundled.filerStore.image),
       `until valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.filer.name} ping 2>/dev/null | grep -q PONG; do sleep 2; done`,
-      [{ name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }],
+      { env: [{ name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }] },
     ),
-    waiting("volume-server", image, `until wget -q -O - http://${MASTER}:9333/dir/status | grep -q '"DataNodes":\\[{'; do sleep 2; done`),
+    // Through the masters' gRPC, as the filer, as their HTTP port takes none but their own pods'
+    // requests (masterObjects): their topology's room for volumes, none until a volume server
+    // has registered, or a volume server of theirs, which it names once it holds a volume.
+    waiting(
+      "volume-server",
+      image,
+      `until printf 'volume.list\\n' | weed shell -master=${masters(config)} 2>/dev/null | grep -qE '^Topology .*volume:[0-9]+/[1-9]| DataNode '; do sleep 2; done`,
+      { memory: "256Mi", mounts: [configMount("config")] },
+    ),
   ];
   const args = ["filer", `-master=${masters(config)}`, ownAddress(FILER_PEERS), "-ip.bind=0.0.0.0", "-defaultStoreDir=/tmp"];
   const container: V1Container = {

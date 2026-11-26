@@ -44,26 +44,33 @@ export function dataNodes(status: DirStatus): readonly DataNode[] {
 const rendered = (objects: readonly KubernetesObject[], name: string): number | undefined =>
   (objects.find((object) => object.kind === "StatefulSet" && object.metadata?.name === name) as V1StatefulSet | undefined)?.spec?.replicas;
 
-/** What a running master's /dir/status says, read in its pod; null where no master runs, or it does not answer. */
+/**
+ * What the leading master's /dir/status says, read in its pod, as a master's HTTP port takes
+ * that from its own pod alone and a master that does not lead hands it to the one that does,
+ * from its own address; so each running master is asked in turn, and the first that answers is
+ * the leader. Null where no master runs, or none answers.
+ */
 const dirStatus = Effect.gen(function*() {
   const kube = yield* KubeApi;
   const masters = yield* kube.list<V1Pod>(kind("Pod"), { namespace: NAMESPACE, labelSelector: selectorOf((yield* kube.get<V1StatefulSet>({ ...kind("StatefulSet"), name: MASTER, namespace: NAMESPACE }))?.spec?.selector.matchLabels ?? {}) });
-  const running = masters.find(({ status }) => status?.phase === "Running")?.metadata?.name;
-  if (!running) return null;
-  let printed = "";
-  const stdout = new Writable({
-    write: (chunk: Buffer, _encoding, done) => {
-      printed += chunk.toString("utf8");
-      done();
-    },
-  });
-  const exitCode = yield* kube.exec({ namespace: NAMESPACE, pod: running, container: "master" }, ["wget", "-q", "-O", "-", "http://127.0.0.1:9333/dir/status"], {
-    stdin: null,
-    stdout,
-    stderr: new Writable({ write: (_chunk, _encoding, done) => done() }),
-    tty: false,
-  }).pipe(Effect.orElseSucceed(() => 1));
-  return exitCode === 0 ? parsed(printed) : null;
+  for (const running of masters.filter(({ status }) => status?.phase === "Running").map(({ metadata }) => metadata?.name ?? "")) {
+    let printed = "";
+    const stdout = new Writable({
+      write: (chunk: Buffer, _encoding, done) => {
+        printed += chunk.toString("utf8");
+        done();
+      },
+    });
+    const exitCode = yield* kube.exec({ namespace: NAMESPACE, pod: running, container: "master" }, ["wget", "-q", "-O", "-", "http://127.0.0.1:9333/dir/status"], {
+      stdin: null,
+      stdout,
+      stderr: new Writable({ write: (_chunk, _encoding, done) => done() }),
+      tty: false,
+    }).pipe(Effect.orElseSucceed(() => 1));
+    const status = exitCode === 0 ? parsed(printed) : null;
+    if (status !== null) return status;
+  }
+  return null;
 });
 
 /** `text` as the masters' /dir/status, or null where it is not JSON. */

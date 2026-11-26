@@ -40,17 +40,15 @@
  *   LAKE_RETENTION_DAYS                     the days of telemetry kept (default 30)
  *   LAKE_BRANCH                             the branch environment whose lake it is; unset
  *                                           for main's, whose telemetry a branch's is
- *   LAKE_STORE_FILER_URL, LAKE_STORE_MASTER_URL  the bundled object store's filer and masters,
- *                                           which main's reconciliation asks whether a file
- *                                           the store fails a read of has its data still;
- *                                           unset for another store, and for a branch
- *                                           environment's, which reaches neither
+ *   LAKE_STORE_FILER_URL, LAKE_STORE_VOLUME_URLS  the bundled object store's filer, and each
+ *                                           of its volume servers, comma-separated, which
+ *                                           main's reconciliation asks whether a file the
+ *                                           store fails a read of has its data still; unset
+ *                                           for another store, and for a branch
+ *                                           environment's, which reaches none of them
  *                                           (reconcile.ts's StoreParts)
  *   LAKE_STORE_FILER_TOKEN                  what the filer takes its reads of the lake's
  *                                           entries by, required with them
- *   LAKE_STORE_VOLUME_SERVERS               how many volume servers it runs, every one of
- *                                           which its masters are to know before their not
- *                                           knowing a volume says it is gone (default 1)
  *
  * The telemetry intake (./intake-service.ts), which writes the lake's `otel` schema alone:
  *
@@ -143,18 +141,18 @@ export interface MaintenanceConfig extends LakeAccess {
   /** Where the lake learns of Neon's branches, which may read its files; null where it is not told. */
   branches: BranchesSource | null;
   retentionDays: number;
-  /** The bundled object store's filer and masters, which say whether a file's data is gone; null for another store, and for a branch environment's lake. */
+  /** The bundled object store's filer and volume servers, which say whether a file's data is gone; null for another store, and for a branch environment's lake. */
   store: StoreParts | null;
   /** The branch environment whose lake this is; null for main's. */
   branch: string | null;
 }
 
-/** The bundled object store's filer and masters, by their HTTP addresses, the token the filer takes reads of the lake's entries by, and how many volume servers it runs. */
+/** The bundled object store's filer, by its HTTP address, the token it takes reads of the lake's entries by, and its volume servers. */
 export interface StoreParts {
   filer: string;
   filerToken: string;
-  master: string;
-  volumeServers: number;
+  /** Each volume server the store runs, by its HTTP address. */
+  volumeServers: readonly string[];
 }
 
 export interface IntakeConfig extends LakeAccess {
@@ -264,13 +262,12 @@ export function loadMaintenanceConfig(env: NodeJS.ProcessEnv = process.env): Mai
 /** The bundled object store's parts, where both are given; neither, for another store; one alone is a mistake. */
 function storeParts(env: NodeJS.ProcessEnv): StoreParts | null {
   const filer = env["LAKE_STORE_FILER_URL"]?.trim();
-  const master = env["LAKE_STORE_MASTER_URL"]?.trim();
-  if (!filer && !master) return null;
+  const volumes = env["LAKE_STORE_VOLUME_URLS"]?.trim();
+  if (!filer && !volumes) return null;
   return {
     filer: required(env, "LAKE_STORE_FILER_URL"),
     filerToken: required(env, "LAKE_STORE_FILER_TOKEN"),
-    master: required(env, "LAKE_STORE_MASTER_URL"),
-    volumeServers: positive(env, "LAKE_STORE_VOLUME_SERVERS", 1),
+    volumeServers: required(env, "LAKE_STORE_VOLUME_URLS").split(",").map((url) => url.trim()).filter(Boolean),
   };
 }
 

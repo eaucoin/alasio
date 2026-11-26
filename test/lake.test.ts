@@ -2180,16 +2180,17 @@ describe("the lake", () => {
     }
   });
 
-  test("the reconciliation holds lost a file the store fails a read of only where its filer and masters show a chunk of it gone, and fails, naming it, where they do not", async () => {
+  test("the reconciliation holds lost a file the store fails a read of only where its filer and volume servers show a chunk of it gone, and fails, naming it, where they do not", async () => {
     const s3 = await startFakeS3({ bucket: "lake", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" });
     const instance = await DuckDBInstance.create(":memory:");
     const db = await instance.connect();
-    // The bundled store's filer, masters and volume server, at one address, each answering
-    // as `parts` says: the filer's entry of the file, the masters' lookup of its volume, and
-    // the volume server's status for its chunk, and the volume servers the masters' topology holds, each time it is read.
-    type Parts = { entry: number | object; lookup: [number, object]; chunk: number; servers?: () => string[] };
-    const both = () => ["volume-0:8080", "volume-1:8080"];
-    let parts: Parts = { entry: 200, lookup: [200, {}], chunk: 200 };
+    // The bundled store's filer and its two volume servers, at one address, each answering as
+    // `parts` says: the filer's entry of the file; whether each server holds its chunk's volume,
+    // each time it says its volumes, and whether it answers that at all; and the servers' status for the chunk.
+    type Parts = { entry: number | object; holds: (server: number) => boolean; says?: readonly [number, number]; chunk: number };
+    const none = () => false;
+    const first = (server: number) => server === 0;
+    let parts: Parts = { entry: 200, holds: first, chunk: 200 };
     const server = createServer((request, response) => {
       const url = new URL(request.url ?? "/", "http://parts");
       const json = (status: number, body: unknown) => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
@@ -2198,16 +2199,18 @@ describe("the lake", () => {
       if (url.pathname === "/buckets/lake/claude/entries/failing.parquet" && url.searchParams.has("metadata")) {
         return typeof parts.entry === "number" ? json(parts.entry, {}) : json(200, parts.entry);
       }
-      if (url.pathname === "/dir/lookup" && url.searchParams.get("volumeId") === "7") return json(...parts.lookup);
-      if (url.pathname === "/dir/status") return json(200, { Topology: { DataCenters: [{ Racks: [{ DataNodes: (parts.servers ?? both)().map((Url) => ({ Url })) }] }] } });
-      if (url.pathname === "/7,01637037d6" && request.method === "HEAD") return response.writeHead(parts.chunk).end();
+      const volumeServer = /^\/v([01])\//u.exec(url.pathname)?.[1];
+      if (volumeServer !== undefined && url.pathname.endsWith("/status")) {
+        const said = parts.says?.[Number(volumeServer)] ?? 200;
+        return json(said, said === 200 ? { Volumes: [{ Id: 3 }, ...(parts.holds(Number(volumeServer)) ? [{ Id: 7 }] : [])] } : {});
+      }
+      if (volumeServer !== undefined && url.pathname.endsWith("/7,01637037d6") && request.method === "HEAD") return response.writeHead(parts.chunk).end();
       return json(500, { error: `no ${request.method} ${request.url}` });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const store = { filer: `http://${host}`, filerToken: "reads", master: `http://${host}`, volumeServers: 2 };
+    const store = { filer: `http://${host}`, filerToken: "reads", volumeServers: [`http://${host}/v0`, `http://${host}/v1`] };
     const entry = { FullPath: "/buckets/lake/claude/entries/failing.parquet", FileSize: 4, chunks: [{ file_id: "7,01637037d6", size: 4 }] };
-    const located: [number, object] = [200, { volumeOrFileId: "7", locations: [{ url: host, publicUrl: host }] }];
     try {
       await db.run("install httpfs");
       await db.run("load httpfs");
@@ -2222,30 +2225,29 @@ describe("the lake", () => {
       // The store fails every GET of it, as SeaweedFS does of an entry whose chunks are gone, its HEAD answered from the entry, and as it does for a moment while a volume server restarts.
       s3.refuse = (method, key) => (key === "claude/entries/failing.parquet" && method === "GET" ? 500 : null);
       const read = () => readable(db, path, { store, retryMs: 10, pulseMs: 10 });
-      const unknown: [number, object] = [404, { volumeId: "7", error: "volume id 7 not found" }];
-      // Its chunk's volume unknown to masters that know every volume server, its chunk gone from its volume, its entry gone, or an entry of bytes with no chunk: lost.
+      // Its chunk's volume held by no volume server, each saying its volumes every time, its chunk gone from the one that holds its volume, its entry gone, or an entry of bytes with no chunk: lost.
       for (const shown of [
-        { entry, lookup: unknown, chunk: 200 },
-        { entry, lookup: located, chunk: 404 },
-        { entry: 404, lookup: located, chunk: 200 },
-        { entry: { ...entry, chunks: [] }, lookup: located, chunk: 200 },
-      ] as const) {
-        parts = shown as typeof parts;
+        { entry, holds: none, chunk: 200 },
+        { entry, holds: first, chunk: 404 },
+        { entry: 404, holds: first, chunk: 200 },
+        { entry: { ...entry, chunks: [] }, holds: first, chunk: 200 },
+      ]) {
+        parts = shown;
         assert.equal(await read(), false, JSON.stringify(shown));
       }
       // Its chunk served, as where the store failed the read for a moment, or a part not
-      // answering as one that knows: the reconciliation fails, naming the file.
-      // Its volume unknown to masters short of a volume server, as one restarts, or whose servers change as they are read, is that too.
-      let reads = 0;
+      // answering as one that knows: the reconciliation fails, naming the file. Its volume held
+      // by none while a volume server does not say its volumes, as one restarts, or held by one
+      // since, is that too.
+      let readsOfSecond = 0;
       for (const shown of [
-        { entry, lookup: located, chunk: 200 },
-        { entry, lookup: located, chunk: 503 },
-        { entry: 503, lookup: located, chunk: 200 },
-        { entry, lookup: [503, {}], chunk: 200 },
-        { entry, lookup: unknown, chunk: 200, servers: () => ["volume-0:8080"] },
-        { entry, lookup: unknown, chunk: 200, servers: () => (reads++ === 0 ? ["volume-0:8080", "volume-1:8080"] : ["volume-0:8080", "volume-2:8080"]) },
-      ] as const) {
-        parts = shown as Parts;
+        { entry, holds: first, chunk: 200 },
+        { entry, holds: first, chunk: 503 },
+        { entry: 503, holds: first, chunk: 200 },
+        { entry, holds: none, says: [200, 503] as const, chunk: 200 },
+        { entry, holds: (server: number) => server === 1 && ++readsOfSecond > 1, chunk: 404 },
+      ]) {
+        parts = shown;
         await assert.rejects(read(), (error: unknown) => error instanceof StoreUndecided && error.message.includes(path), JSON.stringify(shown));
       }
       // Another store than the bundled one, or a branch environment's lake, whose parts are not asked.
@@ -2258,12 +2260,12 @@ describe("the lake", () => {
     }
   });
 
-  test("a reconciliation on the bundled store forgets nothing while its masters miss a volume server, nor where its filer has no /buckets, and forgets the file once they know every one", async () => {
+  test("a reconciliation on the bundled store forgets nothing while a volume server does not say its volumes, nor where its filer has no /buckets, and forgets the file once every one says them", async () => {
     const s3 = await startFakeS3({ bucket: "lake", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" });
-    // The filer, masters and volume server, at one address: the bucket, the file's entry and
-    // its chunk's volume unknown to the masters, whose topology holds `servers`.
+    // The filer and the two volume servers, at one address: the bucket, the file's entry, and
+    // its chunk's volume held by neither server, of which those `saying` say their volumes.
     let buckets = 200;
-    let servers = ["volume-0:8080"];
+    let saying = [true, false];
     let entry: object = {};
     const server = createServer((request, response) => {
       const url = new URL(request.url ?? "/", "http://parts");
@@ -2271,13 +2273,13 @@ describe("the lake", () => {
       if (url.pathname.startsWith("/buckets/") && request.headers.authorization !== "Bearer reads") return json(401, { error: "wrong jwt" });
       if (url.pathname === "/buckets/lake/") return json(buckets, { Path: "/buckets/lake", Entries: [] });
       if (url.pathname.startsWith("/buckets/lake/") && url.searchParams.has("metadata")) return json(200, entry);
-      if (url.pathname === "/dir/lookup") return json(404, { volumeId: url.searchParams.get("volumeId"), error: `volume id ${url.searchParams.get("volumeId")} not found` });
-      if (url.pathname === "/dir/status") return json(200, { Topology: { DataCenters: [{ Racks: [{ DataNodes: servers.map((Url) => ({ Url })) }] }] } });
+      const volumeServer = /^\/v([01])\/status$/u.exec(url.pathname)?.[1];
+      if (volumeServer !== undefined) return saying[Number(volumeServer)] ? json(200, { Volumes: [{ Id: 3 }] }) : json(503, {});
       return json(500, { error: `no ${request.method} ${request.url}` });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const store = { filer: `http://${host}`, filerToken: "reads", master: `http://${host}`, volumeServers: 2 };
+    const store = { filer: `http://${host}`, filerToken: "reads", volumeServers: [`http://${host}/v0`, `http://${host}/v1`] };
     const superuser = new pg.Client({ connectionString: postgres?.url });
     await superuser.connect();
     await superuser.query("create database reconcile_s3 owner lake");
@@ -2303,14 +2305,14 @@ describe("the lake", () => {
         const passed = await runPass(lake.db, "reconcile", { ...passing((message, fields) => void logs.push(`${message} ${JSON.stringify(fields ?? {})}`)), catalog: onStore.catalog, dataPath: onStore.dataPath, store });
         return { passed, said: logs.join("\n") };
       };
-      // One of its two volume servers not registered: the pass fails, naming the file, and forgets nothing.
+      // One of its two volume servers not saying its volumes: the pass fails, naming the file, and forgets nothing.
       const missing = await pass();
-      assert.deepEqual([missing.passed, missing.said.includes(file), /1 of the store's 2 volume servers/u.test(missing.said), await named()], [false, true, true, 1]);
+      assert.deepEqual([missing.passed, missing.said.includes(file), /did not say their volumes, of the store's 2/u.test(missing.said), await named()], [false, true, true, 1]);
       // Its filer without the bucket's /buckets, where an entry's absence proves nothing: no more.
-      [buckets, servers] = [404, ["volume-0:8080", "volume-1:8080"]];
+      [buckets, saying] = [404, [true, true]];
       const unlisted = await pass();
       assert.deepEqual([unlisted.passed, /has no \/buckets\/lake/u.test(unlisted.said), await named()], [false, true, 1]);
-      // Every volume server known, the volume not: the file is gone, and forgotten.
+      // Every volume server saying its volumes, none of them the chunk's: the file is gone, and forgotten.
       buckets = 200;
       const known = await pass();
       assert.deepEqual([known.passed, await named()], [true, 0], known.said);
@@ -3501,9 +3503,10 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.throws(() => loadMaintenanceConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches" }), /LAKE_BRANCHES_TOKEN is not set/);
   assert.deepEqual(loadMaintenanceConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches", LAKE_BRANCHES_TOKEN: "t" }).branches, { url: "http://control:8080/branches", token: "t" });
   // The bundled store's parts, with the token its filer takes reads of the lake's entries by; none for another store.
-  const parts = { LAKE_STORE_FILER_URL: "http://filer:8888", LAKE_STORE_MASTER_URL: "http://master:9333", LAKE_STORE_VOLUME_SERVERS: "2" };
+  const parts = { LAKE_STORE_FILER_URL: "http://filer:8888", LAKE_STORE_VOLUME_URLS: "http://volume-0:8080, http://volume-1:8080" };
   assert.throws(() => loadMaintenanceConfig({ ...local, ...parts }), /LAKE_STORE_FILER_TOKEN is not set/);
-  assert.deepEqual(loadMaintenanceConfig({ ...local, ...parts, LAKE_STORE_FILER_TOKEN: "reads" }).store, { filer: "http://filer:8888", filerToken: "reads", master: "http://master:9333", volumeServers: 2 });
+  assert.deepEqual(loadMaintenanceConfig({ ...local, ...parts, LAKE_STORE_FILER_TOKEN: "reads" }).store, { filer: "http://filer:8888", filerToken: "reads", volumeServers: ["http://volume-0:8080", "http://volume-1:8080"] });
+  assert.throws(() => loadMaintenanceConfig({ ...local, LAKE_STORE_FILER_URL: "http://filer:8888", LAKE_STORE_FILER_TOKEN: "reads" }), /LAKE_STORE_VOLUME_URLS is not set/);
   assert.equal(loadMaintenanceConfig(local).store, null);
   // Through Neon's proxy, every connection names its compute; straight to a Postgres, none.
   assert.equal(loadConfig({ ...local, ...LOADER_LOG }).catalog.options, "");

@@ -1187,9 +1187,24 @@ export function neonStack(): void {
       const masters = async () =>
         (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "seaweedfs-master" }) }))
           .filter(({ status, metadata }) => status?.phase === "Running" && !metadata?.deletionTimestamp).map(({ metadata }) => metadata?.name ?? "");
-      /** What a running master answers at `path` of its HTTP port, which it asks its leader where it is not one. */
-      const onMaster = async (path: string, master?: string) =>
-        kube.execOk(NAMESPACE, master ?? (await masters())[0] ?? assert.fail("no master runs"), ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "master" });
+      /**
+       * What `master` answers at `path` of its HTTP port, in its pod; or, unnamed, the leading
+       * master: each running master is asked in turn, as one that does not lead hands the request to
+       * the one that does, from its own address, which a master takes no such request from.
+       */
+      const onMaster = async (path: string, master?: string) => {
+        const asked = (pod: string) => kube.execOk(NAMESPACE, pod, ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "master" });
+        if (master !== undefined) return asked(master);
+        const errors: string[] = [];
+        for (const pod of await masters()) {
+          try {
+            return await asked(pod);
+          } catch (error) {
+            errors.push(`${pod}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        return assert.fail(`no master answered ${path}: ${errors.join("; ") || "none runs"}`);
+      };
       /** The pod of a part's address, as SeaweedFS names a server: its name in its headless Service, and a port. */
       const podOfAddress = (address: string) => address.split(".")[0] ?? "";
 
@@ -1429,7 +1444,7 @@ export function neonStack(): void {
         }
       });
 
-      test("the object store's parts take gRPC from one another alone, over mutual TLS: none answers a plaintext call or one without a certificate, nor one of a part its port does not take, though the network admits each; and the filers answer no request over HTTP that their keys did not sign, the lake's token reading the lake's entries alone", async () => {
+      test("the object store's parts take gRPC from one another alone, over mutual TLS: none answers a plaintext call or one without a certificate, nor one of a part its port does not take, though the network admits each; the filers answer no request over HTTP that their keys did not sign, the lake's token reading the lake's entries alone; and the masters answer where volumes are to their own pods alone", async () => {
         const probe = await storeProbe();
         try {
           const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
@@ -1455,6 +1470,9 @@ export function neonStack(): void {
           assert.equal(await asked("GET", `${lake}/?limit=1`, token), 200);
           assert.equal(await asked("GET", "/buckets/neon/?limit=1", token), 401);
           assert.equal(await asked("PUT", `${lake}/signed`, token), 401);
+          // The masters' HTTP port: where volumes are, and their deletion, its own pod's to ask alone; its probes' answered.
+          const ofMaster = async (path: string) => Number((await kube.execOk(NAMESPACE, probe, ["node", "-e", HTTP_CALL, "GET", `http://${master}:9333${path}`, ""])).trim());
+          assert.deepEqual([await ofMaster("/dir/status"), await ofMaster("/vol/status"), await ofMaster("/cluster/status")], [401, 401, 200]);
         } finally {
           await kube.remove(ref("Pod", probe, NAMESPACE));
         }
