@@ -31,11 +31,9 @@
  * disk whenever it has `syncBytes` written since (UNSYNCED_DOWNLOAD_BYTES, ./names.ts).
  */
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { type FileHandle, open, stat } from "node:fs/promises";
 import { type ClientRequest, type IncomingMessage, request as httpRequest, type RequestOptions } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { pipeline } from "node:stream/promises";
 
 import { Effect, Schema } from "effect";
 
@@ -435,6 +433,68 @@ async function writeSynced(file: FileHandle, source: AsyncIterable<Buffer>, star
   return position - start;
 }
 
+/** What a request's body is sent from a file in, and a file hashed in, at a time, into one buffer it keeps: 1 MiB. */
+const FILE_CHUNK_BYTES = 1024 ** 2;
+
+/**
+ * The buffers of FILE_CHUNK_BYTES the agent's bodies and hashes of files read into, each lent to one at a time and kept for
+ * the next once it is given back, so a save's parts, one after another, read into the same few rather than each into its own
+ * for a collection to free: as many kept as SPARE_CHUNKS at most, the most read into at once (a save's parts at a time, and
+ * the downloads', each file's at once).
+ */
+const spareChunks: Buffer[] = [];
+const SPARE_CHUNKS = 4 * SNAPSHOT_PARTS_AT_ONCE;
+
+/** A buffer of FILE_CHUNK_BYTES to read into until `use` ends, then kept for the next (spareChunks). */
+async function withChunk<A>(use: (buffer: Buffer) => Promise<A>): Promise<A> {
+  const buffer = spareChunks.pop() ?? Buffer.allocUnsafeSlow(FILE_CHUNK_BYTES);
+  try {
+    return await use(buffer);
+  } finally {
+    if (spareChunks.length < SPARE_CHUNKS) spareChunks.push(buffer);
+  }
+}
+
+/**
+ * Sends `size` bytes of the file at `path` from the byte `start` as `request`'s body, and ends it: read into one buffer
+ * of FILE_CHUNK_BYTES (withChunk), used again for each read once the request has written out what it was given, so a body
+ * holds that buffer and no more, however large it is, and none of what it sent waits for a collection to be freed.
+ */
+async function sendFile(request: ClientRequest, path: string, start: number, size: number): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await withChunk(async (buffer) => {
+      for (let sent = 0; sent < size;) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - sent), start + sent);
+        if (bytesRead === 0) throw new Error(`${path} ends ${sent} bytes into the ${size} sent from its byte ${start}`);
+        await new Promise<void>((resolve, reject) => request.write(buffer.subarray(0, bytesRead), (error) => (error ? reject(error) : resolve())));
+        sent += bytesRead;
+      }
+    });
+    request.end();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** The SHA-256 of the file at `path`, in hex, read once into one buffer of FILE_CHUNK_BYTES (withChunk). */
+async function sha256Of(path: string): Promise<string> {
+  const handle = await open(path, "r");
+  try {
+    return await withChunk(async (buffer) => {
+      const hash = createHash("sha256");
+      for (let read = 0; ;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, read);
+        if (bytesRead === 0) return hash.digest("hex");
+        hash.update(buffer.subarray(0, bytesRead));
+        read += bytesRead;
+      }
+    });
+  } finally {
+    await handle.close();
+  }
+}
+
 /** The bucket of `options`, reached over HTTP(S) as the module says. */
 export function makeS3Bucket(options: S3Options): S3Bucket {
   const { partBytes = PART_BYTES, parallel = PARALLEL, syncBytes = SYNC_BYTES, copyBytes = COPY_BYTES } = options;
@@ -469,7 +529,10 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
       request.once("error", reject);
       if (body === undefined) request.end();
       else if ("bytes" in body) request.end(body.bytes);
-      else pipeline(createReadStream(body.file, body.size === 0 ? {} : { start: body.start ?? 0, end: (body.start ?? 0) + body.size - 1 }), request).catch(reject);
+      else sendFile(request, body.file, body.start ?? 0, body.size).catch((error: unknown) => {
+        request.destroy(error instanceof Error ? error : new Error(String(error)));
+        reject(error);
+      });
     });
   };
 
@@ -608,9 +671,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         } finally {
           await file.close();
         }
-        const hash = createHash("sha256");
-        await pipeline(createReadStream(path), hash);
-        return { bytes: (await stat(path)).size, sha256: hash.digest("hex") };
+        return { bytes: (await stat(path)).size, sha256: await sha256Of(path) };
       }),
 
     putJson: (key, value) =>

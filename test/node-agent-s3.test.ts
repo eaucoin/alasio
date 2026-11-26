@@ -5,9 +5,14 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { test } from "node:test";
 
 import { Effect, Exit } from "effect";
@@ -489,6 +494,33 @@ test("a get holds the bucket to the size its file is said to be, a JSON object t
     assert.deepEqual(got.map(({ bytes }) => bytes), [500, 500]);
   } finally {
     await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("one-pass uploads of a 1 GiB file, hashed ahead as they upload, one after another as a node's saves come, hold some tens of MiB of anonymous memory at their most, whatever the file's size and however many: each read into a buffer kept for the next", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "alasio-upload-memory-"));
+  // A bucket that takes every part as fast as it comes, and keeps none of it.
+  const server = createServer((request, response) => {
+    request.on("data", () => {});
+    request.on("end", () => {
+      if (request.method === "POST" && request.url?.includes("uploads")) response.end("<InitiateMultipartUploadResult><UploadId>upload</UploadId></InitiateMultipartUploadResult>");
+      else if (request.method === "POST") response.end("<CompleteMultipartUploadResult><ETag>\"whole\"</ETag></CompleteMultipartUploadResult>");
+      else response.writeHead(200, { etag: "\"part\"" }).end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    // Sparse: read as fast as memory goes, none of the disk's.
+    const path = join(directory, "pages.img");
+    writeFileSync(path, "");
+    truncateSync(path, 1024 ** 3);
+    const { stdout } = await promisify(execFile)(process.execPath, [fileURLToPath(new URL("./support/upload-memory.ts", import.meta.url)), `http://127.0.0.1:${(server.address() as AddressInfo).port}`, path, "4"]);
+    const { began, most } = JSON.parse(stdout) as { readonly began: number; readonly most: number };
+    // Its thread of hashes' isolate and a few buffers of 1 MiB, against some 150 MiB as each chunk read was its own.
+    assert.ok(most - began < 48 * 1024 ** 2, `it held ${Math.round((most - began) / 1024 ** 2)} MiB more as it uploaded`);
+  } finally {
+    server.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });
