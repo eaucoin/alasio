@@ -263,6 +263,34 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
   }
 });
 
+test("a part SeaweedFS 4.54's gateway asks to slow down only once it has waited for room, a minute, is sent again within the window that wait counts in: three times, then its upload fails, as the save it is of must within its bound", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
+  try {
+    // At a 120th of the time: 2 minutes of sends again (1 s), a minute's wait for room (500 ms), the first wait 1 s (8 ms).
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 1, resendFirstMs: 8, resendWithinMs: 1000 });
+    s3.refusedAfterMs = 500;
+    const source = join(directory, "pages.img");
+    writeFileSync(source, Buffer.alloc(2500, 7));
+    const sends = (key: string) => s3.requests.filter((asked) => asked === `PUT ${key} part 2`).length;
+    // Slowed down twice, a minute each, then taken: whole.
+    let slowed = 0;
+    s3.refuse = (_method, _key, asked) => (asked === "PUT main/fs-abc/s1/pages.img part 2" && slowed++ < 2 ? 503 : null);
+    await Effect.runPromise(bucket.putFile("main/fs-abc/s1/pages.img", source));
+    assert.equal(sends("main/fs-abc/s1/pages.img"), 3);
+    assert.deepEqual(s3.objects.get("main/fs-abc/s1/pages.img"), Buffer.alloc(2500, 7));
+    // Slowed down every time: sent three times, each a minute's wait, the window from the first answer past before a fourth.
+    s3.refuse = (_method, _key, asked) => (asked === "PUT main/fs-abc/s2/pages.img part 2" ? 503 : null);
+    const failed = await Effect.runPromiseExit(bucket.putFile("main/fs-abc/s2/pages.img", source));
+    assert.ok(Exit.isFailure(failed));
+    assert.match(String(failed.cause), /the bucket's upload of main\/fs-abc\/s2\/pages\.img failed: 503 InternalError/u);
+    assert.equal(sends("main/fs-abc/s2/pages.img"), 3);
+  } finally {
+    await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("a request the store fails, or that fails unanswered, is sent again, waiting twice as long each time, while the bucket is told to, and one refused otherwise once; one asked as of an ETag and refused once sent again fails", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));

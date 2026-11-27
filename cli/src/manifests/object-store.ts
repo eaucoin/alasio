@@ -556,8 +556,10 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
  * room goes in at once, so one may wait as others pass it; and it looks before it adds its own,
  * so the uploads under way may go past the bound by one request's. One that waits a minute
  * (-inflightUploadDataTimeout) is answered 503 SlowDown, its body unread, which each of the
- * store's clients sends again later, the node agents too (src/node-agent/s3.ts
- * SLOW_DOWN_SENDS), rather than hold its connection and what the kernel buffers of it.
+ * store's clients sends again later rather than hold its connection and what the kernel buffers
+ * of it: the node agents within the 2 minutes from its first such answer that they send a failed
+ * request again for (src/node-agent/s3.ts RESEND_WITHIN_MS), which a minute's wait each counts in,
+ * so a part waits for room three times, some 3 minutes, before its save fails.
  */
 export function gatewayUploadBufferMiB(resources: { readonly limits?: { readonly memory?: string } }): number {
   const limit = resources.limits?.memory;

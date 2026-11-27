@@ -45,6 +45,8 @@ export interface FakeS3 {
   answers: (asked: string, body: string) => string;
   /** Answers a request (`asked` as `requests` records it) with the status it gives, as S3 would with an error, at once, rather than doing it; null does it. */
   refuse: (method: string, key: string, asked: string) => number | null;
+  /** How long it waits before it answers a request `refuse` refuses, its body unread: as SeaweedFS's gateway answers an upload SlowDown once it waited a minute for room (from 4.54). */
+  refusedAfterMs: number;
   /** How long it waits before it answers a get of an object, so gets overlap as they would on a network. */
   getDelayMs: number;
   /** Whether a get of a whole object is answered with its ETag, as S3 does; a test's to unset, as of a store that does not. */
@@ -163,7 +165,10 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     const asked = !key ? `${method} ?${url.searchParams}` : `${method} ${key}${multipartOf}${source === null ? "" : ` from ${source}`}${typeof range === "string" && method === "GET" ? ` ${range}` : ""}`;
     requests.push(asked);
     const refused = fake.refuse(method, key, asked);
-    if (refused !== null) return error(response, refused, "InternalError", "refused, as the test asks");
+    if (refused !== null) {
+      if (fake.refusedAfterMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.refusedAfterMs));
+      return error(response, refused, "InternalError", "refused, as the test asks");
+    }
     if (key && method === "GET") {
       getting += 1;
       mostGetting = Math.max(mostGetting, getting);
@@ -376,6 +381,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     refuseVersion: () => null,
     answers: (_asked, body) => body,
     refuse: () => null,
+    refusedAfterMs: 0,
     getDelayMs: 0,
     getsTagged: true,
     honoursConditions: true,

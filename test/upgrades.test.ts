@@ -1,5 +1,5 @@
 /**
- * The cut-over of an installation of the release before (upgrades/from-10.0.26.sh), in how it
+ * The cut-over of an installation of the release before (upgrades/from-10.0.27.sh), in how it
  * runs, without a cluster: its checks and refusals, its point of no return, and how a run
  * again goes on from where one before stopped. The end-to-end run's upgrade shard runs it on
  * an installation of that release (test/e2e/alasio.test.ts).
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 import { STORE_SNAPSHOT_CONFIGMAP } from "../cli/src/object-store.ts";
 
-const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.26.sh", import.meta.url));
+const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.27.sh", import.meta.url));
 
 /** The PATH the cut-over runs with: `bin`'s, and the system's. */
 const pathOf = (bin: string) => [bin, "/usr/bin", "/bin"].join(delimiter);
@@ -185,7 +185,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.marks(), ["point-of-no-return", "upgraded"]);
     // Of an installation whose object store is not the bundled one: none of it stopped, nor snapshotted.
-    assert.match(run.said, /cutting over from 10\.0\.26[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* the object store is not the bundled one: none of it to snapshot\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+    assert.match(run.said, /cutting over from 10\.0\.27[^\n]*\n[^\n]* checking that no branch environment exists[^\n]*\n[^\n]* checking that the upgrade can run[^\n]*\n[^\n]* the object store is not the bundled one: none of it to snapshot\n[^\n]* past the point of no return[^\n]*\n[^\n]* upgrading, from the cut-over begun at [^\n]*\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
     assert.deepEqual([at.stopped(), at.configMaps()], [[], []]);
   } finally {
     at.remove();
@@ -346,7 +346,7 @@ test("the snapshot's restore, refused while the store runs, puts each claim back
     for (const claim of CLAIMS) assert.deepEqual(tree(at.volume(claim)), before[claim], claim);
     // Each volume's data the snapshot's file again, as linked.
     for (const id of [1, 2, 3]) assert.equal(statSync(join(volume, `neon_${id}.dat`)).ino, statSync(join(at.snapshot, VOLUME, "files", `neon_${id}.dat`)).ino, `neon_${id}.dat`);
-    assert.ok(restored.said.includes(`the object store restored as it was snapshotted, ${readFileSync(join(at.snapshot, "taken"), "utf8").trim()}; start it on ${IMAGE}, as 10.0.26 ran it`), restored.said);
+    assert.ok(restored.said.includes(`the object store restored as it was snapshotted, ${readFileSync(join(at.snapshot, "taken"), "utf8").trim()}; start it on ${IMAGE}, as 10.0.27 ran it`), restored.said);
   } finally {
     at.remove();
   }
@@ -384,7 +384,7 @@ test("the cut-over refuses a branch environment before it changes anything, nami
     at.namespaces("alasio-branch-one\tone\nalasio-branch-two\ttwo\nalasio-sessions\tone\nother\t\n");
     const refused = at.cutOver();
     assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 10\.0\.26 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
+    assert.match(refused.said, /FAILED: alasio upgrades main alone, and the branch environments 10\.0\.27 made [^\n]*\(alasio branch delete one, alasio branch delete two\)/u);
     assert.deepEqual([at.ran(), at.marks()], [[], []]);
     // A namespace labelled for a branch that is not that branch's own is no branch environment.
     at.namespaces("alasio-sessions\tone\n");

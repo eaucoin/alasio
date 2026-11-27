@@ -604,14 +604,8 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And what the object store's parts prove themselves with, and the gateways' own S3 identity, which this release adds to the stack's.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
-            "s3.rules",
-            "storeSecurity.authority",
-            "storeSecurity.filerReadSigningKey",
-            "storeSecurity.filerSigningKey",
-            "storeSecurity.parts",
-          ]);
+          // And the S3 identity the gateways' lifecycle rules are set as, which this release adds to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), ["s3.rules"]);
         },
       },
       {
@@ -5603,8 +5597,8 @@ if (inShard("upgrade")) {
       }
       const restored = await inCutOverRecordOnCluster("bash object-store/restore.sh");
       t.diagnostic(restored);
-      assert.match(restored, /the object store restored as it was snapshotted, \S+; start it on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}, as 10\.0\.26 ran it/u);
-      // Each container of its parts and its gateways that runs SeaweedFS on the image 10.0.26 ran, each part at its count again,
+      assert.match(restored, /the object store restored as it was snapshotted, \S+; start it on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}, as 10\.0\.27 ran it/u);
+      // Each container of its parts and its gateways that runs SeaweedFS on the image 10.0.27 ran, each part at its count again,
       // those its peers need first, as the restore says.
       const image = (await inCutOverRecord("cat object-store/image")).trim();
       const counts = new Map((await inCutOverRecord("cat object-store/counts")).split("\n").filter(Boolean).map((line) => line.split("\t") as [string, string]));
