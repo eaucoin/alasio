@@ -62,6 +62,7 @@ import {
   UNSYNCED_DOWNLOAD_BYTES,
   WORKSPACES_ROOT,
 } from "../../src/node-agent/names.ts";
+import { RESEND_WITHIN_MS } from "../../src/node-agent/s3.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { BACKGROUND_REPORT, ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
@@ -2764,7 +2765,9 @@ if (inShard("snapshots")) {
         const failed = agentLog.find((line) => line.includes(`the sandbox of ${SESSIONS}/${big} can be saved no more, `) || line.includes(`checkpointing ${SESSIONS}/${big} failed: `));
         assert.ok(failed, `${node}'s agent said nothing of ${big}'s save failing`);
         t.diagnostic(failed.slice(failed.indexOf(failed.includes("can be saved no more") ? "the sandbox" : "checkpointing")));
-        assert.ok(released < LOADING_TEST_TIMINGS.stallMs + 120_000, `its release answered ${released} ms after it was asked`);
+        // Its snapshot then forgotten, as the workspace has moved on from it: a request the store, cut off, refuses, sent again
+        // for as long as the bucket sends one again (RESEND_WITHIN_MS).
+        assert.ok(released < LOADING_TEST_TIMINGS.stallMs + RESEND_WITHIN_MS + 120_000, `its release answered ${released} ms after it was asked`);
       } finally {
         await undoThrottles(throttled);
       }

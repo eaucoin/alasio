@@ -90,7 +90,7 @@ const COPY_BYTES = 5 * 1024 ** 3;
  * store away for longer fails each next request at once, as it did before, rather than hold every one of them as long: what
  * follows a save that failed so, forgetting its snapshot (./names.ts LOADING_SAVE_LATEST_SECONDS), waits no more for it.
  */
-const RESEND_WITHIN_MS = 2 * 60_000;
+export const RESEND_WITHIN_MS = 2 * 60_000;
 /** How long a request that failed waits to be sent again the first time, unless told, twice as long each time after: 1 s. */
 const RESEND_FIRST_MS = 1000;
 /** The longest a request that failed waits to be sent again: 16 s, so a store back is found within it. */
