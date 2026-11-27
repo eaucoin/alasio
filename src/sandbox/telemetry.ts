@@ -17,14 +17,8 @@ import type { ResourceStamp } from "./otlp-resource.ts";
 export function sandboxBaymaTelemetryEnv(env: Readonly<NodeJS.ProcessEnv> = process.env): Record<string, string> {
   const telemetry = resolveTelemetry(env);
   if (!telemetryEnabled(telemetry)) return {};
-  const settings: Record<string, string> = {};
-  for (const signal of SIGNALS) {
-    const upper = signal.toUpperCase();
-    const exporter = telemetry[signal];
-    settings[`OTEL_${upper}_EXPORTER`] = exporter ? "otlp" : "none";
-    if (exporter) settings[`OTEL_EXPORTER_OTLP_${upper}_PROTOCOL`] = exporter.protocol;
-  }
-  return settings;
+  // Spike: bayma in the sandbox exports nothing, for what its telemetry dirties as it idles.
+  return { OTEL_SDK_DISABLED: "true", ...Object.fromEntries(SIGNALS.map((signal) => [`OTEL_${signal.toUpperCase()}_EXPORTER`, "none"])) };
 }
 
 /** The resource attributes a session's telemetry is stamped with. */
