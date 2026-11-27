@@ -26,3 +26,7 @@ RUN mkdir -p /tmp/bayma-build \
       node /opt/bayma/bayma.js install-toolbelt \
  && chown -R agent:agent /opt/bayma-data \
  && rm -rf /tmp/bayma-build
+# Measurement only: bayma's save without its file systems' sync, for what that sync's process dirties.
+RUN grep -l 'await execFile("sync", \["--file-system", \.\.\.directories\]);' /opt/bayma/*.js | grep -q . \
+ && sed -i 's/await execFile("sync", \["--file-system", \.\.\.directories\]);/void directories;/' /opt/bayma/*.js \
+ && ! grep -q '"--file-system", \.\.\.directories' /opt/bayma/*.js
