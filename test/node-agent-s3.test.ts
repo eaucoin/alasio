@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
 
-import { Effect, Exit } from "effect";
+import { Effect, Exit, Fiber } from "effect";
 
 import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { startFakeS3 } from "./support/fake-s3.ts";
@@ -25,6 +25,8 @@ const SUITE_CREDENTIALS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrX
 const SUITE_SCOPE = { region: "us-east-1", service: "service" };
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const SUITE_HEADERS = { host: "example.amazonaws.com", "x-amz-date": "20150830T123600Z" };
+/** Options of a bucket that sends each request once, failed or not: of a test of what one failure does. */
+const SENT_ONCE = { resendWithinMs: 0 };
 
 test("requests are signed as AWS's Signature Version 4 test suite signs them", () => {
   // get-vanilla
@@ -208,7 +210,7 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
-    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300, copyBytes: 1500 });
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, ...SENT_ONCE, partBytes: 1000, parallel: 2, syncBytes: 300, copyBytes: 1500 });
     const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
     const pages = Buffer.from(Array.from({ length: 3500 }, (_, index) => index % 251));
     const source = join(directory, "pages.img");
@@ -255,6 +257,118 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
     assert.ok(s3.requests.includes("DELETE main/fs-abc/s2/pages.img abort"));
     assert.equal(s3.objects.has("main/fs-abc/s2/pages.img"), false);
     assert.equal(s3.uploads.size, 0);
+  } finally {
+    await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a request the store fails, or that fails unanswered, is sent again, waiting twice as long each time, while the bucket is told to, and one refused otherwise once; one asked as of an ETag and refused once sent again fails", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, resendFirstMs: 20, resendWithinMs: 1000 });
+    const pages = Buffer.from(Array.from({ length: 2500 }, (_, index) => index % 251));
+    const source = join(directory, "pages.img");
+    writeFileSync(source, pages);
+    const key = "main/fs-abc/s1/pages.img";
+    const put = (value: unknown) => Effect.runPromiseExit(bucket.putJson("main/fs-abc/current.json", value));
+    const sends = () => s3.requests.filter((asked) => asked === "PUT main/fs-abc/current.json").length;
+    const timed = async <A>(work: () => Promise<A>): Promise<[number, A]> => {
+      const started = Date.now();
+      const done = await work();
+      return [Date.now() - started, done];
+    };
+
+    // A part the store asks twice to slow down (503), as SeaweedFS's gateway does with no room for it, then takes: the upload whole.
+    let slowed = 0;
+    s3.refuse = (_method, _key, asked) => (asked === `PUT ${key} part 2` && slowed++ < 2 ? 503 : null);
+    await Effect.runPromise(bucket.putFile(key, source));
+    assert.deepEqual(s3.objects.get(key), pages);
+    assert.equal(s3.requests.filter((asked) => asked === `PUT ${key} part 2`).length, 3);
+    s3.refuse = () => null;
+
+    // The store away as parts are sent, each dropped as it goes and refused after, and back 300 ms later: the parts are read
+    // and sent again, and the upload is whole.
+    let away: Promise<void> | null = null;
+    s3.holdPut = () => (away ??= s3.goAway().then(() => void setTimeout(() => void s3.comeBack(), 300)));
+    await Effect.runPromise(bucket.putFile("main/fs-abc/s2/pages.img", source));
+    s3.holdPut = () => null;
+    assert.notEqual(away, null);
+    assert.ok(s3.requests.filter((asked) => asked.startsWith("PUT main/fs-abc/s2/pages.img part ")).length > 3, s3.requests.join(", "));
+    assert.deepEqual(s3.objects.get("main/fs-abc/s2/pages.img"), pages);
+    assert.equal(s3.uploads.size, 0);
+
+    // Failed every time (500): sent again 20, 40, 80, 160 and 320 ms apart, within the 1 s the bucket was told, then failed
+    // as the store last answered.
+    s3.requests.length = 0;
+    s3.refuse = (method) => (method === "PUT" ? 500 : null);
+    const [failingMs, failed] = await timed(() => put({ snapshot: "s1" }));
+    assert.ok(Exit.isFailure(failed));
+    assert.match(String(failed.cause), /the bucket's upload of main\/fs-abc\/current\.json failed: 500 InternalError/u);
+    assert.equal(sends(), 6);
+    assert.ok(failingMs >= 620, `the six sends took ${failingMs} ms`);
+    // Once the store has failed every request for as long as the bucket sends one again, the next is sent once.
+    await new Promise((resolve) => setTimeout(resolve, 1000 - failingMs));
+    s3.requests.length = 0;
+    assert.ok(Exit.isFailure(await put({ snapshot: "s1" })));
+    assert.equal(sends(), 1);
+    // Answered once more, the next that fails is sent again as the first was.
+    s3.refuse = () => null;
+    await Effect.runPromise(bucket.getJson("main/fs-abc/current.json"));
+    let failures = 2;
+    s3.refuse = (method) => (method === "PUT" && failures-- > 0 ? 502 : null);
+    s3.requests.length = 0;
+    assert.ok(Exit.isSuccess(await put({ snapshot: "s1" })));
+    assert.equal(sends(), 3);
+
+    // Refused otherwise (403), or as of what the store does not implement (501): sent once.
+    for (const status of [403, 501]) {
+      s3.requests.length = 0;
+      s3.refuse = (method) => (method === "PUT" ? status : null);
+      assert.ok(Exit.isFailure(await put({ snapshot: "s1" })));
+      assert.equal(sends(), 1);
+    }
+    s3.refuse = () => null;
+
+    // The store away for good: sent again within the 1 s, then failed as the last send did, said so.
+    await s3.goAway();
+    const [awayMs, unanswered] = await timed(() => put({ snapshot: "s2" }));
+    assert.ok(Exit.isFailure(unanswered));
+    assert.match(String(unanswered.cause), /the bucket's upload of main\/fs-abc\/current\.json failed: connect ECONNREFUSED [0-9.:]+, as it did each of the 6 times it was sent, over 1 s/u);
+    assert.ok(awayMs >= 620 && awayMs < 1500, `the six sends took ${awayMs} ms`);
+    // One stopped as it waits to be sent again ends at once.
+    const stopped = await Effect.runPromise(Effect.forkChild(bucket.putJson("main/fs-abc/current.json", { snapshot: "s3" })));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const [stoppingMs] = await timed(() => Effect.runPromise(Fiber.interrupt(stopped)));
+    assert.ok(stoppingMs < 100, `it ended ${stoppingMs} ms after it was stopped`);
+    await s3.comeBack();
+
+    // A put as of an ETag whose first send the store did, its answer lost, refused as it is sent again: it fails, as it may
+    // have been done, which the bucket says it was.
+    const held = await Effect.runPromise(bucket.getTaggedJson("main/fs-abc/current.json"));
+    let dropped = 1;
+    s3.dropsPut = () => (dropped-- > 0 ? "written" : null);
+    const unsure = await Effect.runPromiseExit(bucket.putJsonIf("main/fs-abc/current.json", { snapshot: "s4" }, held?.etag ?? null));
+    s3.dropsPut = () => null;
+    assert.ok(Exit.isFailure(unsure));
+    assert.match(String(unsure.cause), /the bucket's upload of main\/fs-abc\/current\.json failed: it was refused \(412\) once sent again, 2 sends in all, as one before, which failed, may have done it/u);
+    assert.deepEqual(await Effect.runPromise(bucket.getJson("main/fs-abc/current.json")), { snapshot: "s4" });
+    // One whose first send failed undone, and the next done: done.
+    const now = await Effect.runPromise(bucket.getTaggedJson("main/fs-abc/current.json"));
+    let slowedPut = 1;
+    s3.refuse = (method) => (method === "PUT" && slowedPut-- > 0 ? 503 : null);
+    assert.equal(await Effect.runPromise(bucket.putJsonIf("main/fs-abc/current.json", { snapshot: "s5" }, now?.etag ?? null)), true);
+    assert.deepEqual(await Effect.runPromise(bucket.getJson("main/fs-abc/current.json")), { snapshot: "s5" });
+    // A deletion as of an ETag so too: its first send done and answered 500, as a gateway whose filer did it and failed
+    // after may answer, refused as it is sent again, fails.
+    const last = await Effect.runPromise(bucket.getTaggedJson("main/fs-abc/current.json"));
+    let deletions = 1;
+    s3.refuse = (method, deleted) => (method === "DELETE" && deletions-- > 0 ? (s3.objects.delete(deleted), 500) : null);
+    const unsureDeletion = await Effect.runPromiseExit(bucket.removeIf("main/fs-abc/current.json", last?.etag ?? ""));
+    s3.refuse = () => null;
+    assert.ok(Exit.isFailure(unsureDeletion));
+    assert.match(String(unsureDeletion.cause), /the bucket's deletion of main\/fs-abc\/current\.json failed: it was refused \(412\) once sent again, 2 sends in all/u);
   } finally {
     await s3.close();
     rmSync(directory, { recursive: true, force: true });
@@ -329,7 +443,7 @@ test("the multipart uploads begun under a prefix and left, across pages of their
 test("a versioned bucket's versions and delete markers under a prefix are listed across pages, in order, and versions are deleted for good, a thousand a request, saying those the bucket did not delete, one gone already gone; a request that fails fails the deletion", async () => {
   const s3 = await startFakeS3({ bucket: "neon", region: "us-east-1", ...CREDENTIALS });
   try {
-    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "neon", ...CREDENTIALS });
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "neon", ...CREDENTIALS, ...SENT_ONCE });
     const at = Date.parse("2026-11-20T12:00:00.000Z");
     const listed = [
       { key: "pageserver/a&b", versionId: "v3", writtenAt: at, bytes: 0, latest: true, deleteMarker: true },
@@ -460,7 +574,7 @@ test("a get holds the bucket to the size its file is said to be, a JSON object t
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
-    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300 });
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, ...SENT_ONCE, partBytes: 1000, parallel: 2, syncBytes: 300 });
     const pages = Buffer.from(Array.from({ length: 3500 }, (_, index) => index % 251));
     const failure = async <A>(effect: Effect.Effect<A, unknown>) => {
       const exit = await Effect.runPromiseExit(effect);

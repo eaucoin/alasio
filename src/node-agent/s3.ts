@@ -25,6 +25,15 @@
  * An object larger than 5 GiB, which S3 copies in no one request either, is copied in
  * parts too.
  *
+ * A request the store fails, or that fails unanswered, as a store does while its parts restart
+ * or as it asks a client to slow down, is sent again, signed anew, waiting longer each time, for
+ * as long as RESEND_WITHIN_MS says. What it does may be done as often as it is sent: a part, or
+ * an object of the same bytes, put again, a deletion done again, and a multipart upload begun
+ * again, one begun unanswered left to the bucket's lifecycle. Where one is asked only as the
+ * object it names is so, or of an upload that is there still, and is refused once sent again, it
+ * fails, as one sent before may have done it unanswered, for its caller to tell from the bucket
+ * whether it did.
+ *
  * What the bucket gets is written to its file within a budget of the agent's memory, which
  * counts what is written and not yet on the disk, and cannot reclaim it before it is: at
  * most `parallel` gets at a time, every get of the bucket's together, each synced to the
@@ -34,6 +43,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { type FileHandle, open, stat } from "node:fs/promises";
 import { type ClientRequest, type IncomingMessage, request as httpRequest, type RequestOptions } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { Effect, Schema } from "effect";
 
@@ -47,7 +57,8 @@ export interface S3Credentials {
 
 /**
  * Where the bucket is, and as whom it is reached; and, unless told, how large a part is,
- * how many go at a time, how much a get writes between syncs, and the most copied whole.
+ * how many go at a time, how much a get writes between syncs, the most copied whole, and how
+ * long a request that failed is sent again for, and first waits to be.
  */
 export interface S3Options extends S3Credentials {
   /** The S3 API's URL, `http(s)://host[:port]`. */
@@ -58,6 +69,8 @@ export interface S3Options extends S3Credentials {
   readonly parallel?: number;
   readonly syncBytes?: number;
   readonly copyBytes?: number;
+  readonly resendWithinMs?: number;
+  readonly resendFirstMs?: number;
 }
 
 /** A part, unless told (./names.ts). */
@@ -68,6 +81,26 @@ const PARALLEL = SNAPSHOT_PARTS_AT_ONCE;
 const SYNC_BYTES = SNAPSHOT_SYNC_BYTES;
 /** The most S3 copies in one request: 5 GiB. */
 const COPY_BYTES = 5 * 1024 ** 3;
+
+/**
+ * How long a request is sent again for, from as it first failed, where the store failed it (RESENT_STATUSES) or it failed
+ * unanswered (Unanswered), unless told: 2 minutes, as a store whose parts restart one after another, refusing one another
+ * until all have, fails what it is asked for tens of seconds or a minute or two, after which it fails as the store last failed
+ * it. Nor for longer than every request of the bucket's has failed so, which one the store answers otherwise ends, so that a
+ * store away for longer fails each next request at once, as it did before, rather than hold every one of them as long: what
+ * follows a save that failed so, forgetting its snapshot (./names.ts LOADING_SAVE_LATEST_SECONDS), waits no more for it.
+ */
+const RESEND_WITHIN_MS = 2 * 60_000;
+/** How long a request that failed waits to be sent again the first time, unless told, twice as long each time after: 1 s. */
+const RESEND_FIRST_MS = 1000;
+/** The longest a request that failed waits to be sent again: 16 s, so a store back is found within it. */
+const RESEND_MOST_MS = 16_000;
+/**
+ * What the store answers a request it failed with, which it may do if sent again: its failure or its gateway's (500, 502, 504),
+ * or its asking a client to slow down (503, SlowDown), as SeaweedFS's gateway answers an upload that waited a minute for room
+ * among those under way (from 4.54), its body unread. Not 501, which says it implements no such request.
+ */
+const RESENT_STATUSES: readonly number[] = [500, 502, 503, 504];
 
 /** A request as Signature Version 4 signs it. */
 export interface SigningRequest {
@@ -347,6 +380,12 @@ async function failureOf(response: IncomingMessage): Promise<string> {
   return [`${response.statusCode}`, code, message].filter(Boolean).join(" ");
 }
 
+/**
+ * A request failed before its answer began, as the store or the way to it failed it: refused, dropped, or unanswered for
+ * IDLE_TIMEOUT_MS. Sent again, it may be answered.
+ */
+class Unanswered extends Error {}
+
 /** What a request sends: its query, its headers, signed or not, and its body. */
 interface Sending {
   readonly query?: Readonly<Record<string, string>>;
@@ -458,7 +497,8 @@ async function withChunk<A>(use: (buffer: Buffer) => Promise<A>): Promise<A> {
 /**
  * Sends `size` bytes of the file at `path` from the byte `start` as `request`'s body, and ends it: read into one buffer
  * of FILE_CHUNK_BYTES (withChunk), used again for each read once the request has written out what it was given, so a body
- * holds that buffer and no more, however large it is, and none of what it sent waits for a collection to be freed.
+ * holds that buffer and no more, however large it is, and none of what it sent waits for a collection to be freed. Fails
+ * Unanswered where the request could not be written, as the way to the store failed it.
  */
 async function sendFile(request: ClientRequest, path: string, start: number, size: number): Promise<void> {
   const handle = await open(path, "r");
@@ -467,7 +507,9 @@ async function sendFile(request: ClientRequest, path: string, start: number, siz
       for (let sent = 0; sent < size;) {
         const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - sent), start + sent);
         if (bytesRead === 0) throw new Error(`${path} ends ${sent} bytes into the ${size} sent from its byte ${start}`);
-        await new Promise<void>((resolve, reject) => request.write(buffer.subarray(0, bytesRead), (error) => (error ? reject(error) : resolve())));
+        await new Promise<void>((resolve, reject) =>
+          request.write(buffer.subarray(0, bytesRead), (error) => (error ? reject(new Unanswered(error.message, { cause: error })) : resolve()))
+        );
         sent += bytesRead;
       }
     });
@@ -497,9 +539,11 @@ async function sha256Of(path: string): Promise<string> {
 
 /** The bucket of `options`, reached over HTTP(S) as the module says. */
 export function makeS3Bucket(options: S3Options): S3Bucket {
-  const { partBytes = PART_BYTES, parallel = PARALLEL, syncBytes = SYNC_BYTES, copyBytes = COPY_BYTES } = options;
+  const { partBytes = PART_BYTES, parallel = PARALLEL, syncBytes = SYNC_BYTES, copyBytes = COPY_BYTES, resendWithinMs = RESEND_WITHIN_MS, resendFirstMs = RESEND_FIRST_MS } = options;
   // Every get of the bucket's, so what they hold not yet on the disk, together, is within the budget.
   const getting = limiter(parallel);
+  /** Since when every request of the bucket's has failed as one that is sent again does (RESEND_WITHIN_MS), or null as the last answered otherwise. */
+  let failingSince: number | null = null;
   const endpoint = new URL(options.endpoint);
   const send = endpoint.protocol === "https:" ? httpsRequest : httpRequest;
   const base = endpoint.pathname.replace(/\/+$/u, "");
@@ -507,8 +551,8 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
   /** The object `key` as `/<bucket>/<key>`, encoded, or the bucket for null: a request's path, after the endpoint's, and a copy's source. */
   const inBucket = (key: string | null): string => `/${uriEncode(options.bucket)}${key === null ? "" : `/${key.split("/").map(uriEncode).join("/")}`}`;
 
-  /** Sends a signed request, and answers its response once it begins. */
-  const call = async (method: string, key: string | null, { query = {}, headers = {}, signedHeaders = {}, body }: Sending, signal: AbortSignal): Promise<IncomingMessage> => {
+  /** Sends a signed request, and answers its response once it begins; fails Unanswered where it fails before, as the way to the store does. */
+  const sendOnce = async (method: string, key: string | null, { query = {}, headers = {}, signedHeaders = {}, body }: Sending, signal: AbortSignal): Promise<IncomingMessage> => {
     const payloadHash = body === undefined ? sha256Hex("") : "bytes" in body ? sha256Hex(body.bytes) : UNSIGNED_PAYLOAD;
     const signed = { ...signedHeaders, host: endpoint.host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate(new Date()) };
     const path = `${base}${inBucket(key)}`;
@@ -526,14 +570,46 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     return new Promise<IncomingMessage>((resolve, reject) => {
       const request: ClientRequest = send(requestOptions, resolve);
       request.setTimeout(IDLE_TIMEOUT_MS, () => request.destroy(new Error(`no answer within ${IDLE_TIMEOUT_MS / 1000}s`)));
-      request.once("error", reject);
+      request.once("error", (error) => reject(signal.aborted ? error : new Unanswered(error.message, { cause: error })));
       if (body === undefined) request.end();
       else if ("bytes" in body) request.end(body.bytes);
       else sendFile(request, body.file, body.start ?? 0, body.size).catch((error: unknown) => {
-        request.destroy(error instanceof Error ? error : new Error(String(error)));
+        // Failed with its own error, first: the request's, as it is destroyed with it, is no failure of the store's.
         reject(error);
+        request.destroy(error instanceof Error ? error : new Error(String(error)));
       });
     });
+  };
+
+  /**
+   * Sends a signed request as sendOnce does, and again, signed anew, where it fails Unanswered or is answered as RESENT_STATUSES
+   * says, for as long as RESEND_WITHIN_MS says: its last response, once it begins, or how it last failed. Where what it asks is
+   * done only as the bucket is so, as of an object's ETag or of an upload there still, and it is sent again, an answer that is
+   * one of `refusals` fails it, as a send before may have done it.
+   */
+  const call = async (method: string, key: string | null, sending: Sending, signal: AbortSignal, refusals: readonly number[] = []): Promise<IncomingMessage> => {
+    let failedAt: number | null = null;
+    for (let sent = 1, waitMs = resendFirstMs; ; sent += 1, waitMs = Math.min(2 * waitMs, RESEND_MOST_MS)) {
+      const answered = await sendOnce(method, key, sending, signal).catch((error: unknown) => {
+        if (error instanceof Unanswered && !signal.aborted) return error;
+        throw error;
+      });
+      if (!(answered instanceof Unanswered) && !RESENT_STATUSES.includes(answered.statusCode ?? 0)) {
+        failingSince = null;
+        if (sent === 1 || !refusals.includes(answered.statusCode ?? 0)) return answered;
+        await bodyText(answered, 0);
+        throw new Error(`it was refused (${answered.statusCode}) once sent again, ${sent} sends in all, as one before, which failed, may have done it`);
+      }
+      const now = Date.now();
+      failedAt ??= now;
+      failingSince ??= now;
+      if (now + waitMs - Math.min(failedAt, failingSince) > resendWithinMs) {
+        if (answered instanceof Unanswered) throw sent === 1 ? answered : new Error(`${answered.message}, as it did each of the ${sent} times it was sent, over ${Math.round((now - failedAt) / 1000)} s`);
+        return answered;
+      }
+      if (!(answered instanceof Unanswered)) await bodyText(answered, 0);
+      await sleep(waitMs, undefined, { signal });
+    }
   };
 
   /** `run`'s answer, or why it failed, as the bucket's `operation` of `key`. */
@@ -573,7 +649,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
       const parts = etags.map((etag, index) => `<Part><PartNumber>${index + 1}</PartNumber><ETag>${escapeXml(etag)}</ETag></Part>`).join("");
       const bytes = Buffer.from(`<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUpload>${parts}</CompleteMultipartUpload>`);
       // S3 may answer 200 with an error, the parts not put together.
-      const completed = await bodyText(await succeeded(await call("POST", key, { query: { uploadId }, headers: { "content-type": "application/xml" }, body: { bytes } }, signal)), ERROR_BODY_BYTES);
+      const completed = await bodyText(await succeeded(await call("POST", key, { query: { uploadId }, headers: { "content-type": "application/xml" }, body: { bytes } }, signal, [404])), ERROR_BODY_BYTES);
       if (elements(completed, "Code").length > 0) throw new Error(`its parts were not put together: ${elements(completed, "Code").join(" ")} ${elements(completed, "Message").join(" ")}`);
       const [etag] = elements(completed, "ETag");
       if (!etag) throw new Error("its parts were put together with no ETag");
@@ -603,7 +679,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     attempt("upload", key, async (signal) => {
       const bytes = Buffer.from(JSON.stringify(value));
       const condition = etag === null ? { "if-none-match": "*" } : { "if-match": etag };
-      const response = await succeeded(await call("PUT", key, { headers: { "content-type": "application/json", ...condition }, body: { bytes } }, signal), REFUSED_CONDITIONS);
+      const response = await succeeded(await call("PUT", key, { headers: { "content-type": "application/json", ...condition }, body: { bytes } }, signal, REFUSED_CONDITIONS), REFUSED_CONDITIONS);
       await bodyText(response, 0);
       return !REFUSED_CONDITIONS.includes(response.statusCode ?? 0);
     });
@@ -612,7 +688,7 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     attempt("deletion", key, async (signal) => {
       // Refused where it is another (412), or none: SeaweedFS answers 412 for one not there too, S3 404; and where a write
       // of it runs at once (409, S3's ConditionalRequestConflict), which is another once it is through.
-      const response = await succeeded(await call("DELETE", key, { headers: { "if-match": etag } }, signal), REFUSED_CONDITIONS);
+      const response = await succeeded(await call("DELETE", key, { headers: { "if-match": etag } }, signal, REFUSED_CONDITIONS), REFUSED_CONDITIONS);
       await bodyText(response, 0);
       return !REFUSED_CONDITIONS.includes(response.statusCode ?? 0);
     });

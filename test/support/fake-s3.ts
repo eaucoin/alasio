@@ -7,7 +7,7 @@
  * request's Signature Version 4 checked against the credentials it is given, with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
  * asked is recorded in order, a request can be made to fail, and its gets and heads to wait,
- * as they would on a network.
+ * as they would on a network, and the whole of it to go away and come back.
  */
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -73,6 +73,10 @@ export interface FakeS3 {
   readonly mostHeading: () => number;
   /** Forgets the most heads it has answered at once, counting anew from those it answers now. */
   readonly forgetMostHeading: () => void;
+  /** Stops listening, every connection it has dropped, so that each is refused, as a store away refuses it, until it comes back. */
+  readonly goAway: () => Promise<void>;
+  /** Listens again where it did, as a store back does. */
+  readonly comeBack: () => Promise<void>;
   readonly close: () => Promise<void>;
 }
 
@@ -361,8 +365,9 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     handle(request, response).catch((cause: unknown) => error(response, 500, "InternalError", String(cause)));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
   const fake: FakeS3 = {
-    endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    endpoint: `http://127.0.0.1:${port}`,
     objects,
     writtenAt,
     requests,
@@ -381,6 +386,12 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     headDelayMs: 0,
     mostHeading: () => mostHeading,
     forgetMostHeading: () => void (mostHeading = heading),
+    goAway: () =>
+      new Promise((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+    comeBack: () => new Promise((resolve) => server.listen(port, "127.0.0.1", resolve)),
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
   return fake;

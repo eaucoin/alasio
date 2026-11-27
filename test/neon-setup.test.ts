@@ -534,7 +534,8 @@ test("on an external store, the setup refuses a main key that can write the snap
   const credentials = { accessKeyId: "main-key", secretAccessKey: "main-secret" };
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...credentials });
   try {
-    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...credentials });
+    // Each request sent once, so that the store's failure below fails it at once.
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...credentials, resendWithinMs: 0 });
     await assert.rejects(refuseMainKeyOnSnapshots(bucket), {
       message: "the object store's main key (S3_ACCESS_KEY) can write the snapshots bucket, whose images the node agents restore as root: " +
         "give it no right to that bucket, which the snapshots' own key alone may write",

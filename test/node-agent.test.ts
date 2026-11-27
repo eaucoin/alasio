@@ -70,7 +70,7 @@ import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "..
 import { egressGap, listedEgressGap, type PodAddress } from "../src/node-agent/kube-router.ts";
 import type { NodeMemory } from "../src/node-agent/memory.ts";
 import { type CheckpointOptions, makeRunsc, type ReleaseNotInstalled, type Runsc, RunscError, runscFlags, SandboxGone } from "../src/node-agent/runsc.ts";
-import { makeS3Bucket, sigV4Authorization } from "../src/node-agent/s3.ts";
+import { makeS3Bucket, type S3Options, sigV4Authorization } from "../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../src/node-agent/store-proxy.ts";
 import { NODE_PINS } from "../cli/src/cluster/node.ts";
 import { backgroundReadSeconds, LOAD_WAIT_WATCHDOG_MARGIN_SECONDS, LOADING_SAVE_LATEST_SECONDS, NODE_AGENT_PORT, restoresFromBucket, SAVE_HOOK_SECONDS, SAVE_LOAD_WAIT_SECONDS, STORE_PROXY_PORT } from "../src/node-agent/names.ts";
@@ -279,11 +279,17 @@ interface NodeOptions {
   readonly deltaAfterColdRestore?: boolean;
 }
 
-/** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
-async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: (name: string, options?: NodeOptions) => Effect.Effect<Node, never, Scope.Scope> }) => Effect.Effect<void, unknown, Scope.Scope>): Promise<void> {
+/**
+ * A bucket and a directory of the test's, and nodes made on them, removed after `body`. The bucket sends each request once,
+ * failed or not, as a test of what a failure does asks, unless `resends` says how it sends one again (S3Options).
+ */
+async function withBucket(
+  body: (context: { readonly s3: FakeS3; readonly node: (name: string, options?: NodeOptions) => Effect.Effect<Node, never, Scope.Scope> }) => Effect.Effect<void, unknown, Scope.Scope>,
+  resends: Pick<S3Options, "resendWithinMs" | "resendFirstMs"> = { resendWithinMs: 0 },
+): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
-  const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
+  const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, ...resends });
   const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, deltaAfterColdRestore, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
@@ -2195,6 +2201,33 @@ test("a checkpoint that fails forgets the workspace's snapshot, which the worksp
       assert.equal((yield* here.agent.current({ environment: "main", workspace: "fs-other" }))?.snapshot, other.snapshot);
     })
   ));
+
+test("a release's save lands though the store refuses every connection for 30 s as its image goes up, as one does as its parts restart: each request is sent again until the store is back", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const here = yield* node("node-1");
+      // Away as the image's first file goes up, every connection dropped, the upload's among them, and back 30 s later.
+      const outage = { awayAt: 0, backAt: 0 };
+      let away: Promise<void> | null = null;
+      s3.holdPut = (key) =>
+        key.includes("/layers/")
+          ? (away ??= s3.goAway().then(() => {
+            outage.awayAt = Date.now();
+            setTimeout(() => void s3.comeBack().then(() => (outage.backAt = Date.now())), 30_000);
+          }))
+          : null;
+      const saved = yield* here.agent.checkpoint(request("fs-abc"));
+      s3.holdPut = () => null;
+      assert.ok(outage.backAt - outage.awayAt >= 30_000, `the store was away ${outage.backAt - outage.awayAt} ms`);
+      // Committed once it was back: its image, its manifest and its commit in the bucket, which says it is current.
+      assert.ok(Date.now() >= outage.backAt);
+      assert.deepEqual(yield* here.agent.current(workspace), saved);
+      const [own] = saved.layers;
+      assert.ok(own);
+      assert.deepEqual(keysOf(s3, `main/fs-abc/layers/${own.digest}/`), IMAGE_FILES.map((path) => `main/fs-abc/layers/${own.digest}/${path}`).sort());
+      assert.ok(s3.objects.has(`main/fs-abc/manifests/${saved.snapshot}.json`));
+    }), {}));
 
 test("a checkpoint taken live leaves its sandbox running, records what bayma said it caught, is the base of its next, and changes no snapshot where it fails", () =>
   withBucket(({ s3, node }) =>

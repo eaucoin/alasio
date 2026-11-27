@@ -280,8 +280,8 @@ export const LOADING_STALL_LEAST_SECONDS = SAVE_HOOK_SECONDS;
  * How long from as a release's checkpoint is asked its save may wait on its restore's reads at
  * the most: OPERATION_LIMIT_SECONDS less 5 minutes for what follows a revocation (the gofer's
  * next attempt of a read, 20 s at most; the save's end; forgetting the workspace's snapshot, a
- * request of 60 s at most to a store away; the answer to alasio), which a stall window may take
- * no more of either.
+ * request to a store away sent again for 2 minutes at most, the last of 60 s at most (./s3.ts
+ * RESEND_WITHIN_MS); the answer to alasio), which a stall window may take no more of either.
  */
 export const LOADING_SAVE_LATEST_SECONDS = OPERATION_LIMIT_SECONDS - 5 * 60;
 
