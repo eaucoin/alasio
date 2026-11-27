@@ -353,6 +353,18 @@ if (inShard("upgrade")) {
       // Each as it is said, but the version, and what it replaces, said after it.
       return new RegExp(said.map((each) => each.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(VERSION, ".+?")).join("|"), "u");
     })();
+    /**
+     * A session of main's bound on the release before, busy through the cut-over, which deletes its pod from the session image's
+     * layers it mounts anew: the pod, and its REPL, which holds a value.
+     */
+    const BOUND_SESSION = "fs-e2eupgradebound";
+    let boundBefore: { readonly pod: string; readonly repl: string } | null = null;
+    /** The file whose writing ends the exec that keeps the bound session busy. */
+    const BOUND_HELD_UNTIL = "/workspace/upgrade/bound-released";
+    /** Why the scenarios of the session image's layers are skipped, where they are. */
+    const NOT_LAZY = "the session image is pulled lazily through stargz-snapshotter's daemon on the host target alone, of the images a run pushed";
+    /** Whether the session image's layers are on the cluster's node as this run's are on the host target: through stargz-snapshotter's daemon. */
+    const LAZY = TARGET === "host" && ESTARGZ;
     /** The standbys of main's sessions that run, each of its containers started, on `node` where named. */
     const standbysRunning = async (node?: string) =>
       (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: node === undefined ? STANDBY_LABEL : `${STANDBY_LABEL}=${node}` })).filter((pod) =>
@@ -564,13 +576,8 @@ if (inShard("upgrade")) {
           const after = await stackSecrets();
           const changed = (before: Readonly<Record<string, string>>, now: Readonly<Record<string, string>>) => Object.keys(before).filter((key) => before[key] !== now[key]);
           assert.deepEqual({ root: changed(secretsBefore.root, after.root), log: changed(secretsBefore.log, after.log) }, { root: [], log: [] });
-          // And what the object store's parts prove themselves with, which this release adds to the stack's.
-          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)).sort(), [
-            "storeSecurity.authority",
-            "storeSecurity.filerReadSigningKey",
-            "storeSecurity.filerSigningKey",
-            "storeSecurity.parts",
-          ]);
+          // And this release adds none to the stack's.
+          assert.deepEqual(Object.keys(after.root).filter((key) => !(key in secretsBefore.root)), []);
         },
       },
       {
@@ -674,6 +681,46 @@ if (inShard("upgrade")) {
             assert.ok(release !== undefined && restoresIntoStandby(release, NODE_PINS.gvisor.restoresIntoStandbySince ?? ""), `the standby ${standby.metadata?.name} runs under ${standby.spec?.runtimeClassName}`);
             assert.equal(standby.metadata?.annotations?.[STANDBY_ANNOTATION], standbySocket(SESSIONS, standby.metadata?.name ?? ""));
           }
+        },
+      },
+      {
+        seeds: "a session bound and busy through the cut-over, its REPL holding a value, on the session image's layers",
+        seed: async (t) => {
+          if (!LAZY) return void t.skip(NOT_LAZY);
+          // fusectl's mount, made where the machine has none, before the cut-over, so that each FUSE connection made after it is
+          // made then, as its directory's time says, which the cut-over's check reads.
+          await onNode("", 'grep -qF " /sys/fs/fuse/connections " /proc/self/mountinfo || mount -t fusectl none /sys/fs/fuse/connections');
+          const token = await mainToken(BOUND_SESSION);
+          await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+          const { name } = await bindSession(BOUND_SESSION);
+          assert.ok(await onRemoteSnapshot(SESSIONS, name), `${SESSIONS}/${name} runs on no layer of the session image's`);
+          const { sessionId } = await repl.set(BOUND_SESSION, `bound on ${PREVIOUS}`);
+          // Busy, so that its gateway releases it no sooner than the cut-over.
+          await repl.hold(BOUND_SESSION, BOUND_HELD_UNTIL);
+          boundBefore = { pod: name, repl: sessionId };
+        },
+        keeps: "the session bound through the cut-over, its pod deleted from the layers the cut-over mounted anew, saved and released, and restored whole at its next bind onto those layers; and a new session bound on them",
+        check: async (t) => {
+          if (boundBefore === null) return void t.skip(NOT_LAZY);
+          const { pod, repl: held } = boundBefore;
+          assert.match(await inCutOverRecord("cat remount.log"), new RegExp(`^pod "${pod}" deleted`, "mu"), `the cut-over did not delete ${SESSIONS}/${pod}`);
+          // Released into a snapshot taken as its pod was deleted, not left bound.
+          assert.equal(await boundPodOf(BOUND_SESSION), null);
+          assert.ok(await snapshotOf(BOUND_SESSION), `${BOUND_SESSION} was released into no snapshot`);
+          const bound = await bindSession(BOUND_SESSION);
+          assert.match(bound.name, /-restore-/u);
+          assert.ok(await onRemoteSnapshot(SESSIONS, bound.name), `${SESSIONS}/${bound.name} runs on no layer of the session image's`);
+          const seen = await repl.read(BOUND_SESSION, held);
+          assert.deepEqual([seen.live, seen.checkpointed], [`bound on ${PREVIOUS}`, `bound on ${PREVIOUS}`]);
+          assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+          // Its exec held since the seed let go, so that it is released as idle.
+          await inSession(BOUND_SESSION, `const f=require("fs");f.mkdirSync(require("path").dirname(${JSON.stringify(BOUND_HELD_UNTIL)}),{recursive:true});f.writeFileSync(${JSON.stringify(BOUND_HELD_UNTIL)},"")`);
+          // A session new since, bound on the layers mounted anew, started there once.
+          const next = await newSession("none");
+          const nextPod = await sessionPod(next);
+          assert.ok(await onRemoteSnapshot(SESSIONS, nextPod.metadata?.name ?? ""));
+          assert.deepEqual(nextPod.status?.containerStatuses?.filter(({ restartCount }) => restartCount > 0).map(({ name }) => name), []);
+          assert.equal((await inSession(next, 'process.stdout.write(String(require("fs").readdirSync("/usr/bin").length > 0))')).trim(), "true");
         },
       },
       {
@@ -829,9 +876,54 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
-      assert.match(again.stderr, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+      // What follows the upgrade: the session image's layers mounted anew, under FUSE passthrough, the pods on them deleted.
+      assert.match(
+        again.stderr,
+        new RegExp(
+          [
+            "stopping stargz-snapshotter's daemon, its FUSE manager \\d+ serving its layers on \\(remount\\.log\\)",
+            "unmounted the [1-9]\\d* layers it served, lazily, which [1-9]\\d* containers read on, the manager serving them still",
+            "starting stargz-snapshotter's daemon, which starts a FUSE manager of its own and mounts each layer again through it, under FUSE passthrough",
+            "stargz-snapshotter's daemon serves again, [0-9.]+ s after this run of the step began, each layer mounted anew through its FUSE manager \\d+",
+            "deleting the [1-9]\\d* pods of the [1-9]\\d* containers on the layers before, as a drain does: a session's bound pod saved and released, the others made again \\(remount\\.log\\)",
+            "the containers on the layers before ended, \\d+ s after their pods were deleted",
+            "killed the FUSE manager before, \\d+, with the layers it served, which nothing reads",
+            "the session image's layers mounted anew, under FUSE passthrough, [0-9.]+ s after this run of the step began",
+            "upgraded at \\S+",
+            "through",
+          ].map((line) => `[^\\n]* ${line}\\n`).join("") + "$",
+          "u",
+        ),
+      );
       assert.deepEqual(await alasioApplied(), applied);
       upgraded = Date.now();
+    });
+
+    // The session image's layers, mounted under the release before's daemon configuration, which kept them through the upgrade's
+    // restart of the daemon, mounted anew by the cut-over under this release's, which serves them through FUSE passthrough: by a
+    // FUSE manager of the daemon's own, started since the upgrade, each layer's FUSE connection made since, as fusectl's directory
+    // of it says, the manager before gone, and no container left on what it served.
+    test(`the cut-over from ${PREVIOUS} has stargz-snapshotter's daemon serve the session image through FUSE passthrough, each of its layers mounted anew since the upgrade by a FUSE manager of its own, the one before gone, no container left on what it served`, { skip: !LAZY && NOT_LAZY }, async (t) => {
+      assert.match(await onNode("", "cat /etc/containerd-stargz-grpc/config.toml"), /^\[fuse\]\npassthrough = true$/mu);
+      // The upgrade's end, to the second, as the cut-over recorded it, before what follows it.
+      const since = Date.parse((await inCutOverRecord("cat upgraded")).trim()) / 1000;
+      const managers = (await onNode("", 'for exe in /proc/[0-9]*/exe; do [ "$(readlink "$exe")" = /usr/local/bin/stargz-fuse-manager ] && { pid=${exe%/exe}; echo "${pid#/proc/}"; }; done; true')).trim().split("\n").filter(Boolean);
+      assert.equal(managers.length, 1, `stargz-snapshotter's FUSE managers: ${managers.join(", ")}`);
+      const started = Number((await onNode("", `date -d "$(ps -o lstart= -p ${managers[0]})" +%s`)).trim());
+      assert.ok(started >= since, `the FUSE manager ${managers[0]} started at ${started}, before the upgrade's end at ${since}`);
+      // Each of the daemon's layers, by its FUSE connection, which fusectl names by its device's minor number.
+      const layers = (await onNode("", "cat /proc/self/mountinfo")).split("\n").flatMap((line) => {
+        const [before = "", after = ""] = line.split(" - ");
+        const fields = before.split(" ");
+        return after.startsWith("fuse") && (fields[4] ?? "").startsWith("/var/lib/containerd-stargz-grpc/snapshotter/snapshots/") ? [{ at: fields[4] ?? "", minor: (fields[2] ?? "").split(":")[1] ?? "" }] : [];
+      });
+      assert.ok(layers.length > 0, "stargz-snapshotter's daemon has no layer mounted");
+      const made = (await onNode("", layers.map(({ minor }) => `stat -c %Y /sys/fs/fuse/connections/${minor}`).join("; "))).trim().split("\n").map(Number);
+      const before = layers.filter((_, at) => !((made[at] ?? 0) >= since));
+      assert.deepEqual(before.map(({ at }) => at), [], `layers whose FUSE connections were made before the upgrade's end at ${since}: ${before.map(({ at, minor }) => `${at} (${minor})`).join(", ")}`);
+      assert.deepEqual(await staleOnNode(""), [], "a container runs on the layers of the FUSE manager before");
+      const events = (await inCutOverRecord("cat events.log")).split("\n").filter((line) => /daemon serves again|containers on the layers before ended|layers mounted anew, under FUSE passthrough/u.test(line));
+      t.diagnostic(`${layers.length} layers mounted anew by the FUSE manager ${managers[0]}, started ${started - since} s after the upgrade's end; ${events.join("; ")}`);
     });
 
     // The upgrade restarted the cluster for the gVisor releases this release pins, the release before's sandbox gateway running
