@@ -57,8 +57,9 @@ export interface S3Credentials {
 
 /**
  * Where the bucket is, and as whom it is reached; and, unless told, how large a part is,
- * how many go at a time, how much a get writes between syncs, the most copied whole, and how
- * long a request that failed is sent again for, and first waits to be.
+ * how many go at a time, how much a get writes between syncs, the most copied whole, how long
+ * a request that failed is sent again for, and first waits to be, and how long after its last
+ * failure the store is taken as failing no more.
  */
 export interface S3Options extends S3Credentials {
   /** The S3 API's URL, `http(s)://host[:port]`. */
@@ -71,6 +72,7 @@ export interface S3Options extends S3Credentials {
   readonly copyBytes?: number;
   readonly resendWithinMs?: number;
   readonly resendFirstMs?: number;
+  readonly failureForgottenMs?: number;
 }
 
 /** A part, unless told (./names.ts). */
@@ -86,9 +88,10 @@ const COPY_BYTES = 5 * 1024 ** 3;
  * How long a request is sent again for, from as it first failed, where the store failed it (RESENT_STATUSES) or it failed
  * unanswered (Unanswered), unless told: 2 minutes, as a store whose parts restart one after another, refusing one another
  * until all have, fails what it is asked for tens of seconds or a minute or two, after which it fails as the store last failed
- * it. Nor for longer than every request of the bucket's has failed so, which one the store answers otherwise ends, so that a
- * store away for longer fails each next request at once, as it did before, rather than hold every one of them as long: what
- * follows a save that failed so, forgetting its snapshot (./names.ts LOADING_SAVE_LATEST_SECONDS), waits no more for it.
+ * it. Nor for longer than every request of the bucket's has failed so, which one the store answers otherwise ends, or a while
+ * with no failure (FAILURE_FORGOTTEN_MS), so that a store away for longer fails each next request at once, as it did before,
+ * rather than hold every one of them as long: what follows a save that failed so, forgetting its snapshot (./names.ts
+ * LOADING_SAVE_LATEST_SECONDS), waits no more for it.
  */
 export const RESEND_WITHIN_MS = 2 * 60_000;
 /** How long a request that failed waits to be sent again the first time, unless told, twice as long each time after: 1 s. */
@@ -261,6 +264,13 @@ export const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 
 /** How long a request may wait for its next bytes, either way. */
 const IDLE_TIMEOUT_MS = 60_000;
+/**
+ * How long after the store last failed a request, sent again or not, it is taken as failing no more (RESEND_WITHIN_MS), unless
+ * told: longer than a request sent again goes between two of its failures, RESEND_MOST_MS and IDLE_TIMEOUT_MS at the most, so
+ * that a store failing still is taken as failing still; and one that came back with no request to tell it, as over a quiet
+ * hour, does not have the next request that fails, as one it asks to slow down does, fail at once.
+ */
+const FAILURE_FORGOTTEN_MS = RESEND_MOST_MS + IDLE_TIMEOUT_MS;
 /** The most of a failed response's body read for its reason. */
 const ERROR_BODY_BYTES = 64 * 1024;
 /** The most a JSON object of the bucket's may hold: a manifest, which names a snapshot's few files, is a few KiB. */
@@ -539,11 +549,14 @@ async function sha256Of(path: string): Promise<string> {
 
 /** The bucket of `options`, reached over HTTP(S) as the module says. */
 export function makeS3Bucket(options: S3Options): S3Bucket {
-  const { partBytes = PART_BYTES, parallel = PARALLEL, syncBytes = SYNC_BYTES, copyBytes = COPY_BYTES, resendWithinMs = RESEND_WITHIN_MS, resendFirstMs = RESEND_FIRST_MS } = options;
+  const { partBytes = PART_BYTES, parallel = PARALLEL, syncBytes = SYNC_BYTES, copyBytes = COPY_BYTES, resendWithinMs = RESEND_WITHIN_MS, resendFirstMs = RESEND_FIRST_MS, failureForgottenMs = FAILURE_FORGOTTEN_MS } = options;
   // Every get of the bucket's, so what they hold not yet on the disk, together, is within the budget.
   const getting = limiter(parallel);
-  /** Since when every request of the bucket's has failed as one that is sent again does (RESEND_WITHIN_MS), or null as the last answered otherwise. */
-  let failingSince: number | null = null;
+  /**
+   * Since when every request of the bucket's has failed as one that is sent again does (RESEND_WITHIN_MS), and when one last
+   * did; or null as the last was answered otherwise, or none has failed for failureForgottenMs.
+   */
+  let failing: { readonly since: number; last: number } | null = null;
   const endpoint = new URL(options.endpoint);
   const send = endpoint.protocol === "https:" ? httpsRequest : httpRequest;
   const base = endpoint.pathname.replace(/\/+$/u, "");
@@ -595,15 +608,16 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         throw error;
       });
       if (!(answered instanceof Unanswered) && !RESENT_STATUSES.includes(answered.statusCode ?? 0)) {
-        failingSince = null;
+        failing = null;
         if (sent === 1 || !refusals.includes(answered.statusCode ?? 0)) return answered;
         await bodyText(answered, 0);
         throw new Error(`it was refused (${answered.statusCode}) once sent again, ${sent} sends in all, as one before, which failed, may have done it`);
       }
       const now = Date.now();
       failedAt ??= now;
-      failingSince ??= now;
-      if (now + waitMs - Math.min(failedAt, failingSince) > resendWithinMs) {
+      if (failing === null || now - failing.last > failureForgottenMs) failing = { since: now, last: now };
+      else failing.last = now;
+      if (now + waitMs - Math.min(failedAt, failing.since) > resendWithinMs) {
         if (answered instanceof Unanswered) throw sent === 1 ? answered : new Error(`${answered.message}, as it did each of the ${sent} times it was sent, over ${Math.round((now - failedAt) / 1000)} s`);
         return answered;
       }

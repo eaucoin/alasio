@@ -263,11 +263,11 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
   }
 });
 
-test("a request the store fails, or that fails unanswered, is sent again, waiting twice as long each time, while the bucket is told to, and one refused otherwise once; one asked as of an ETag and refused once sent again fails", async () => {
+test("a request the store fails, or that fails unanswered, is sent again, waiting twice as long each time, while the bucket is told to, unless every request has failed so for as long and one did lately, and one refused otherwise once; one asked as of an ETag and refused once sent again fails", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
-    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, resendFirstMs: 20, resendWithinMs: 1000 });
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, resendFirstMs: 20, resendWithinMs: 1000, failureForgottenMs: 600 });
     const pages = Buffer.from(Array.from({ length: 2500 }, (_, index) => index % 251));
     const source = join(directory, "pages.img");
     writeFileSync(source, pages);
@@ -313,6 +313,13 @@ test("a request the store fails, or that fails unanswered, is sent again, waitin
     s3.requests.length = 0;
     assert.ok(Exit.isFailure(await put({ snapshot: "s1" })));
     assert.equal(sends(), 1);
+    // Nor where none has failed for longer than the bucket is told to remember a failure (600 ms), as of a store that came
+    // back with nothing asked of it: the next that fails is sent again as the first was.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    s3.requests.length = 0;
+    const [rememberedMs, remembered] = await timed(() => put({ snapshot: "s1" }));
+    assert.ok(Exit.isFailure(remembered));
+    assert.equal(sends(), 6, `sent ${sends()} times over ${rememberedMs} ms`);
     // Answered once more, the next that fails is sent again as the first was.
     s3.refuse = () => null;
     await Effect.runPromise(bucket.getJson("main/fs-abc/current.json"));
