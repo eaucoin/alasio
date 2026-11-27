@@ -2707,11 +2707,15 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
 
   /**
    * The chain `chain` of the filter table of `ip`'s family on the node, as iptables lists it;
-   * unlisted where iptables exits 1, as it does for a chain there is not, saying why.
+   * unlisted where iptables exits 1, as it does for a chain there is not, or 4, as the node's
+   * iptables does where it is legacy and another holds its lock (xtables.lock), kube-router as it
+   * syncs, saying why: a gap, looked for again at the next look, as one still unwritten is. Its
+   * lock not waited for (`-w`): legacy iptables tries it again only every `-W`, a second unless
+   * told, and a look is every POLICY_POLL.
    */
   const listed = (ip: string) => (chain: string): Effect.Effect<Listing, HostCommandError> =>
-    onNode(host, [isIPv6(ip) ? "ip6tables" : "iptables", "-t", "filter", "-S", chain], ({ exitCode }) => exitCode === 0 || exitCode === 1).pipe(
-      Effect.map(({ exitCode, stdout, stderr }) => (exitCode === 0 ? { rules: stdout } : { unlisted: stderr.trim() || "it exited 1" })),
+    onNode(host, [isIPv6(ip) ? "ip6tables" : "iptables", "-t", "filter", "-S", chain], ({ exitCode }) => exitCode === 0 || exitCode === 1 || exitCode === 4).pipe(
+      Effect.map(({ exitCode, stdout, stderr }) => (exitCode === 0 ? { rules: stdout } : { unlisted: stderr.trim() || `it exited ${exitCode}` })),
     );
 
   /** What of its rules a pod's address lacks in its family's filter table on the node, as ./kube-router.ts says, or null. */

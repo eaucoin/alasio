@@ -4194,6 +4194,22 @@ test("a resume waits for the pod's rules on every address, forgets the connectio
     }).pipe(Effect.provide(TestClock.layer()))
   ));
 
+test("a resume whose look finds the node's iptables lock held, as legacy iptables exits 4 while kube-router syncs, looks again at the next look, and resumes once one lists the pod's rules", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const snapshot = released(s3);
+      const { host } = here;
+      let held = 1;
+      host.answer = ([program]) => (program === "iptables" && held-- > 0 ? { exitCode: 4, stdout: "", stderr: "Another app is currently holding the xtables lock. Perhaps you want to use the -w option?\n" } : null);
+      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot)));
+      yield* TestClock.adjust("10 millis");
+      yield* Fiber.join(resuming);
+      assert.deepEqual(host.ran.filter(([program]) => program === "iptables"), [listing(4, FORWARD), listing(4, FORWARD), listing(4, podChainOf(host.ipv4))]);
+      assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
+    }).pipe(Effect.provide(TestClock.layer()))
+  ));
+
 test("a resume waits for its pod to run its containers with its addresses, as the API server says it, and is answered once the pod accepts connections on its bayma's port from the node, as kubelet's readiness probe would find it; one whose pod goes, or that does not accept, is refused, saying why", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
