@@ -172,9 +172,9 @@ export async function bootLogs(node: string): Promise<void> {
   // Spike: and runsc's flags that the setting BENCH_RUNSC_CONFIG names, as flag:value pairs separated by commas.
   const flags = (process.env["BENCH_RUNSC_CONFIG"] ?? "").split(",").filter(Boolean).map((pair) => {
     const [flag = "", value = ""] = pair.split(":");
-    if (!/^[a-z0-9-]+$/u.test(flag) || !/^[A-Za-z0-9_./+-]+$/u.test(value)) throw new Error(`BENCH_RUNSC_CONFIG names ${pair}, no flag:value`);
-    // Spike: a value's list, as strace-syscalls', its items joined by + in the setting.
-    return `  ${flag} = "${value.replaceAll("+", ",")}"\\n`;
+    if (!/^[a-z0-9-]+$/u.test(flag) || !/^[A-Za-z0-9_./-]+$/u.test(value)) throw new Error(`BENCH_RUNSC_CONFIG names ${pair}, no flag:value`);
+    // Spike: strace-syscalls' list, its names joined by dots in the setting, whose words commas split.
+    return `  ${flag} = "${flag === "strace-syscalls" ? value.replaceAll(".", ",") : value}"\\n`;
   });
   // Spike: a flag the options set already, as working-set-window, set to the setting's value instead.
   const unset = (process.env["BENCH_RUNSC_CONFIG"] ?? "").split(",").filter(Boolean).map((pair) => `sed -i '/^  ${pair.split(":")[0] ?? ""} = /d' `);
