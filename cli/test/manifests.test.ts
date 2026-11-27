@@ -2705,6 +2705,8 @@ describe("node agents", () => {
       ALASIO_LOADING_STALL_SECONDS: "90",
       ALASIO_ONE_PASS_SAVES: "true",
       ALASIO_DELTA_AFTER_COLD_RESTORE: "true",
+      MALLOC_ARENA_MAX: "2",
+      MALLOC_MMAP_THRESHOLD_: "131072",
       META_URL: { secretKeyRef: { name: "alasio-workspaces-quotas", key: "metaurl" } },
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
