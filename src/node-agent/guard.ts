@@ -33,8 +33,9 @@
  * END_WINDOW_MS, nor while one ended is still there, its memory being freed, so the room is
  * measured anew after each. And only where the sandboxes took the most of what the node is losing
  * now, over the last ATTRIBUTION_WINDOW_MS, the room at its most then less the room now: their
- * growth together over as long, no less than what is left of that loss, the other pods'; and none
- * while the room has stopped falling. A sandbox that grew as another pod grows more, as a
+ * growth together over as long, what a restore fills its sandbox with counted, as the room falls by
+ * it all the same, no less than what is left of that loss, the other pods'; and none while the room
+ * has stopped falling. A sandbox that grew as another pod grows more, as a
  * session's REPL loading a dataset while a pod beside it fills the node, is not the cause: ended,
  * it frees what the other takes again, and a session is lost for none of its own doing, as two
  * sandboxes beside a pod that grew by 6 GiB measured, the one that had grown ended in 17 trials of
@@ -105,7 +106,11 @@ const FOREIGN_SAID_MS = 60_000;
 /** By how much a sandbox's limit must move before it is written again. */
 const LIMIT_STEP_BYTES = 16 * 1024 ** 2;
 
-/** A sandbox as the guard plans for it: its key, its pod's state, what its pod and its own cgroup hold, and by how much it grew over GROWTH_WINDOW_MS, and over ATTRIBUTION_WINDOW_MS. */
+/**
+ * A sandbox as the guard plans for it: its key, its pod's state, what its pod and its own cgroup
+ * hold, by how much it grew over GROWTH_WINDOW_MS past what its restore brings in (Restores), and by
+ * how much over ATTRIBUTION_WINDOW_MS, its restore's fill and all.
+ */
 export interface Guarded {
   readonly key: string;
   readonly state: SandboxState;
@@ -254,11 +259,14 @@ export class GuardRecords {
  * The node's sandboxes being restored, by their pods' keys, as the agent restores them (./agent.ts
  * resume, ./standby.ts): what their restores bring in, their images' bytes together, null where it
  * is not known; and when each had read its images, or ended, null while it reads them. What a
- * sandbox fills its memory with from its image is not what its node wants memory for: the guard
- * counts of a sandbox's growth while it restores only what is past its image, and
- * SANDBOX_MEMORY_SLACK_BYTES beside it for its sandbox's own; of one whose image's bytes are not
- * known, none. And for GROWTH_WINDOW_MS after, as its growth is measured over as long. One that has
- * not read its images within RECORD_KEPT_MS is forgotten, as a restore whose pod went is.
+ * sandbox fills its memory with from its image is not what its node wants memory for: of a
+ * sandbox's growth while it restores, the guard takes for the one to end only what is past its
+ * image, and SANDBOX_MEMORY_SLACK_BYTES beside it for its sandbox's own; of one whose image's bytes
+ * are not known, none. And for GROWTH_WINDOW_MS after, as its growth is measured over as long. Not
+ * of what the sandboxes took of what the node lost, though: the room falls by a restore's fill as
+ * by any growth, and counted the other pods' it had them take the most, as one sandbox grew into
+ * the node's end while another restored faster, and the one grown spared. One that has not read its
+ * images within RECORD_KEPT_MS is forgotten, as a restore whose pod went is.
  */
 export class Restores {
   readonly #restores = new Map<string, { readonly bytes: number | null; readonly since: number; readonly readAt: number | null }>();
@@ -353,10 +361,10 @@ export const guardOnce = ({ runsc, nodeRoot, attachRoot, reclaimable = reclaimab
       const scopeBytes = (yield* Effect.promise(() => numberIn(join(sandbox.scope, "memory.current")))) ?? sandbox.bytes ?? 0;
       const seen = [...(state.seen.get(key) ?? []).filter(({ at }) => now - at <= GROWTH_WINDOW_MS), { at: now, bytes: scopeBytes }];
       state.seen.set(key, seen);
-      // Of one being restored, what is past what its restore brings in alone.
+      // Of one being restored, what is past what its restore brings in alone, for the one to end; what it took of the room, all.
       const floor = restores.floorOf(key, now) ?? 0;
       const least = Math.max(Math.min(...seen.map(({ bytes }) => bytes)), floor);
-      const leastRecently = Math.max(Math.min(...seen.filter(({ at }) => now - at <= ATTRIBUTION_WINDOW_MS).map(({ bytes }) => bytes)), floor);
+      const leastRecently = Math.min(...seen.filter(({ at }) => now - at <= ATTRIBUTION_WINDOW_MS).map(({ bytes }) => bytes));
       guarded.push({ key, state: sandbox.state, bytes: sandbox.bytes ?? 0, scopeBytes, grown: Math.max(0, scopeBytes - least), grownRecently: Math.max(0, scopeBytes - leastRecently) });
     }
     const ending = state.endedCgroups.size > 0 || now - state.lastEndAt < END_WINDOW_MS;

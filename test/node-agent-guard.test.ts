@@ -340,6 +340,54 @@ test("as the node's pods come near their limit, a sandbox filling its memory fro
   }
 });
 
+test("as the node's pods come near their limit, a sandbox growing into it as another restores faster beside it is ended, not the one restored: the room falls by a restore's fill as by any growth", async () => {
+  const node = guardedNode();
+  try {
+    // 2 GiB left under the pods' class's limit.
+    node.memory(9 * GIB, 6 * GIB, 8 * GIB);
+    const a = node.pod("sandboxes-none-0aaa", "aaaa-0001", GIB, true);
+    const r = node.pod("sandboxes-none-1rrr", "rrrr-0002", 100 * MIB, true);
+    const restores = new Restores();
+    restores.restoring("alasio-sessions", "sandboxes-none-1rrr", 2 * GIB);
+    const state = newGuardState();
+    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot, restores }, state));
+    const kills = () => [a, r].flatMap((pod) => [node.read(join(pod, "cgroup.kill")), node.read(join(pod, "cri-containerd-pause.scope", "cgroup.kill"))]);
+    await look();
+    // Within the same 2 s, A grows by 1 GiB and R fills from its image to its image's bytes and its sandbox's own, the room falling by both: the class past its limit.
+    const fill = 2 * GIB + SANDBOX_MEMORY_SLACK_BYTES - (100 * MIB - MIB);
+    writeFileSync(join(a, "cri-containerd-pause.scope", "memory.current"), `${2 * GIB - MIB}\n`);
+    writeFileSync(join(r, "cri-containerd-pause.scope", "memory.current"), `${2 * GIB + SANDBOX_MEMORY_SLACK_BYTES}\n`);
+    node.memory(9 * GIB, 6 * GIB + GIB + fill, 8 * GIB);
+    await look();
+    assert.deepEqual(kills(), [null, "1", null, null]);
+  } finally {
+    node.done();
+  }
+});
+
+test("as the node's pods come near their limit, a sandbox restoring alone as another pod takes the room is not ended, its fill no growth of its own", async () => {
+  const node = guardedNode();
+  try {
+    node.memory(9 * GIB, 6 * GIB, 8 * GIB);
+    const a = node.pod("sandboxes-none-0aaa", "aaaa-0001", GIB, true);
+    const r = node.pod("sandboxes-none-1rrr", "rrrr-0002", 100 * MIB, true);
+    const restores = new Restores();
+    restores.restoring("alasio-sessions", "sandboxes-none-1rrr", 2 * GIB);
+    const state = newGuardState();
+    const look = () => Effect.runPromise(guardOnce({ runsc: node.runsc, nodeRoot: node.nodeRoot, attachRoot: node.attachRoot, restores }, state));
+    const kills = () => [a, r].flatMap((pod) => [node.read(join(pod, "cgroup.kill")), node.read(join(pod, "cri-containerd-pause.scope", "cgroup.kill"))]);
+    await look();
+    // R fills from its image as another pod takes 1 GiB: the class past its limit, by no sandbox's growth of its own.
+    const fill = 2 * GIB + SANDBOX_MEMORY_SLACK_BYTES - (100 * MIB - MIB);
+    writeFileSync(join(r, "cri-containerd-pause.scope", "memory.current"), `${2 * GIB + SANDBOX_MEMORY_SLACK_BYTES}\n`);
+    node.memory(9 * GIB, 6 * GIB + fill + GIB, 8 * GIB);
+    for (let each = 0; each < 3; each += 1) await look();
+    assert.deepEqual(kills(), [null, null, null, null]);
+  } finally {
+    node.done();
+  }
+});
+
 test("a sandbox is counted as restored from when the agent says so until GROWTH_WINDOW_MS after it has read its images, and forgotten where it never does", () => {
   const restores = new Restores();
   const now = Date.now();
