@@ -196,6 +196,12 @@ export interface CheckpointOptions {
    * start.sh), its restore `hookTimeout`.
    */
   readonly hookSocket?: string;
+  /**
+   * With `hookSocket`, of a release that syncs the sandbox itself after its hook's save
+   * (./names.ts savesSync): runsc syncs the sandbox's filesystems once the hook has answered the
+   * save, and tells the hook so, which then leaves its own sync; a sync that fails fails the save.
+   */
+  readonly syncsSandbox?: boolean;
 }
 
 /**
@@ -479,7 +485,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
     releases,
     current,
 
-    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds, summaryFile, hookSocket }) =>
+    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath, live = false, loadWaitSeconds, summaryFile, hookSocket, syncsSandbox = false }) =>
       run(release, ["checkpoint"], [
         `--image-path=${imagePath}`,
         "--compression=none",
@@ -492,7 +498,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         // and bayma collects its garbage only as its sandbox ends.
         ...(hookSocket === undefined
           ? [`--save-restore-exec-argv=${[...hook, ...(live ? ["--leave-running"] : [])].join(" ")}`]
-          : [`--save-restore-exec-socket=${hookSocket}`, `--save-restore-exec-save-timeout=${SAVE_HOOK_SECONDS}s`]),
+          : [`--save-restore-exec-socket=${hookSocket}`, `--save-restore-exec-save-timeout=${SAVE_HOOK_SECONDS}s`, ...(syncsSandbox ? ["--save-restore-exec-sync"] : [])]),
         `--save-restore-exec-timeout=${hookTimeout}`,
         containerId,
       ]).pipe(Effect.asVoid),

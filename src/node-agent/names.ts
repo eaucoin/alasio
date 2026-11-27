@@ -333,6 +333,20 @@ export const hooksOverSocket = (release: string, since: string): boolean => rele
 export const HOOKS_OVER_SOCKET_SINCE_VARIABLE = "ALASIO_GVISOR_HOOKS_OVER_SOCKET_SINCE";
 
 /**
+ * Whether gVisor's `release`, asking bayma's hook over its socket (hooksOverSocket), syncs the
+ * sandbox's filesystems itself once the hook has answered a save, and tells the hook so (runsc
+ * checkpoint --save-restore-exec-sync): bayma's server then leaves its own sync, a process it
+ * starts, whose pages the save would write again; a sync that fails fails the save, the sandbox
+ * running on. One at or past `since`, the first release that does, as cluster/node/pins.json says
+ * it (gvisor.savesSyncSince) and the installation gives the node agent it
+ * (SAVES_SYNC_SINCE_VARIABLE); none where `since` names none.
+ */
+export const savesSync = (release: string, since: string): boolean => releaseAtOrPast(release, since);
+
+/** The variable that gives the node agent the first gVisor release that syncs a sandbox after its hook's save (savesSync). */
+export const SAVES_SYNC_SINCE_VARIABLE = "ALASIO_GVISOR_SAVES_SYNC_SINCE";
+
+/**
  * The socket bayma's server serves its hook on, for the hook `hook` (bayma's `sandbox-hook`,
  * told `--state-dir`): sandbox-hook.sock in that state directory, as bayma's sandbox-hook finds it;
  * null for a hook told none. Pure, for tests.

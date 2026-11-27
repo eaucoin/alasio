@@ -36,6 +36,7 @@ import {
   GVISOR_RELEASE_VARIABLE,
   GVISOR_RELEASES,
   HOOKS_OVER_SOCKET_SINCE_VARIABLE,
+  SAVES_SYNC_SINCE_VARIABLE,
   LOADING_STALL_SECONDS_VARIABLE,
   META_URL_VARIABLE,
   NODE_AGENT_PORT,
@@ -161,6 +162,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: SAVES_WITH_LOAD_WAIT_SINCE_VARIABLE, value: NODE_PINS.gvisor.savesWithLoadWaitSince },
               { name: SAVES_SUMMARY_SINCE_VARIABLE, value: NODE_PINS.gvisor.savesSummarySince },
               { name: HOOKS_OVER_SOCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.hooksOverSocketSince },
+              { name: SAVES_SYNC_SINCE_VARIABLE, value: NODE_PINS.gvisor.savesSyncSince },
               { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               // How long a release's save of a sandbox its restore from the bucket still reads may see no byte of it served (src/node-agent/agent.ts).
               { name: LOADING_STALL_SECONDS_VARIABLE, value: String(durationSeconds(sessions.snapshots.loadingStallWait) ?? 0) },
