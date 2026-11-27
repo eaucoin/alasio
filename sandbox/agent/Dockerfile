@@ -26,3 +26,6 @@ RUN mkdir -p /tmp/bayma-build \
       node /opt/bayma/bayma.js install-toolbelt \
  && chown -R agent:agent /opt/bayma-data \
  && rm -rf /tmp/bayma-build
+# Measurement only: bayma's bundle of the 0.15.10 candidate, its save leaving the sync to a host that says it syncs.
+RUN rm -f /opt/bayma/*.js
+COPY bayma-bundle /opt/bayma
