@@ -58,12 +58,13 @@ if (!["as-shipped", "kept-cache", "whole", "restored", "trace", "turn-replay", "
  * the first right after the session's work, the others into its idleness, as one waiting on its
  * user is saved.
  */
-const IDLE_SAVES_S = [0, 5, 30, 120, 300] as const;
+// Spike: back to back after the first 5 s, for what a save and its resume write themselves.
+const IDLE_SAVES_S = [0, 5, 0, 0, 0] as const;
 const IDLING = VARIANT === "idle-saves" || VARIANT === "idle-floor";
 /** How long the session is left idle before each live save a run takes, in seconds. */
 export const IDLE_BEFORE_SAVES_S: readonly number[] = IDLING ? IDLE_SAVES_S : [];
 /** How long the session is left idle after its last live save before its release, in seconds. */
-export const IDLE_BEFORE_RELEASE_S = IDLING ? 300 : 0;
+export const IDLE_BEFORE_RELEASE_S = IDLING ? 5 : 0;
 /** Whether the session is asked nothing after its first live save's mark (`idle-floor`). */
 export const IDLE_UNTOUCHED = VARIANT === "idle-floor";
 /** The live saves a run takes before its release. */
