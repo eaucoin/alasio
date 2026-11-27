@@ -78,6 +78,26 @@ export const APPLIED_AFTER_ANNOTATION = "alasio.dev/applied-after";
  */
 export const APPLIED_ONCE_ROLLED_ANNOTATION = "alasio.dev/applied-once-rolled";
 
+/**
+ * The annotation of a workload applied, with every other of its phase that carries it, before
+ * the rest of that phase, which is applied only once they are ready (../kube/apply.ts): for the
+ * parts of a store the rest reads and writes, so that the window in which they restart is no
+ * longer than their own restarts, and over before anything else restarts.
+ */
+export const APPLIED_FIRST_ANNOTATION = "alasio.dev/applied-first";
+
+/**
+ * The annotation of a workload whose pods are replaced as a ConfigMap or Secret they read
+ * changes: as it is applied, after the ConfigMaps and the Jobs that make its Secrets, its pod
+ * template is given CONFIG_READ_ANNOTATION (../kube/apply.ts), for a workload that reads them
+ * as it starts alone, a Secret a Job makes, which no manifest holds to take a checksum of,
+ * among them.
+ */
+export const ROLLS_WITH_CONFIG_ANNOTATION = "alasio.dev/rolls-with-config";
+
+/** The annotation of the pod template of a workload that rolls with what it reads: a checksum of what each ConfigMap and Secret its pods read holds. */
+export const CONFIG_READ_ANNOTATION = "checksum/config-read";
+
 /** The value of APPLIED_AFTER_ANNOTATION, or of APPLIED_ONCE_ROLLED_ANNOTATION, that names `workloads`. */
 export const appliedAfter = (workloads: readonly { readonly kind: string; readonly namespace: string; readonly name: string }[]): string =>
   workloads.map(({ kind, namespace, name }) => `${kind}/${namespace}/${name}`).join(",");

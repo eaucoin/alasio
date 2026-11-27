@@ -19,7 +19,7 @@ import { Effect, Logger, Result } from "effect";
 import { installConfigOf } from "../src/config.ts";
 import { installationObjects } from "../src/install.ts";
 import { kind, KubeApi } from "../src/kube/api.ts";
-import { applyInstallation, removeInstallation } from "../src/kube/apply.ts";
+import { applyInstallation, applyObjects, configReadBy, removeInstallation } from "../src/kube/apply.ts";
 import { checkAutoscalers } from "../src/kube/autoscalers.ts";
 import { awaitRolled, READY_ONCE_BOUND_ANNOTATION, readiness, readinessOf } from "../src/kube/rollout.ts";
 import { POLICY_PROBE_POD_ANNOTATION, POLICY_REVISION_ANNOTATION } from "../src/manifests/admission.ts";
@@ -850,6 +850,91 @@ test("a workload's applied-after naming what the installation applies in another
   assert.deepEqual(kube.changes.filter(({ method }) => method === "PATCH"), []);
   await run(applyInstallation(naming("StatefulSet/alasio/alasio-nothing"), WAIT));
   assert.ok(progress.includes("applying DaemonSet alasio/alasio-workspace-mount once StatefulSet alasio/alasio-valkey, StatefulSet alasio/alasio-seaweedfs-filer-store are ready"), progress.join("\n"));
+});
+
+test("the object store's parts are applied first, and every other workload only once they are ready, so the store is back before anything that reads it restarts; a part never ready holds every other", async (t) => {
+  const { kube, run, progress } = await rig(t);
+  const objects = objectsOf();
+  const parts = ["statefulsets/alasio-seaweedfs-master", "statefulsets/alasio-seaweedfs-volume", "statefulsets/alasio-seaweedfs-filer-store", "statefulsets/alasio-seaweedfs-filer", "deployments/alasio-seaweedfs"];
+  const workloads = (from = 0) =>
+    kube.changes.slice(from).filter(({ method, path }) => method === "PATCH" && /\/(deployments|statefulsets|daemonsets|cronjobs)\//u.test(path)).map(({ path }) => `${pluralOf(path)}/${path.split("/").at(-1)}`);
+  kube.stuck.add("alasio-seaweedfs-master");
+  const error = await run(Effect.flip(applyInstallation(objects, { timeout: "300 millis", poll: "10 millis" })));
+  assert.equal(error._tag, "NotReadyInTime");
+  assert.match(error.message, /StatefulSet alasio\/alasio-seaweedfs-master: /u);
+  assert.deepEqual(workloads().sort(), [...parts].sort());
+  kube.stuck.delete("alasio-seaweedfs-master");
+  const since = kube.changes.length;
+  await run(applyInstallation(objects, WAIT));
+  const order = workloads(since);
+  assert.deepEqual(order.slice(0, parts.length).sort(), [...parts].sort());
+  assert.ok(order.length > parts.length, order.join(", "));
+  assert.ok(progress.includes("applying the rest of the workloads once StatefulSet alasio/alasio-seaweedfs-master, StatefulSet alasio/alasio-seaweedfs-volume, StatefulSet alasio/alasio-seaweedfs-filer-store, StatefulSet alasio/alasio-seaweedfs-filer, Deployment alasio/alasio-seaweedfs are ready"), progress.join("\n"));
+});
+
+test("the ConfigMaps and Secrets a pod reads are read of its volumes, projected or not, and its containers' environment", () => {
+  assert.deepEqual(configReadBy({
+    initContainers: [{ name: "wait", env: [{ name: "A", valueFrom: { secretKeyRef: { name: "init-secret", key: "a" } } }] }],
+    containers: [{
+      name: "main",
+      env: [{ name: "B", value: "b" }, { name: "C", valueFrom: { configMapKeyRef: { name: "env-map", key: "c" } } }, { name: "D", valueFrom: { secretKeyRef: { name: "env-secret", key: "d" } } }],
+      envFrom: [{ secretRef: { name: "from-secret" } }, { configMapRef: { name: "from-map" } }],
+    }],
+    volumes: [
+      { name: "a", secret: { secretName: "volume-secret" } },
+      { name: "b", configMap: { name: "volume-map" } },
+      { name: "c", projected: { sources: [{ configMap: { name: "projected-map" } }, { secret: { name: "projected-secret" } }, { secret: { name: "env-secret" } }] } },
+      { name: "d", emptyDir: {} },
+    ],
+  }), {
+    configMaps: ["env-map", "from-map", "projected-map", "volume-map"],
+    secrets: ["env-secret", "from-secret", "init-secret", "projected-secret", "volume-secret"],
+  });
+  assert.deepEqual(configReadBy(undefined), { configMaps: [], secrets: [] });
+});
+
+test("a workload that rolls with what it reads is given, as it is applied, a checksum of each ConfigMap and Secret its pods read as they are then, a Secret no manifest holds among them; one that does not, none", async (t) => {
+  const { kube, run } = await rig(t);
+  const statefulSet = (name: string, rolls: boolean) => ({
+    apiVersion: "apps/v1",
+    kind: "StatefulSet",
+    metadata: { name, namespace: "alasio", ...(rolls ? { annotations: { "alasio.dev/rolls-with-config": "true" } } : {}) },
+    spec: {
+      serviceName: name,
+      selector: { matchLabels: { app: name } },
+      template: {
+        metadata: { labels: { app: name } },
+        spec: {
+          containers: [{ name: "part", image: "example.com/part:1", env: [{ name: "KEY", valueFrom: { secretKeyRef: { name: "part-key", key: "key" } } }] }],
+          volumes: [{ name: "config", projected: { sources: [{ configMap: { name: "part-config" } }, { secret: { name: "part-certificate" } }] } }],
+        },
+      },
+    },
+  });
+  const configMap = (toml: string) => ({ apiVersion: "v1", kind: "ConfigMap", metadata: { name: "part-config", namespace: "alasio" }, data: { "security.toml": toml } });
+  // The Secrets a Job of the stack makes, there as the workloads are applied.
+  const secret = (name: string, data: Record<string, string>) => kube.objects.set(`/api/v1/namespaces/alasio/secrets/${name}`, { apiVersion: "v1", kind: "Secret", metadata: { name, namespace: "alasio" }, data });
+  secret("part-key", { key: "a2V5" });
+  secret("part-certificate", { "tls.crt": "Y2VydA==", "tls.key": "a2V5" });
+  const checksum = async (toml = "one") => {
+    await run(applyObjects([configMap(toml), statefulSet("rolls", true), statefulSet("stays", false)], WAIT));
+    const read = (name: string) => (kube.get(`/apis/apps/v1/namespaces/alasio/statefulsets/${name}`)?.["spec"] as { template?: { metadata?: { annotations?: Record<string, string> } } } | undefined)?.template?.metadata?.annotations;
+    assert.equal(read("stays")?.["checksum/config-read"], undefined);
+    return read("rolls")?.["checksum/config-read"];
+  };
+  const first = await checksum();
+  assert.match(first ?? "", /^[0-9a-f]{16}$/u);
+  // Nothing changed, nothing rolls.
+  assert.equal(await checksum(), first);
+  // A certificate made anew, a key, the ConfigMap, a Secret gone: each rolls it.
+  secret("part-certificate", { "tls.crt": "Y2VydDI=", "tls.key": "a2V5" });
+  const certificate = await checksum();
+  secret("part-key", { key: "a2V5Mg==" });
+  const key = await checksum();
+  const toml = await checksum("two");
+  kube.objects.delete("/api/v1/namespaces/alasio/secrets/part-key");
+  const gone = await checksum("two");
+  assert.equal(new Set([first, certificate, key, toml, gone]).size, 5);
 });
 
 test("a DaemonSet is ready once every node it schedules to runs its current pod, ready", () => {

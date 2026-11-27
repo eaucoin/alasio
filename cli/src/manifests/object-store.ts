@@ -49,7 +49,25 @@ import type {
 import { commonName, type StorePart } from "../../../neon/control/store-security.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
-import { BACKGROUND_CPU, claimSpec, componentName, labels, NAMESPACE, neonName, oncePolicyApplies, replicasOf, restrictedContainer, s3Endpoint, scaled, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
+import {
+  APPLIED_FIRST_ANNOTATION,
+  BACKGROUND_CPU,
+  claimSpec,
+  componentName,
+  labels,
+  NAMESPACE,
+  neonName,
+  oncePolicyApplies,
+  replicasOf,
+  restrictedContainer,
+  ROLLS_WITH_CONFIG_ANNOTATION,
+  s3Endpoint,
+  scaled,
+  script,
+  selectorLabels,
+  stackLabels,
+  stackPodSpec,
+} from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -206,8 +224,20 @@ function configVolume(name: string, part: StorePart, others: readonly V1VolumePr
 /** The mount of a part's configuration volume `name` (configVolume), where SeaweedFS reads it. */
 const configMount = (name: string) => ({ name, mountPath: CONFIG_DIRECTORY, readOnly: true });
 
-/** The annotation of each part's pods, which restarts them as the store's security.toml changes, which they read as they start alone. */
-const securityChecksum = () => ({ "checksum/security": sha256(storeSecurityToml()) });
+/**
+ * Each part of the store that runs, each StatefulSet and the gateways' Deployment, of `objects`:
+ * applied before the rest of the stack's workloads, which are applied only once these are ready
+ * (APPLIED_FIRST_ANNOTATION), so the store is away no longer than its own parts restart, and back
+ * before anything that reads it restarts; and replaced as what they read as they start alone
+ * changes (ROLLS_WITH_CONFIG_ANNOTATION): security.toml, the Secrets of their certificates and
+ * keys, which the stack setup makes, and the rest of their configuration.
+ */
+const storeParts = (objects: readonly KubernetesObject[]): KubernetesObject[] =>
+  objects.map((object) =>
+    object.kind === "StatefulSet" || object.kind === "Deployment"
+      ? { ...object, metadata: { ...object.metadata, annotations: { ...object.metadata?.annotations, [APPLIED_FIRST_ANNOTATION]: "true", [ROLLS_WITH_CONFIG_ANNOTATION]: "true" } } }
+      : object
+  );
 
 /**
  * The filers' signing key of writes, of `part`'s Secret: which the filers take requests over
@@ -298,7 +328,7 @@ function partStatefulSet(
       podManagementPolicy: ordered ? "OrderedReady" : "Parallel",
       selector: { matchLabels: selectorLabels(component) },
       template: {
-        metadata: { labels: stackLabels(component), annotations: securityChecksum() },
+        metadata: { labels: stackLabels(component) },
         spec: {
           ...priority(storage ? "bound" : "floor"),
           ...stackPodSpec(config),
@@ -594,7 +624,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
       ...replicasOf(scaling),
       selector: { matchLabels: selectorLabels(COMPONENTS.gateway) },
       template: {
-        metadata: { labels: stackLabels(COMPONENTS.gateway), annotations: securityChecksum() },
+        metadata: { labels: stackLabels(COMPONENTS.gateway) },
         spec: {
           ...priority("floor"),
           ...stackPodSpec(config),
@@ -1071,11 +1101,7 @@ export function objectStoreObjects(config: InstallConfig): KubernetesObject[] {
   };
   return [
     security,
-    ...masterObjects(config),
-    ...volumeServerObjects(config),
-    ...filerStoreObjects(config),
-    ...filerObjects(config),
-    ...gatewayObjects(config),
+    ...storeParts([...masterObjects(config), ...volumeServerObjects(config), ...filerStoreObjects(config), ...filerObjects(config), ...gatewayObjects(config)]),
     lifecyclePass(config),
     ...filerStoreBackup(config),
   ];

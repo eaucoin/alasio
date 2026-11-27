@@ -44,7 +44,7 @@ import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
 import { alasioObjects, alasioScaling } from "../src/manifests/alasio.ts";
 import { branchEnvironment, branchObjects } from "../src/manifests/branch.ts";
-import { MAIN_ENVIRONMENT, sha256 } from "../src/manifests/common.ts";
+import { APPLIED_FIRST_ANNOTATION, MAIN_ENVIRONMENT, ROLLS_WITH_CONFIG_ANNOTATION } from "../src/manifests/common.ts";
 import { lakeReconcile } from "../src/manifests/lake.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
@@ -1265,10 +1265,12 @@ describe("object store", () => {
     const pass = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
     assert.deepEqual(pass?.env, [key("WEED_JWT_FILER_SIGNING_KEY", "lifecycle", "filer-signing-key")]);
     assert.equal(objects.flatMap(keyed).length, 4);
-    // Each part restarts as the file changes, which it reads as it starts alone.
-    for (const [kind, name] of [["StatefulSet", "alasio-seaweedfs-master"], ["StatefulSet", "alasio-seaweedfs-volume"], ["StatefulSet", "alasio-seaweedfs-filer"], ["Deployment", "alasio-seaweedfs"]] as const) {
-      assert.equal(template(kind, name)?.metadata?.annotations?.["checksum/security"], sha256(toml), name);
-    }
+    // Each part that runs restarts as the file or its Secrets change, which it reads as it starts alone; and is applied, and
+    // ready, before any other workload of the stack: none but those.
+    const parts = ["StatefulSet/alasio-seaweedfs-master", "StatefulSet/alasio-seaweedfs-volume", "StatefulSet/alasio-seaweedfs-filer-store", "StatefulSet/alasio-seaweedfs-filer", "Deployment/alasio-seaweedfs"];
+    const marked = (annotation: string) => objects.filter(({ metadata }) => metadata?.annotations?.[annotation] === "true").map(({ kind, metadata }) => `${kind}/${metadata?.name}`).sort();
+    assert.deepEqual(marked(APPLIED_FIRST_ANNOTATION), [...parts].sort());
+    assert.deepEqual(marked(ROLLS_WITH_CONFIG_ANNOTATION), [...parts].sort());
   });
 
   test("sizes the filer store's memory from the entries it holds, and refuses a limit that leaves no room for its snapshots", () => {

@@ -5,7 +5,9 @@
  * of pods; what pods run as and with, and where the API server
  * reaches its extensions (APIServices, webhooks); Jobs, each run to completion afresh
  * (the Neon setup, which makes the Secrets the stack mounts); once each policy of pods holds
- * them as applied, the workloads, each that names
+ * them as applied, the workloads: those applied first (APPLIED_FIRST_ANNOTATION), waited for
+ * until ready, then the rest; each that rolls with what it reads (ROLLS_WITH_CONFIG_ANNOTATION)
+ * given the checksum of the ConfigMaps and Secrets it reads as they are then; each that names
  * others of them it waits for (APPLIED_AFTER_ANNOTATION) applied only once those are ready,
  * and each that names DaemonSets (APPLIED_ONCE_ROLLED_ANNOTATION) once those have rolled on the
  * Ready nodes they run a pod on, or ROLLED_WAIT has passed; then what
@@ -20,11 +22,20 @@
  * is deleted first, and waited for, while the controller runs to let go of it, or let go of
  * here where it has not within a minute, as it does not run.
  */
-import type { KubernetesObject } from "@kubernetes/client-node";
+import { createHash } from "node:crypto";
+
+import type { KubernetesObject, V1ConfigMap, V1Container, V1DaemonSet, V1Deployment, V1PodSpec, V1Secret, V1StatefulSet } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, Schedule, Schema } from "effect";
 
 import { POLICY_PROBE_ANNOTATION, POLICY_PROBE_POD_ANNOTATION, POLICY_REVISION_ANNOTATION, type PolicyProbe, probeRefusal } from "../manifests/admission.ts";
-import { APPLIED_AFTER_ANNOTATION, APPLIED_ONCE_ROLLED_ANNOTATION, RELEASE } from "../manifests/common.ts";
+import {
+  APPLIED_AFTER_ANNOTATION,
+  APPLIED_FIRST_ANNOTATION,
+  APPLIED_ONCE_ROLLED_ANNOTATION,
+  CONFIG_READ_ANNOTATION,
+  RELEASE,
+  ROLLS_WITH_CONFIG_ANNOTATION,
+} from "../manifests/common.ts";
 import { describeRef, FIELD_MANAGER, hasStatus, type Kind, kind, type KindName, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./api.ts";
 import { awaitGone, awaitReady, awaitRolled, type NotReadyInTime, type RolloutFailed, selectorOf, type WaitOptions } from "./rollout.ts";
 
@@ -333,6 +344,57 @@ const namedElsewhere = (object: KubernetesObject, batch: readonly KubernetesObje
 const sharedAfter = (options: WaitOptions, spent: number): Effect.Effect<WaitOptions> =>
   Effect.map(Clock.currentTimeMillis, (now) => ({ ...options, since: now - spent }));
 
+/** The ConfigMaps and Secrets the pods of `spec` read, each by its name, sorted: as volumes, projected or not, and as their containers' environment. */
+export function configReadBy(spec: V1PodSpec | undefined): { readonly configMaps: readonly string[]; readonly secrets: readonly string[] } {
+  const containers: readonly V1Container[] = [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])];
+  const volumes = spec?.volumes ?? [];
+  const projected = volumes.flatMap(({ projected }) => projected?.sources ?? []);
+  const envs = containers.flatMap(({ env = [] }) => env.map(({ valueFrom }) => valueFrom));
+  const froms = containers.flatMap(({ envFrom = [] }) => envFrom);
+  const named = (names: readonly (string | undefined)[]) => [...new Set(names.filter((name): name is string => !!name))].sort();
+  return {
+    configMaps: named([
+      ...volumes.map(({ configMap }) => configMap?.name),
+      ...projected.map(({ configMap }) => configMap?.name),
+      ...envs.map((from) => from?.configMapKeyRef?.name),
+      ...froms.map(({ configMapRef }) => configMapRef?.name),
+    ]),
+    secrets: named([
+      ...volumes.map(({ secret }) => secret?.secretName),
+      ...projected.map(({ secret }) => secret?.name),
+      ...envs.map((from) => from?.secretKeyRef?.name),
+      ...froms.map(({ secretRef }) => secretRef?.name),
+    ]),
+  };
+}
+
+/**
+ * `object`, where it rolls with what it reads (ROLLS_WITH_CONFIG_ANNOTATION), its pod template
+ * given CONFIG_READ_ANNOTATION: the checksum of what each ConfigMap and Secret its pods read
+ * holds now, one not there as none, so that a change to any of them, a Secret a Job of this
+ * apply made anew among them, replaces its pods; any other as it is.
+ */
+const withConfigRead = Effect.fnUntraced(function*(object: KubernetesObject): Effect.fn.Return<KubernetesObject, KubeApiError, KubeApi> {
+  if (object.metadata?.annotations?.[ROLLS_WITH_CONFIG_ANNOTATION] !== "true") return object;
+  const kube = yield* KubeApi;
+  const workload = object as V1Deployment | V1StatefulSet | V1DaemonSet;
+  const template = workload.spec?.template;
+  const namespace = object.metadata?.namespace;
+  const { configMaps, secrets } = configReadBy(template?.spec);
+  const sorted = (data: Readonly<Record<string, string>> | undefined) => Object.entries(data ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const read = yield* Effect.forEach([...configMaps.map((name) => ["ConfigMap", name] as const), ...secrets.map((name) => ["Secret", name] as const)], ([of, name]) =>
+    Effect.map(kube.get<V1ConfigMap | V1Secret>({ ...kind(of), namespace, name }), (held) => [of, name, held === null ? null : [sorted(held.data), sorted("binaryData" in held ? held.binaryData : undefined)]]));
+  const checksum = createHash("sha256").update(JSON.stringify(read)).digest("hex").slice(0, 16);
+  const annotated: V1Deployment | V1StatefulSet | V1DaemonSet = {
+    ...workload,
+    spec: { ...workload.spec, template: { ...template, metadata: { ...template?.metadata, annotations: { ...template?.metadata?.annotations, [CONFIG_READ_ANNOTATION]: checksum } } } },
+  } as V1Deployment | V1StatefulSet | V1DaemonSet;
+  return annotated;
+});
+
+/** Whether `object` is applied before the rest of its phase (APPLIED_FIRST_ANNOTATION). */
+const appliedFirst = (object: KubernetesObject): boolean => object.metadata?.annotations?.[APPLIED_FIRST_ANNOTATION] === "true";
+
 /** The workloads of `objects`. */
 const workloadsOf = (objects: readonly KubernetesObject[]): ObjectRef[] =>
   objects.filter((object) => WORKLOADS.some((name) => name === object.kind)).map(refOf);
@@ -354,7 +416,9 @@ const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObje
   yield* Effect.logInfo(`applying ${objects.length} objects to ${kube.server}`);
   let spent = 0;
   for (const phase of PHASES) {
-    const batch = objects.filter((object) => phase.some((name) => name === object.kind));
+    const kinds = objects.filter((object) => phase.some((name) => name === object.kind));
+    // The workloads as what they read is now, the Jobs that make it run.
+    const batch = phase.includes("Deployment") ? yield* Effect.forEach(kinds, withConfigRead) : kinds;
     if (phase.includes("Job")) {
       for (const job of batch) yield* runJob(job, options);
       continue;
@@ -365,35 +429,51 @@ const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObje
       yield* policiesInForce(objects);
       yield* handOverReplicas(batch);
     }
-    // Those that wait for others of theirs (APPLIED_AFTER_ANNOTATION) once the rest are applied, each once those are ready.
-    const later = batch.filter((object) => appliedOnceReady(object, batch).length > 0);
-    // And, beside them, those held for DaemonSets to roll (APPLIED_ONCE_ROLLED_ANNOTATION), which ROLLED_WAIT bounds, and
-    // which fail nothing: neither holds the other, nor does a wait of the first that fails keep the second from being applied.
-    const rolledFirst = batch.filter((object) => !later.includes(object) && appliedOnceRolled(object, batch).length > 0);
-    yield* Effect.forEach(batch.filter((object) => !later.includes(object) && !rolledFirst.includes(object)), (object) => kube.apply(object), { concurrency: 8, discard: true });
-    const afterReady = Effect.forEach(later, (object) =>
-      Effect.gen(function*() {
-        const before = appliedOnceReady(object, batch);
-        yield* Effect.logInfo(`applying ${describeRef(refOf(object))} once ${before.map(describeRef).join(", ")} ${before.length === 1 ? "is" : "are"} ready`);
-        const began = yield* Clock.currentTimeMillis;
-        yield* awaitReady(before, yield* sharedAfter(options, spent));
-        spent += (yield* Clock.currentTimeMillis) - began;
-        yield* kube.apply(object);
-      }), { discard: true });
-    const afterRolled = Effect.forEach(rolledFirst, (object) =>
-      Effect.gen(function*() {
-        const sets = appliedOnceRolled(object, batch);
-        // Never longer than the apply's own timeout.
-        const rolledWait = Duration.min(Duration.fromInputUnsafe(ROLLED_WAIT), Duration.fromInputUnsafe(options.timeout));
-        yield* Effect.logInfo(`applying ${describeRef(refOf(object))} once ${sets.map(describeRef).join(", ")} ${sets.length === 1 ? "has" : "have"} rolled on the Ready nodes ${sets.length === 1 ? "it runs" : "they run"} a pod on, ${Duration.format(rolledWait)} at most`);
-        yield* Effect.forEach(sets, (set) => awaitRolled(set, { timeout: rolledWait, poll: options.poll }), { discard: true });
-        yield* kube.apply(object);
-      }), { discard: true });
-    const [readied, rolled] = yield* Effect.all([Effect.result(afterReady), Effect.result(afterRolled)], { concurrency: 2 });
-    // Both failed, the one failure said, the apply failing with the other.
-    if (readied._tag === "Failure" && rolled._tag === "Failure") yield* Effect.logError(`applying what was held for DaemonSets to roll failed too: ${rolled.failure.message}`);
-    if (readied._tag === "Failure") return yield* readied.failure;
-    if (rolled._tag === "Failure") return yield* rolled.failure;
+    /**
+     * Applies `part` of the phase's `batch`, as the module says, each that waits for others of the batch once they are
+     * ready, or have rolled.
+     */
+    const applyPart = Effect.fnUntraced(function*(part: readonly KubernetesObject[]): Effect.fn.Return<void, ApplyError, KubeApi> {
+      // Those that wait for others of theirs (APPLIED_AFTER_ANNOTATION) once the rest are applied, each once those are ready.
+      const later = part.filter((object) => appliedOnceReady(object, batch).length > 0);
+      // And, beside them, those held for DaemonSets to roll (APPLIED_ONCE_ROLLED_ANNOTATION), which ROLLED_WAIT bounds, and
+      // which fail nothing: neither holds the other, nor does a wait of the first that fails keep the second from being applied.
+      const rolledFirst = part.filter((object) => !later.includes(object) && appliedOnceRolled(object, batch).length > 0);
+      yield* Effect.forEach(part.filter((object) => !later.includes(object) && !rolledFirst.includes(object)), (object) => kube.apply(object), { concurrency: 8, discard: true });
+      const afterReady = Effect.forEach(later, (object) =>
+        Effect.gen(function*() {
+          const before = appliedOnceReady(object, batch);
+          yield* Effect.logInfo(`applying ${describeRef(refOf(object))} once ${before.map(describeRef).join(", ")} ${before.length === 1 ? "is" : "are"} ready`);
+          const began = yield* Clock.currentTimeMillis;
+          yield* awaitReady(before, yield* sharedAfter(options, spent));
+          spent += (yield* Clock.currentTimeMillis) - began;
+          yield* kube.apply(object);
+        }), { discard: true });
+      const afterRolled = Effect.forEach(rolledFirst, (object) =>
+        Effect.gen(function*() {
+          const sets = appliedOnceRolled(object, batch);
+          // Never longer than the apply's own timeout.
+          const rolledWait = Duration.min(Duration.fromInputUnsafe(ROLLED_WAIT), Duration.fromInputUnsafe(options.timeout));
+          yield* Effect.logInfo(`applying ${describeRef(refOf(object))} once ${sets.map(describeRef).join(", ")} ${sets.length === 1 ? "has" : "have"} rolled on the Ready nodes ${sets.length === 1 ? "it runs" : "they run"} a pod on, ${Duration.format(rolledWait)} at most`);
+          yield* Effect.forEach(sets, (set) => awaitRolled(set, { timeout: rolledWait, poll: options.poll }), { discard: true });
+          yield* kube.apply(object);
+        }), { discard: true });
+      const [readied, rolled] = yield* Effect.all([Effect.result(afterReady), Effect.result(afterRolled)], { concurrency: 2 });
+      // Both failed, the one failure said, the apply failing with the other.
+      if (readied._tag === "Failure" && rolled._tag === "Failure") yield* Effect.logError(`applying what was held for DaemonSets to roll failed too: ${rolled.failure.message}`);
+      if (readied._tag === "Failure") return yield* readied.failure;
+      if (rolled._tag === "Failure") return yield* rolled.failure;
+    });
+    // Those applied first, until ready, within the timeout the waits share; then the rest, once they are.
+    const first = batch.filter(appliedFirst);
+    if (first.length > 0) {
+      yield* applyPart(first);
+      const began = yield* Clock.currentTimeMillis;
+      yield* Effect.logInfo(`applying the rest of the workloads once ${workloadsOf(first).map(describeRef).join(", ")} ${first.length === 1 ? "is" : "are"} ready`);
+      yield* awaitReady(workloadsOf(first), yield* sharedAfter(options, spent));
+      spent += (yield* Clock.currentTimeMillis) - began;
+    }
+    yield* applyPart(batch.filter((object) => !appliedFirst(object)));
     if (phase.includes("CustomResourceDefinition")) yield* awaitReady(batch.map(refOf), options);
   }
   return spent;
