@@ -47,7 +47,7 @@ import { emit, emitSpans, type Phase, type Result, store } from "./results.ts";
 import { probeExecMs, type Probed, restore, restoreBefore, restoreOutcome, restoreSpanMetrics } from "./restore.ts";
 import { saveLogged } from "./runsc-log.ts";
 import { awaitSpans, hasSpan, liveDurableMs, releaseDurableMs } from "./spans.ts";
-import { BENCH_DIR, CASES, COMMON, IDLE_BEFORE_RELEASE_S, IDLE_BEFORE_SAVES_S, LIVE_SAVES, PAGE_CACHE, PROFILE, RELEASE_UNDER_TEST, RUNS, VARIANT } from "./settings.ts";
+import { BENCH_DIR, CASES, COMMON, IDLE_BEFORE_RELEASE_S, IDLE_BEFORE_SAVES_S, IDLE_UNTOUCHED, LIVE_SAVES, PAGE_CACHE, PROFILE, RELEASE_UNDER_TEST, RUNS, VARIANT } from "./settings.ts";
 import { storeMeasures } from "./store.ts";
 import { replayTurns } from "./turns.ts";
 
@@ -140,11 +140,15 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
       const idleS = IDLE_BEFORE_SAVES_S[saved - 1] ?? 0;
       await sleep(idleS * 1000);
       const heldBeforeSave = heldLive;
-      await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
+      // Of `idle-floor`, the session asked nothing past its first save's mark.
+      const touched = !IDLE_UNTOUCHED || saved === 1;
+      if (touched) await driver(workspace, "mark", "--session", sessionId, "--fixture", fixture);
       const liveT0 = Date.now();
       const liveSent = (await storeBytes(node)).sent;
       const checkpointed = await liveCheckpoint(node, request);
-      const gaps = await driver<{ readonly max_gap_ms: number; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
+      const gaps = IDLE_UNTOUCHED
+        ? { max_gap_ms: null, slowdown: null }
+        : await driver<{ readonly max_gap_ms: number | null; readonly slowdown: number | null }>(workspace, "gaps", "--session", sessionId, "--fixture", fixture);
       const liveSentBytes = (await storeBytes(node)).sent - liveSent;
       heldLive = await bucketBytes(node, workspace);
       const logged = saveLogged(await bootLog(node, sandboxId));
