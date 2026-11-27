@@ -16,6 +16,7 @@
     "savesWithLoadWaitSince": "20261102.0-eaucoin.10",
     "savesSummarySince": "20261102.0-eaucoin.11",
     "hooksOverSocketSince": "20261102.0-eaucoin.10",
+    "savesSyncSince": "20261102.0-eaucoin.10",
     "releases": [
       {
         "release": "20261102.0-eaucoin.10",

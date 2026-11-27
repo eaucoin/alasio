@@ -266,6 +266,8 @@ interface NodeOptions {
   readonly savesSummarySince?: string;
   /** The first release that asks bayma's hook over its socket, none unless given (NodeAgentOptions hooksOverSocketSince). */
   readonly hooksOverSocketSince?: string;
+  /** The first release that syncs the sandbox itself after its hook's save, none unless given (NodeAgentOptions savesSyncSince). */
+  readonly savesSyncSince?: string;
   readonly loadWait?: NodeAgentOptions["loadWait"];
   /** How long a resumed restore may read the bucket through its agent (NodeAgentOptions backgroundReadMs), BACKGROUND_READ_MS unless given. */
   readonly backgroundReadMs?: number;
@@ -284,7 +286,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", hooksOverSocketSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false, quietMs, preparedForMs, inspectTimeoutMs, loadingSave, savesWithLoadWaitSince = "", savesSummarySince = "", hooksOverSocketSince = "", savesSyncSince = "", loadWait, backgroundReadMs = BACKGROUND_READ_MS, pods, cache: cached = (cache) => cache, onePassSaves, restores }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -314,6 +316,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
         savesWithLoadWaitSince,
         savesSummarySince,
         hooksOverSocketSince,
+        savesSyncSince,
         ...(loadWait === undefined ? {} : { loadWait }),
         backgroundReadMs,
         ...(inspectTimeoutMs === undefined ? {} : { inspectTimeoutMs }),
@@ -1210,6 +1213,29 @@ test("a checkpoint under a release that asks bayma's hook over its socket asks i
         assert.ok(!ran.some((arg) => arg.startsWith("--save-restore-exec-socket=") || arg.startsWith("--save-restore-exec-save-timeout=")), ran.join(" "));
         yield* before.agent.resume({ ...resumeRequest(snapshot), stopReason });
         assert.deepEqual(resumed(before), [[CONTAINER], [OTHER_CONTAINER]]);
+      }
+    })
+  ));
+
+test("a checkpoint under a release that syncs the sandbox itself after its hook's save, asking the hook over its socket, has runsc sync it and tell the hook so; under one before, or one that runs the hook, runsc syncs nothing", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const checkpointed = (here: Node) => here.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint")) ?? [];
+      const syncing = yield* node("node-1", { hooksOverSocketSince: RELEASE, savesSyncSince: RELEASE });
+      yield* syncing.agent.checkpoint(request("fs-abc"));
+      const asked = checkpointed(syncing);
+      assert.ok(asked.includes(`--save-restore-exec-socket=${STATE_DIR}/sandbox-hook.sock`) && asked.includes("--save-restore-exec-sync"), asked.join(" "));
+
+      // Under a release before the first that syncs, as where none is named; and where the hook runs as a process, which runsc tells nothing.
+      for (const [name, options] of [
+        ["before", { hooksOverSocketSince: RELEASE, savesSyncSince: "20261102.0-eaucoin.99" }],
+        ["unnamed", { hooksOverSocketSince: RELEASE }],
+        ["hook-run", { savesSyncSince: RELEASE }],
+      ] as const) {
+        const here = yield* node(`node-${name}`, options);
+        yield* here.agent.checkpoint(request("fs-abc"));
+        const ran = checkpointed(here);
+        assert.ok(!ran.includes("--save-restore-exec-sync"), `${name}: ${ran.join(" ")}`);
       }
     })
   ));
