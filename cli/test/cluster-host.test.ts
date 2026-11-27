@@ -23,6 +23,7 @@ import { describeKept, keptReleases, releasesInUseOf, type SnapshotReleases, sna
 import { Machine } from "../src/cluster/machine.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
+import { stargzConfig } from "../src/cluster/stargz.ts";
 import type { Registries } from "../src/config.ts";
 import { CERTIFICATE, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
@@ -282,6 +283,12 @@ test("up applies gVisor's RuntimeClasses, deleting first alasio's of releases no
   assert.equal(await up(), null);
   const handlers = [...kube.objects].filter(([path]) => path.startsWith("/apis/node.k8s.io/v1/runtimeclasses/")).map(([, { metadata, handler }]) => [metadata.name, handler]);
   assert.deepEqual(handlers.sort(), [["gvisor", "runsc-21000101-0"], ["gvisor-20990101-0", "runsc-20990101-0"], ["gvisor-21000101-0", "runsc-21000101-0"], ["kata", "kata"]]);
+});
+
+test("up has the node's stargz-snapshotter serve the session image's files through FUSE passthrough by default", async (t) => {
+  const { machine, up } = await rig(t, { since: true });
+  assert.equal(await up(), null);
+  assert.equal(machine.read("/etc/containerd-stargz-grpc/config.toml"), stargzConfig(undefined, true));
 });
 
 test("what root's work did not do as it failed is done the next time, as alasio installed what it did", async (t) => {

@@ -8,7 +8,7 @@ import { Deferred, Effect, Fiber, Layer } from "effect";
 import { added } from "./support/metrics.ts";
 import { childrenOf, ended, endedLater, endedSpan } from "./support/spans.ts";
 import { BIND_DURATION, BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
-import { type BindingLease, claim, counts, markReleasing, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
+import { type BindingLease, claim, markReleasing, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
 import { BINDING_LABEL, boundLabels, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL } from "../src/binder/names.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { TracingLayer } from "../src/telemetry/index.ts";
@@ -128,7 +128,7 @@ test("of binders claiming a pool's free pods at once, each pod is claimed once, 
   }
 });
 
-test("a claim takes a free pod that runs, ready or not, and passes over one not yet running, one not yet started, and one being deleted", async () => {
+test("a claim takes a free pod that runs, ready or not, and passes over one not yet running, and one being deleted", async () => {
   const of = await pool();
   const kube = binder();
   await run(kube, withKube((client) =>
@@ -139,14 +139,8 @@ test("a claim takes a free pod that runs, ready or not, and passes over one not 
   await run(kube, withKube((client) => Effect.andThen(client.patch("v1", "Pod", of.namespace, ending!, { metadata: { finalizers: ["alasio.dev/test"] } }), client.remove("v1", "Pod", of.namespace, ending!))));
   assert.equal(await run(kube, claim(of, "sessionfs:workspace")), null);
   await run(kube, withKube((client) => client.patch("v1", "Pod", of.namespace, ending!, { metadata: { finalizers: null } })));
-  // Running, its container not yet started, as one whose startup probe waits for its warm-up: passed over, and not counted free.
-  const container = (started: boolean) => ({ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, started, state: { running: {} } });
-  await run(kube, withKube((client) => client.patchPodStatus(of.namespace, "starting", { status: { phase: "Running", conditions: [{ type: "Ready", status: "False" }], containerStatuses: [container(false)] } })));
-  assert.equal(await run(kube, claim(of, "sessionfs:workspace")), null);
-  assert.equal((await run(kube, counts(of))).free, 0);
   // Running, its containers started, not ready, as a pool's pod waits for its workspace: claimed.
-  await run(kube, withKube((client) => client.patchPodStatus(of.namespace, "starting", { status: { phase: "Running", conditions: [{ type: "Ready", status: "False" }], containerStatuses: [container(true)] } })));
-  assert.equal((await run(kube, counts(of))).free, 1);
+  await run(kube, withKube((client) => client.patchPodStatus(of.namespace, "starting", { status: { phase: "Running", conditions: [{ type: "Ready", status: "False" }] } })));
   assert.equal((await run(kube, claim(of, "sessionfs:workspace")))?.metadata?.name, "starting");
 });
 

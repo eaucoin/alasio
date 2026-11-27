@@ -91,11 +91,12 @@ const HostTarget = Schema.Struct({
   registries: Schema.optionalKey(Registries),
   /**
    * Whether the nodes' stargz-snapshotter serves the session image's files through FUSE passthrough,
-   * so the kernel reads them from the daemon's merged files with no round trip through it, a pool's
-   * pod opening the binaries a restore reads as it starts (sandbox/agent/start.sh); off unless said.
-   * It applies to the layers a node mounts after the daemon starts with it.
+   * so the kernel reads them from the daemon's merged files with no round trip through it; on unless
+   * set off. A kernel before Linux 6.9 has none: the daemon merges each file as it is first opened all
+   * the same, then serves its reads itself, so it is set off there. It applies to the layers a node
+   * mounts after the daemon starts with it.
    */
-  imagePassthrough: defaulted(Schema.Boolean, false),
+  imagePassthrough: defaulted(Schema.Boolean, true),
 });
 
 /** The cluster alasio makes on this machine in Docker, its DockerClusterOptions. */
@@ -112,11 +113,12 @@ const DockerTarget = Schema.Struct({
   registries: Schema.optionalKey(Registries),
   /**
    * Whether the nodes' stargz-snapshotter serves the session image's files through FUSE passthrough,
-   * so the kernel reads them from the daemon's merged files with no round trip through it, a pool's
-   * pod opening the binaries a restore reads as it starts (sandbox/agent/start.sh); off unless said.
-   * It applies to the layers a node mounts after the daemon starts with it.
+   * so the kernel reads them from the daemon's merged files with no round trip through it; on unless
+   * set off. A kernel before Linux 6.9 has none: the daemon merges each file as it is first opened all
+   * the same, then serves its reads itself, so it is set off there. It applies to the layers a node
+   * mounts after the daemon starts with it.
    */
-  imagePassthrough: defaulted(Schema.Boolean, false),
+  imagePassthrough: defaulted(Schema.Boolean, true),
 });
 
 /** A cluster a kubeconfig reaches: the default kubeconfig and its current context unless they are given. */
@@ -159,9 +161,6 @@ export type TargetKind = "host" | "docker" | "kubeconfig";
 /** The kind of `target`. */
 export const targetKind = (target: Target): TargetKind => ("host" in target ? "host" : "docker" in target ? "docker" : "kubeconfig");
 
-/** Whether the nodes of the cluster `target` makes serve the session image through FUSE passthrough; one a kubeconfig reaches is not made so. */
-export const imagePassthroughOf = (target: Target): boolean => ("host" in target ? target.host.imagePassthrough : "docker" in target ? target.docker.imagePassthrough : false);
-
 /**
  * How Telegram reaches the webhook intake on a cluster of `kind`: on this machine's
  * address, from k3s on it; on the node's, from the cluster in Docker, whose port the
@@ -192,23 +191,20 @@ export class NotInitialized extends Schema.TaggedError<NotInitialized>()("NotIni
  * The install configuration of `install`, with the Secrets alasio names: the bot's,
  * and Claude Code's when `claude`, as alasio finds Claude Code's login in its home when
  * there is none; and with how the webhook intake is reached, as the cluster's `target`
- * makes it, and whether its nodes serve the session image through FUSE passthrough, as the
- * target's `imagePassthrough` says. On a cluster alasio may share with others (one a kubeconfig
- * reaches), its pods take no other's place unless autoscaling.preemption says.
+ * makes it. On a cluster alasio may share with others (one a kubeconfig reaches), its
+ * pods take no other's place unless autoscaling.preemption says.
  */
 export function installConfigOf(
   install: Readonly<Record<string, unknown>>,
-  { claude, target, imagePassthrough = false }: { readonly claude: boolean; readonly target: TargetKind; readonly imagePassthrough?: boolean },
+  { claude, target }: { readonly claude: boolean; readonly target: TargetKind },
 ): Result.Result<InstallConfig, string> {
   const alasio = Predicate.isObject(install["alasio"]) ? install["alasio"] : {};
   const own = ["telegram", "claude"].find((key) => Predicate.hasProperty(alasio, key));
   if (own) return Result.fail(`install.alasio.${own} is alasio's own to say: its Secret is the one alasio init writes`);
   if (Predicate.hasProperty(install["webhook"], "exposure")) return Result.fail("install.webhook.exposure is alasio's own to say: the target makes it");
-  if (Predicate.hasProperty(install["sessions"], "imagePassthrough")) return Result.fail("install.sessions.imagePassthrough is alasio's own to say: the target's imagePassthrough makes it");
   // Given as anything but a map, each is refused as it is.
   const autoscaling = install["autoscaling"] ?? {};
   const webhook = install["webhook"] ?? {};
-  const sessions = install["sessions"] ?? {};
   const mapped = (value: unknown, defaults: Record<string, unknown>) => (Predicate.isObject(value) && !Array.isArray(value) ? { ...defaults, ...value } : value);
   return Result.mapBoth(
     decodeInstallConfig({
@@ -216,7 +212,6 @@ export function installConfigOf(
       alasio: { ...alasio, telegram: { existingSecret: TELEGRAM_SECRET }, claude: { existingSecret: claude ? CLAUDE_SECRET : "" } },
       autoscaling: mapped(autoscaling, { preemption: target !== "kubeconfig" }),
       webhook: mapped(webhook, { exposure: EXPOSURES[target] }),
-      sessions: mapped(sessions, { imagePassthrough }),
     }),
     { onFailure: (error) => `install.${error.message}`, onSuccess: (config) => config },
   );
@@ -237,7 +232,7 @@ export function decodeOperatorConfig(path: string, input: unknown): Result.Resul
     return Result.fail(new OperatorConfigError({ path, reason: describeIssue((Result.isFailure(precise) ? precise : decoded).failure.issue) }));
   }
   const { target, install } = decoded.success;
-  const checked = installConfigOf(install, { claude: true, target: targetKind(target), imagePassthrough: imagePassthroughOf(target) });
+  const checked = installConfigOf(install, { claude: true, target: targetKind(target) });
   if (Result.isFailure(checked)) return Result.fail(new OperatorConfigError({ path, reason: checked.failure }));
   return Result.succeed({ path, file: input as OperatorConfigFile, target, install });
 }

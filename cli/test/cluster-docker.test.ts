@@ -143,7 +143,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
       "--pause-image=docker.io/rancher/mirrored-pause:3.10.2",
     ],
     // kine's compaction given 2 minutes, which k3s v1.37's ends k3s past (cli/src/cluster/k3s.ts's K3S_SERVER_ENV).
-    Env: ["KINE_COMPACT_TIMEOUT=2m", `ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"],
+    Env: ["KINE_COMPACT_TIMEOUT=2m", `ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, true)}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"],
     ExposedPorts: { "6443/tcp": {} },
     HostConfig: {
       Privileged: true,
@@ -289,7 +289,7 @@ test("agents join the server with the token it made, at the addresses after it, 
     NetworkingConfig: unknown;
   };
   assert.equal(agent.Cmd[0], "agent");
-  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`, `ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"]);
+  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`, `ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, true)}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"]);
   assert.equal(agent.Labels["alasio.role"], "agent");
   assert.equal(agent.ExposedPorts, undefined);
   assert.equal(agent.HostConfig.PortBindings, undefined);
@@ -429,11 +429,11 @@ test("status is Docker's version and the cluster's nodes, the server first, and 
   });
 });
 
-test("every node's stargz-snapshotter serves the session image's files through FUSE passthrough where the cluster is told to", async (t) => {
+test("no node's stargz-snapshotter serves the session image's files through FUSE passthrough where the cluster is told not to", async (t) => {
   const { fake, kubeconfig, run } = await rig(t);
-  await run((cluster) => cluster.up(kubeconfig), { agents: 1, imagePassthrough: true });
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, imagePassthrough: false });
   const stargz = fake.requests.filter(({ path }) => path === "/containers/create").map(({ body }) => (body as { Env: string[] }).Env.find((variable) => variable.startsWith("ALASIO_STARGZ_CONFIG=")));
-  assert.deepEqual(stargz, [`ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, true)}`, `ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, true)}`]);
+  assert.deepEqual(stargz, [`ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, false)}`, `ALASIO_STARGZ_CONFIG=${stargzConfig(undefined, false)}`]);
 });
 
 test("every node is made with the registries, as k3s's registries.yaml, and made anew when they change", async (t) => {
@@ -448,7 +448,7 @@ test("every node is made with the registries, as k3s's registries.yaml, and made
   ]);
   // stargz-snapshotter's daemon reads layers through the mirror too.
   const created = fake.requests.find(({ path }) => path === "/containers/create")?.body as { Env: string[] };
-  assert.ok(created.Env.includes(`ALASIO_STARGZ_CONFIG=${stargzConfig(registries)}`));
+  assert.ok(created.Env.includes(`ALASIO_STARGZ_CONFIG=${stargzConfig(registries, true)}`));
 
   const changes = fake.changes().length;
   await run((cluster) => cluster.up(kubeconfig), { agents: 1, registries: { ...registries, configs: { "registry.example:5000": { tls: { insecureSkipVerify: true } } } } });

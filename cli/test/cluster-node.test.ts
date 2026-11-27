@@ -41,7 +41,7 @@ function rig(t: TestContext) {
 }
 
 test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds and its config file, a runaway process killed alone, no snapshotter of its own, its sandbox image pinned; registries only when given; each gVisor release a runtime, where systemd runs the machine; stargz-snapshotter's daemon's; k3s's datastore's compaction given 2 minutes", async () => {
-  const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] });
+  const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"], imagePassthrough: true });
   assert.deepEqual([...files.keys()], [
     "/etc/rancher/k3s/config.yaml",
     "/etc/rancher/k3s/kubelet.yaml",
@@ -87,7 +87,7 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
   ]);
   const runtimes = containerdFiles(["20990101.0"], { systemd: true });
   for (const [path, content] of runtimes) assert.equal(files.get(path), content);
-  assert.equal(files.get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig());
+  assert.equal(files.get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig(undefined, true));
   // The daemon, which k3s's service wants started before it, stops and restarts with k3s, its FUSE manager keeping its mounts.
   const unit = files.get("/etc/systemd/system/stargz-snapshotter.service") ?? "";
   assert.match(unit, /^PartOf=k3s\.service$/mu);
@@ -158,7 +158,7 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
   // kine's compaction given 2 minutes, which k3s v1.37's ends k3s past (./k3s.ts's K3S_SERVER_ENV).
   assert.match(files.get("/etc/systemd/system/k3s.service.d/alasio-env.conf") ?? "", /^\[Service\]\nEnvironment=KINE_COMPACT_TIMEOUT=2m\n$/mu);
   const registries = { mirrors: { "docker.io": { endpoint: ["https://mirror.lan"] } }, configs: {} };
-  assert.equal(nodeFiles({ role: "server", storagePath: "/srv", registries, gvisor: [] }).get("/etc/rancher/k3s/registries.yaml"), `{"mirrors":{"docker.io":{"endpoint":["https://mirror.lan"]}},"configs":{}}\n`);
+  assert.equal(nodeFiles({ role: "server", storagePath: "/srv", registries, gvisor: [], imagePassthrough: true }).get("/etc/rancher/k3s/registries.yaml"), `{"mirrors":{"docker.io":{"endpoint":["https://mirror.lan"]}},"configs":{}}\n`);
 });
 
 test("configuring the node removes runsc's options for releases it no longer runs, and leaves containerd's own configuration", async (t) => {
@@ -166,7 +166,7 @@ test("configuring the node removes runsc's options for releases it no longer run
   machine.write(`${CONTAINERD}/config.toml`, "# containerd's, which k3s writes from the template\n");
   machine.write(`${CONTAINERD}/runsc.toml`, "[runsc_config]\n");
   machine.write(`${CONTAINERD}/runsc-20980101-0.toml`, "[runsc_config]\n");
-  assert.equal(await perform(ConfigureNode.make({ config: { role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] } })), null);
+  assert.equal(await perform(ConfigureNode.make({ config: { role: "server", storagePath: STORAGE, gvisor: ["20990101.0"], imagePassthrough: true } })), null);
   assert.deepEqual(["config.toml", "config-v3.toml.tmpl", "runsc.toml", "runsc-20980101-0.toml", "runsc-20990101-0.toml"].filter((name) => machine.has(`${CONTAINERD}/${name}`)), [
     "config.toml",
     "config-v3.toml.tmpl",
@@ -175,7 +175,7 @@ test("configuring the node removes runsc's options for releases it no longer run
 });
 
 test("stargz-snapshotter's daemon fetches one layer at a time in the background, in chunks of 1 MiB, asks a registry for one range at a time, keeps its mounts with its FUSE manager, and reads layers through the mirrors it can reach as they are", () => {
-  const plain = stargzConfig();
+  const plain = stargzConfig(undefined, false);
   assert.match(plain, /^max_concurrency = 1\n\n\[blob\]\nforce_single_range_mode = true\nchunk_size = 1048576\n\n\[fuse_manager\]\nenable = true\n/mu);
   assert.doesNotMatch(plain, /resolver/u);
   const mirrored = stargzConfig({
@@ -184,7 +184,7 @@ test("stargz-snapshotter's daemon fetches one layer at a time in the background,
       "ghcr.io": { endpoint: ["https://ghcr.mirror.lan"], rewrite: { "^eaucoin/(.*)": "mirror/$1" } },
       "*": { endpoint: ["https://any.lan"] },
     },
-  });
+  }, false);
   assert.equal(mirrored.slice(plain.length), [
     "",
     '[[resolver.host."docker.io".mirrors]]',
@@ -197,13 +197,11 @@ test("stargz-snapshotter's daemon fetches one layer at a time in the background,
   ].join("\n"));
 });
 
-test("stargz-snapshotter's daemon serves the session image's files through FUSE passthrough, its merge bounded, only where the node is told to, as it is not by default", () => {
-  assert.doesNotMatch(stargzConfig(), /passthrough/u);
+test("stargz-snapshotter's daemon serves the session image's files through FUSE passthrough, its merge bounded, but on a node told not to", () => {
   assert.match(stargzConfig(undefined, true), /\n\[fuse\]\npassthrough = true\nmerge_buffer_size = 33554432\n/u);
-  // A node told to writes it so, and one not told writes the file as before.
-  const told = nodeFiles({ role: "server", storagePath: "/var/lib/alasio", gvisor: ["20990101.0"], imagePassthrough: true });
-  assert.equal(told.get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig(undefined, true));
-  assert.equal(nodeFiles({ role: "server", storagePath: "/var/lib/alasio", gvisor: ["20990101.0"] }).get("/etc/containerd-stargz-grpc/config.toml"), stargzConfig());
+  assert.doesNotMatch(stargzConfig(undefined, false), /passthrough/u);
+  const configured = (imagePassthrough: boolean) => nodeFiles({ role: "server", storagePath: "/var/lib/alasio", gvisor: ["20990101.0"], imagePassthrough }).get("/etc/containerd-stargz-grpc/config.toml");
+  assert.deepEqual([configured(true), configured(false)], [stargzConfig(undefined, true), stargzConfig(undefined, false)]);
 });
 
 /** The archive of gVisor's `release`, downloaded into `directory`, as the operator's command leaves it for root. */

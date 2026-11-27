@@ -41,7 +41,7 @@ import { sessionKey, volumeIdOfKey } from "../../src/sandbox/names.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { poolLoginKey } from "../../src/harness/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
-import { imagePassthroughOf, installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
+import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { recordedBaseline } from "./cpu-baseline.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
 import { gatewayCalls } from "./gateway-calls.ts";
@@ -250,7 +250,7 @@ function merged(base: Readonly<Record<string, unknown>>, overrides: Readonly<Rec
 export const branchConfig = Effect.fnUntraced(function*(config: OperatorConfig, overrides: Readonly<Record<string, unknown>>): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
   const install = merged(config.install, merged(overrides, { host: { enabled: false } }));
-  const decoded = installConfigOf(install, { claude, target: targetKind(config.target), imagePassthrough: imagePassthroughOf(config.target) });
+  const decoded = installConfigOf(install, { claude, target: targetKind(config.target) });
   if (Result.isFailure(decoded)) return yield* new OperatorConfigError({ path: config.path, reason: `with the branch's overrides, ${decoded.failure}` });
   return decoded.success;
 });

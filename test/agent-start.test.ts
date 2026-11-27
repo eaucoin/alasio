@@ -4,12 +4,12 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { SANDBOX_STOP_REASON_VARIABLE, WARMED_FILE } from "../src/kube/sandbox-shape.ts";
+import { SANDBOX_STOP_REASON_VARIABLE } from "../src/kube/sandbox-shape.ts";
 import { SAVE_HOOK_SECONDS } from "../src/node-agent/names.ts";
 
 const START = new URL("../sandbox/agent/start.sh", import.meta.url).pathname;
@@ -106,47 +106,31 @@ test("bayma's hook is killed past its bound as it readies the sandbox for a save
   }
 });
 
-test("bayma's server, as a pool's pod starts where the image is served through passthrough, opens the binaries a restore reads before it waits for its binding, then writes the file its startup probe waits for; elsewhere, and a hook, none", async () => {
-  // bayma's hook, which takes a second.
-  const { root, env: podEnv } = pod("sleep 1");
+test("bayma's server, as a pool's pod starts, opens none of the image's binaries before its binding is given, wherever its nodes serve the image", async (t) => {
+  const { root, env: podEnv } = pod("exit 0");
   try {
     const attach = join(root, "attach");
-    // A binary that says when it is opened: a FIFO, whose writer's open waits for its reader's.
-    const binary = join(root, "bun");
-    assert.equal(spawnSync("mkfifo", [binary]).status, 0);
-    /** Whether `binary` is opened for reading within `ms`, by a writer's open of it ending. */
-    const opened = (ms: number) =>
-      new Promise<boolean>((resolve) => {
-        const writer = spawn("sh", ["-c", `printf x > '${binary}'`]);
-        const timer = setTimeout(() => (writer.kill(), resolve(false)), ms);
-        writer.once("exit", (code) => (clearTimeout(timer), resolve(code === 0)));
-      });
-    const warmed = join(root, "warmed");
-    const env = { ...podEnv, ALASIO_WARM_FILES: binary, ALASIO_WARMED: warmed };
-    /** bayma's server under `variables`, its binding not yet given: whether it opens the binary within `ms` as it waits for it. */
-    const serve = async (variables: Record<string, string>, ms: number) => {
-      rmSync(join(attach, "token"), { force: true });
-      rmSync(join(attach, "served"), { force: true });
-      const server = spawn("sh", [START, "true", "mcp-http"], { env: variables });
-      const ended = new Promise<number | null>((resolve) => server.once("exit", resolve));
-      const did = await opened(ms);
-      writeFileSync(join(attach, "token"), "binding");
-      assert.equal(await ended, 0);
-      return did;
-    };
-    // Where the image is not served through passthrough, it opens none, and says nothing warmed.
-    assert.equal(await serve(env, 500), false);
-    assert.equal(existsSync(warmed), false);
-    // Where it is, it opens the binary, then says so.
-    assert.equal(await serve({ ...env, ALASIO_WARM: "1" }, 5_000), true);
-    assert.equal(existsSync(warmed), true);
-    // The file it writes but for tests, the one its startup probe waits for.
-    assert.equal(/ALASIO_WARMED:-([^}]+)\}/u.exec(readFileSync(START, "utf8"))?.[1], WARMED_FILE);
-    // A hook opens none.
-    const hook = spawn("sh", [START, "node", "/opt/bayma/bayma.js", "sandbox-hook"], { env: { ...env, ALASIO_WARM: "1" } });
-    const hookEnded = new Promise<number | null>((resolve) => hook.once("exit", resolve));
-    assert.equal(await opened(500), false);
-    assert.equal(await hookEnded, 0);
+    // bayma's node, first on its PATH, which says whether it was read by its access time: set long before it was written,
+    // which a read moves on where the files' mount keeps access times at all.
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const node = join(bin, "node");
+    writeFileSync(node, "#!/bin/sh\n", { mode: 0o755 });
+    const unread = () => utimesSync(node, new Date("2000-01-01T00:00:00Z"), new Date());
+    const read = () => statSync(node).atimeMs > Date.parse("2001-01-01T00:00:00Z");
+    unread();
+    readFileSync(node);
+    if (!read()) return void t.skip(`${root} keeps no access times`);
+    unread();
+    rmSync(join(attach, "token"));
+    // As a pool's pod was told to open them where its nodes served the image through passthrough.
+    const server = spawn("sh", [START, "true", "mcp-http"], { env: { ...podEnv, PATH: `${bin}:${podEnv["PATH"]}`, ALASIO_WARM: "1" } });
+    const ended = new Promise<number | null>((resolve) => server.once("exit", resolve));
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const early = read();
+    writeFileSync(join(attach, "token"), "binding");
+    assert.equal(await ended, 0);
+    assert.equal(early, false, "bayma's node was read before the pod's binding was given");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

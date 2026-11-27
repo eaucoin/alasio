@@ -35,7 +35,7 @@ function directory(t: TestContext): string {
 test("a docker target is defaulted, and keeps the port and storage it was given", () => {
   const decoded = decodeOperatorConfig(PATH, { target: { docker: { apiPort: 41873 } } });
   assert.ok(Result.isSuccess(decoded));
-  assert.deepEqual(decoded.success.target, { docker: { name: "alasio", apiPort: 41873, hostAliases: [], mounts: [], agents: 0, imagePassthrough: false } });
+  assert.deepEqual(decoded.success.target, { docker: { name: "alasio", apiPort: 41873, hostAliases: [], mounts: [], agents: 0, imagePassthrough: true } });
   assert.deepEqual(decoded.success.install, {});
 });
 
@@ -144,7 +144,7 @@ test("the cluster in Docker runs the node image the config names, such as one bu
   assert.equal(target.cluster.image, "alasio-node:dev");
 });
 
-test("the cluster's nodes serve the session image's files through FUSE passthrough only where the config says so, on either target", async () => {
+test("the cluster's nodes serve the session image's files through FUSE passthrough unless the config sets it off, on either target", async () => {
   /** What `target` resolves to of passthrough. */
   const passthroughOf = async (target: Record<string, unknown>) => {
     const decoded = decodeOperatorConfig(PATH, { target });
@@ -155,21 +155,12 @@ test("the cluster's nodes serve the session image's files through FUSE passthrou
   };
   assert.deepEqual(
     [await passthroughOf({ host: {} }), await passthroughOf({ host: { imagePassthrough: false } }), await passthroughOf({ host: { imagePassthrough: true } })],
-    [false, false, true],
+    [true, false, true],
   );
-  assert.deepEqual([await passthroughOf({ docker: { apiPort: 41873 } }), await passthroughOf({ docker: { apiPort: 41873, imagePassthrough: true } })], [false, true]);
+  assert.deepEqual([await passthroughOf({ docker: { apiPort: 41873 } }), await passthroughOf({ docker: { apiPort: 41873, imagePassthrough: false } })], [true, false]);
   assert.equal(refusal({ target: { host: { imagePassthrough: "yes" } } }), `${PATH}: target.host.imagePassthrough Expected boolean`);
-  // The installation's sessions know it from the target alone.
-  const sessionsOf = (imagePassthrough?: boolean) => {
-    const install = installConfigOf({}, { claude: false, target: "host", ...(imagePassthrough === undefined ? {} : { imagePassthrough }) });
-    assert.ok(Result.isSuccess(install));
-    return install.success.sessions.imagePassthrough;
-  };
-  assert.deepEqual([sessionsOf(), sessionsOf(false), sessionsOf(true)], [false, false, true]);
-  assert.equal(
-    refusal({ target: { host: {} }, install: { sessions: { imagePassthrough: true } } }),
-    `${PATH}: install.sessions.imagePassthrough is alasio's own to say: the target's imagePassthrough makes it`,
-  );
+  // The installation's sessions know nothing of it: their pods do the same wherever the image is served.
+  assert.equal(refusal({ target: { host: {} }, install: { sessions: { imagePassthrough: true } } }), `${PATH}: install.sessions.imagePassthrough Expected no excess property`);
 });
 
 test("the cluster in Docker's registries are k3s's registries.yaml, without a login, which is a secret", async () => {

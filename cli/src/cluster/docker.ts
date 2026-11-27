@@ -85,7 +85,7 @@ export interface DockerClusterOptions {
   readonly agents?: number;
   /** The registries the nodes pull from; containerd's defaults unless given. */
   readonly registries?: Registries;
-  /** Whether their stargz-snapshotter serves the session image's files through FUSE passthrough (./stargz.ts); not unless given. */
+  /** Whether their stargz-snapshotter serves the session image's files through FUSE passthrough (./stargz.ts); it does unless told not to. */
   readonly imagePassthrough?: boolean;
   /** How long each wait for the cluster may take, and how often it looks. */
   readonly readyTimeout?: Duration.Input;
@@ -291,7 +291,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
   mounts = [],
   agents = 0,
   registries,
-  imagePassthrough = false,
+  imagePassthrough = true,
   readyTimeout = WAITS.readyTimeout,
   poll = WAITS.poll,
 }: DockerClusterOptions): Effect.fn.Return<DockerCluster["Service"], never, DockerEngine | FileSystem.FileSystem> {

@@ -58,7 +58,7 @@ import {
   SESSIONS_NAMESPACE_VARIABLE,
   templateHash,
 } from "../../../src/gateway/names.ts";
-import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, NET_MODE_LABEL, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG, WARMED_FILE } from "../../../src/kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, NET_MODE_LABEL, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
 import { NODE_PINS } from "../cluster/node.ts";
@@ -169,13 +169,6 @@ export function recordedCpuBaseline(liveGateway: string | undefined): CpuBaselin
 export const poolsSnapshotted = (cpuBaseline: CpuBaseline): cpuBaseline is readonly string[] => cpuBaseline !== null;
 
 /**
- * How many seconds a pool's pod has to open the binaries a restore reads (its startup probe's
- * failures, a second apart), past which kubelet starts it again, and the binder has it made anew:
- * room for a fresh node's first pull of them through the image's layers.
- */
-const STARTUP_PROBE_FAILURES = 300;
-
-/**
  * The template of a pool's pods, as the module says: a session's, under its internet `mode`.
  * Where its sessions are snapshotted (poolsSnapshotted), as main's are by the gateway, it holds
  * them to the nodes' CPU baseline `cpuBaseline`, its bayma holds a stop it is not given for the
@@ -261,13 +254,9 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
           { name: "HOME", value: "/home/agent" },
           { name: "USER", value: "agent" },
           { name: "BAYMA_PAYLOAD_DIR", value: "/opt/bayma/payload" },
-          // Where the nodes serve its image through passthrough, it opens the binaries a restore reads as it starts.
-          ...(sessions.imagePassthrough ? [{ name: "ALASIO_WARM", value: "1" }] : []),
         ],
         ports: [{ name: "mcp", containerPort: POOL_POD_PORT }],
         readinessProbe: { tcpSocket: { port: "mcp" }, periodSeconds: 2 },
-        // Where it opens the binaries a restore reads as it starts, started only once it has, as no bind claims a pod before.
-        ...(sessions.imagePassthrough ? { startupProbe: { exec: { command: ["test", "-e", WARMED_FILE] }, periodSeconds: 1, failureThreshold: STARTUP_PROBE_FAILURES } } : {}),
         securityContext: restrictedContainer(),
         resources: sessions.resources,
         volumeMounts: [

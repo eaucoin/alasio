@@ -92,10 +92,11 @@ const MERGE_BUFFER_BYTES = 32 * 1024 * 1024;
  * With `passthrough`, a file opened through a mount is merged once into a backing file of the
  * daemon's, which the kernel then reads itself (FUSE passthrough, Linux 6.9 on): no round trip
  * through the daemon for each read, and one copy of the file in the page cache, not two; its first
- * open pays the merge, which a pool's pod pays for the binaries a restore reads as it starts
- * (sandbox/agent/start.sh). The setting is the daemon's as it mounts a layer.
+ * open on the node pays the merge, which a bind pays only for bayma's own executable, as bayma
+ * looks at a runtime's files only as a session of it first needs them. The setting is the
+ * daemon's as it mounts a layer: a layer mounted before keeps how it was mounted.
  */
-export function stargzConfig(registries?: Registries, passthrough = false): string {
+export function stargzConfig(registries: Registries | undefined, passthrough: boolean): string {
   const mirrors = Object.entries(registries?.mirrors ?? {})
     // `*` stands for every registry, which the daemon has no way to say.
     .filter(([host, { rewrite }]) => host !== "*" && rewrite === undefined)

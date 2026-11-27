@@ -13,22 +13,6 @@
 set -eu
 attach="${ALASIO_ATTACH:-/attach}"
 workspace="${ALASIO_WORKSPACE:-/workspace}"
-# The binaries a restore of this pod's sandbox reads first, bayma's node and the runtimes' (or
-# ALASIO_WARM_FILES's, for tests), opened as bayma's server starts in a pool's pod, before it waits
-# for its binding, where ALASIO_WARM is 1, as the pool's pods are run where the nodes serve the
-# image through FUSE passthrough (cli/src/cluster/stargz.ts): a file's first open there merges it
-# into its backing file, which is paid here, not under a session's bind or restore. Then the file
-# its startup probe waits for (ALASIO_WARMED, src/kube/sandbox-shape.ts WARMED_FILE but for tests),
-# so that no bind claims the pod before. Elsewhere none is opened, as each file and directory opened
-# is the sandbox's to ready for every save after, which lengthens a live save's pause.
-case "${ALASIO_WARM:-} $* " in
-"1 "*" mcp-http "*)
-  for file in ${ALASIO_WARM_FILES:-$(command -v node) $(find /opt/bayma/payload -maxdepth 4 -type f -perm -u+x \( -name bun -o -name 'python3.[0-9]*' \) 2>/dev/null)}; do
-    head -c 1 "$file" >/dev/null 2>&1 || true
-  done
-  : > "${ALASIO_WARMED:-/tmp/alasio-warmed}"
-  ;;
-esac
 until [ -s "$attach/token" ]; do sleep 0.1; done
 # bayma's hook is the one bayma's image carries without Node (bayma-sandbox-hook), given what
 # follows `sandbox-hook`: a Node process's start, in a sandbox just restored, is most of the

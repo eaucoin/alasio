@@ -148,8 +148,8 @@ export const NodeConfig = Schema.Struct({
   storagePath: Schema.String,
   registries: Schema.optionalKey(Registries),
   gvisor: Schema.Array(Schema.String),
-  /** Whether its stargz-snapshotter serves the session image's files through FUSE passthrough (./stargz.ts); not unless given. */
-  imagePassthrough: Schema.optionalKey(Schema.Boolean),
+  /** Whether its stargz-snapshotter serves the session image's files through FUSE passthrough (./stargz.ts). */
+  imagePassthrough: Schema.Boolean,
 });
 export type NodeConfig = typeof NodeConfig.Type;
 
@@ -177,7 +177,7 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
     [KUBELET_CONFIG_PATH, KUBELET_CONFIG],
     ...(config.registries ? [[REGISTRIES_YAML, `${registriesYaml(config.registries)}\n`] as const] : []),
     ...containerdFiles(config.gvisor, { systemd: true }),
-    [STARGZ_CONFIG, stargzConfig(config.registries, config.imagePassthrough ?? false)],
+    [STARGZ_CONFIG, stargzConfig(config.registries, config.imagePassthrough)],
     [STARGZ_UNIT, [
       "# stargz-snapshotter's daemon, the snapshotter of k3s's containerd: alasio up writes this file.",
       "[Unit]",
