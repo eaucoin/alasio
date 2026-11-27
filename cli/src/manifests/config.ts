@@ -514,8 +514,8 @@ const Harness = Schema.Struct({
 /** The bayma the host profile's folder instances run, as this release pins it. */
 export const HOST_BAYMA_IMAGE = {
   repository: "ghcr.io/eaucoin/bayma",
-  tag: "0.15.8",
-  digest: "sha256:ff900c8847117265c76135761a5f06fd366a1b1cb68161b99c8109af7c608aac",
+  tag: "0.15.9",
+  digest: "sha256:95f7cc763cd3995475dddbb5c30e6787cfc0f4a447b11505abb41735704bf481",
 } as const;
 
 const Host = Schema.Struct({
