@@ -38,7 +38,7 @@ import { gvisorDirectory, RUNSC_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { dumpClusterState, kube, nodeAgents, onNode, SESSIONS, setUp, tearDown } from "../../test/e2e/harness.ts";
 import {
-  agentApi, agentOk, checkpointRequest, coldCaches, driver, endUnsaved, errorText, forgetWorkspace, gone, liveCheckpoint, loggedOf, msBetween, newSession, now, release, sleep,
+  agentApi, agentOk, checkpointRequest, coldCaches, driver, endReleased, endUnsaved, errorText, forgetWorkspace, gone, liveCheckpoint, loggedOf, msBetween, newSession, now, release, sleep,
   standbyArm, standbyFor,
 } from "./alasio.ts";
 import { mixedLoad } from "./mixed.ts";
@@ -213,7 +213,8 @@ async function runOnce(fixture: string, sizeMib: number, run: number, runId: str
       fixture, sizeMib, run, phase: "restore-warm", ...restoreOutcome(warm, "cache"), metrics: warm.metrics, correctness: warm.probed.correctness,
       details: { ...warm.details, standby_before: warmStandby, compaction_sent_bytes: compactionSent, mixed: warmBeside === null ? null : await warmBeside() },
     }, warm.window.fromMs, warm.window.toMs);
-    await endUnsaved(workspace, warm.pod);
+    // Spike: the warm pod ended by a release, so bayma's restore span is exported as its save ends it.
+    await endReleased(workspace, warm.pod);
 
     phase = "restore-cold";
     await agentOk(node, "DELETE", `/workspaces/${SESSIONS}/${workspace}`);

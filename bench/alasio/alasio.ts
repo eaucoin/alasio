@@ -297,6 +297,18 @@ export async function standbyFor(node: string, arm: "standby" | "none"): Promise
 }
 
 /**
+ * Spike: ends the restored pod `name` of `workspace` with the gateway's release, its save ending the
+ * sandbox, so that bayma exports what its telemetry holds (its restore's span among it) as it ends;
+ * then, as endUnsaved does, waits until the pod is gone and the gateway has let its binding go.
+ */
+export async function endReleased(workspace: string, name: string): Promise<void> {
+  const released = await release(workspace);
+  if (released.status < 200 || released.status >= 300) throw new Error(`the gateway's release answered ${released.status}: ${released.said}`);
+  await gone(name);
+  await bindingLetGo(workspace);
+}
+
+/**
  * Ends the restored pod `name` of `workspace` without a save, as a crash ends it, and waits until it
  * is gone, and the gateway has let its binding go: its Lease gone, as the gateway records what a
  * binding whose pod went is released into while its Lease holds (src/gateway/sessions.ts
@@ -305,6 +317,11 @@ export async function standbyFor(node: string, arm: "standby" | "none"): Promise
 export async function endUnsaved(workspace: string, name: string): Promise<void> {
   await kube.kill(SESSIONS, name);
   await gone(name);
+  await bindingLetGo(workspace);
+}
+
+/** Waits until the gateway has let the binding of `workspace` go: its Lease gone. */
+async function bindingLetGo(workspace: string): Promise<void> {
   const lease = ref("Lease", leaseName(sessionKey(workspace)), SESSIONS);
   for (const deadline = Date.now() + 300_000; ; await sleep(1000)) {
     if ((await kube.get(lease)) === null) return;
