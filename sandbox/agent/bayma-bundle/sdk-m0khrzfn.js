@@ -6,7 +6,7 @@ import {
   require_src,
   require_src2,
   readTokenFile
-} from "./main-eqz69xvs.js";
+} from "./main-qc1nvyfk.js";
 
 // node_modules/.bun/@opentelemetry+context-async-hooks@2.11.0+e40b0dfdd726a224/node_modules/@opentelemetry/context-async-hooks/build/src/AbstractAsyncHooksContextManager.js
 var require_AbstractAsyncHooksContextManager = __commonJS(function(exports) {
@@ -6581,19 +6581,19 @@ var require_getMachineId = __commonJS(function(exports) {
     if (!getMachineIdImpl) {
       switch (process2.platform) {
         case "darwin":
-          getMachineIdImpl = (await import("./getMachineId-darwin-j162caws.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-darwin-vyzzs39k.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         case "linux":
-          getMachineIdImpl = (await import("./getMachineId-linux-p9b7r6ks.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-linux-2y4ve64v.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         case "freebsd":
-          getMachineIdImpl = (await import("./getMachineId-bsd-q742fj46.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-bsd-rw5txavt.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         case "win32":
-          getMachineIdImpl = (await import("./getMachineId-win-xxam2s5r.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-win-py6x26zf.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
         default:
-          getMachineIdImpl = (await import("./getMachineId-unsupported-ns2cz6yk.js").then((m)=>__toESM(m.default))).getMachineId;
+          getMachineIdImpl = (await import("./getMachineId-unsupported-2y8yye54.js").then((m)=>__toESM(m.default))).getMachineId;
           break;
       }
     }
@@ -13715,6 +13715,7 @@ function startSdk(exports, attributes, bearerTokenFile) {
       agents.end();
       bearer?.reread();
     },
+    disconnect: () => agents.end(),
     flush: async () => {
       await Promise.all(flushes.map((flush) => flush()));
     }

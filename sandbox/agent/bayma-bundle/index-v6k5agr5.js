@@ -9,7 +9,7 @@ import {
   ProcessTransport2,
   buildMarkers2,
   createPromptAwareEnvelopeCollector2
-} from "./main-eqz69xvs.js";
+} from "./main-qc1nvyfk.js";
 
 // packages/runtime-bun/src/profile.ts
 var bunModelProfile = {

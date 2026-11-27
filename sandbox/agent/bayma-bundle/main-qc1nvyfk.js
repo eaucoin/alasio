@@ -8173,7 +8173,7 @@ async function startTelemetry(attributes, bearerTokenFile) {
 `);
   if (config.exports.length === 0)
     return;
-  const { startSdk } = await import("./sdk-zdytc6tx.js");
+  const { startSdk } = await import("./sdk-m0khrzfn.js");
   running = {
     sdk: startSdk(config.exports, attributes, bearerTokenFile),
     parent: import_api.propagation.extract(import_api.ROOT_CONTEXT, {
@@ -8221,6 +8221,9 @@ async function flushTelemetry(timeoutMs) {
 }
 function reconnectTelemetry() {
   running?.sdk.reconnect();
+}
+function disconnectTelemetry() {
+  running?.sdk.disconnect();
 }
 function processTraceContext() {
   return running?.parent ?? import_api.ROOT_CONTEXT;
@@ -29584,8 +29587,11 @@ async function serveSandboxHook(stateDir, handlers) {
           runOn();
           throw error;
         }
-        if (!request.leavesRunning)
+        if (!request.leavesRunning) {
           await flushTelemetry(TELEMETRY_FLUSH_TIMEOUT_MS);
+          disconnectTelemetry();
+          handlers.ending?.();
+        }
         savedAtMs = Date.now();
         const save = ++saves;
         resumesWithin(SAVE_EXPIRY_MS).then((resumed) => {
@@ -30161,6 +30167,7 @@ async function serveMcpHttp(adapters, config) {
       stop: heldStop,
       save: (options) => saveSandboxServer(manager, options),
       collect: () => manager.collectGarbage(),
+      ending: () => server.closeIdleConnections(),
       restore: async (savedAtMs, stopReason) => {
         restoreSandboxServer(manager, savedAtMs, stopReason);
         try {
@@ -30540,9 +30547,11 @@ Commands:
       directory's last-save.json says too. A save that ends the sandbox
       then has each Bun session waiting at its prompt collect its garbage,
       and collects the server's, so that the save holds less of their
-      memory; one that leaves it running, as its host says with
-      --leave-running, as it says to runsc checkpoint, collects none, which
-      would rewrite pages the next such save writes again. runsc runs the
+      memory, and ends the connections its clients and its telemetry keep
+      idle, which a restore could not use; one that leaves it running, as
+      its host says with --leave-running, as it says to runsc checkpoint,
+      does neither: a collection would rewrite pages the next such save
+      writes again, and its connections run on with it. runsc runs the
       hook with a save's arguments at the restore or resume after it too,
       which take nothing of them. A restore reads the token file
       again, starts clients' reconnect grace and idle timeouts again, tells
