@@ -59,7 +59,7 @@ import {
   templateHash,
 } from "../../../src/gateway/names.ts";
 import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, NET_MODE_LABEL, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG, WARMED_FILE } from "../../../src/kube/sandbox-shape.ts";
-import { ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
+import { ATTACH_MOUNT, ATTACH_ROOT, goferOf, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, restoresIntoStandby, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
@@ -273,7 +273,7 @@ function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typ
         volumeMounts: [
           // Its own directory on its node, by its namespace and its name, as pods of two namespaces
           // may share a name, which its workspace is attached under once it is bound.
-          { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", mountPropagation: "HostToContainer" },
+          { name: "attach", mountPath: ATTACH_MOUNT, subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", mountPropagation: "HostToContainer" },
           { name: "tmp", mountPath: "/tmp" },
         ],
       }],

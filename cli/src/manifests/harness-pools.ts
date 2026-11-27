@@ -46,7 +46,7 @@ import type { KubernetesObject, V1Deployment, V1EnvVar, V1PodTemplateSpec, V1Rol
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
 import { ALASIO_GATEWAY_URL_VARIABLE, type GatewayConfig, HARNESS_CONTAINER } from "../../../src/gateway/names.ts";
 import { HARNESS_NAMES, type HarnessName } from "../../../src/harness/names.ts";
-import { ATTACH_ROOT, BINDING_FILE } from "../../../src/node-agent/names.ts";
+import { ATTACH_MOUNT, ATTACH_ROOT, BINDING_FILE } from "../../../src/node-agent/names.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
 import {
@@ -119,7 +119,7 @@ function harnessTemplate(config: InstallConfig, environment: Environment, pool: 
   ];
   const volumeMounts: V1VolumeMount[] = [
     // Its own directory on its node, by its namespace and its name, as pods of two namespaces may share a name, where its binding is written: its to read alone, so it fills nothing of its node's.
-    { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", readOnly: true },
+    { name: "attach", mountPath: ATTACH_MOUNT, subPathExpr: "$(POD_NAMESPACE)/$(POD_NAME)", readOnly: true },
     { name: "state", mountPath: STATE_DIR },
     { name: "codex", mountPath: CODEX_HOME },
     // The operator's own Codex home, their login in it, hidden where the machine's mounts would show it.

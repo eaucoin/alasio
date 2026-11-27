@@ -7,13 +7,13 @@
  * operator's, and waits for all that.
  */
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { dirname, posix } from "node:path";
 
 import { type Cluster, KubeConfig, type User, type V1Node, type V1Pod, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
-import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
+import { ATTACH_MOUNT, ATTACHED_FILES, CONTAINERD, excludesFromRestoreValidation, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
 import type { KubeApi } from "../kube/api.ts";
 import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "./stargz.ts";
 
@@ -176,11 +176,15 @@ const GVISOR_POD_ANNOTATIONS = ["dev.gvisor.internal.restore.*", "dev.gvisor.int
  * k3s's own configuration with the CRI's images pulled through the daemon (./stargz.ts),
  * and a runtime for each release, which runs that release's shim; and each runtime's runsc
  * options, which run that release's runsc, and, where `systemd` runs the machine, place
- * its sandboxes' cgroups through systemd, as kubelet does there. alasio writes them on the
- * machine (the host target), and puts them into each node's container (the cluster in
- * Docker). Pure, for tests.
+ * its sandboxes' cgroups through systemd, as kubelet does there; a release at or past
+ * `excludesFromRestoreValidationSince` (cluster/node/pins.json's) checks none of the files an
+ * attach writes anew at every restore. alasio writes them on the machine (the host target), and
+ * puts them into each node's container (the cluster in Docker). Pure, for tests.
  */
-export function containerdFiles(releases: readonly string[], { systemd }: { readonly systemd: boolean }): ReadonlyMap<string, string> {
+export function containerdFiles(
+  releases: readonly string[],
+  { systemd, excludesFromRestoreValidationSince = pins.gvisor.excludesFromRestoreValidationSince }: { readonly systemd: boolean; readonly excludesFromRestoreValidationSince?: string },
+): ReadonlyMap<string, string> {
   const optionsPath = (release: string) => `${CONTAINERD}/${gvisorHandler(release)}.toml`;
   const runtime = (release: string) => {
     const table = `plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.${gvisorHandler(release)}`;
@@ -206,6 +210,14 @@ export function containerdFiles(releases: readonly string[], { systemd }: { read
     "",
     "[runsc_config]",
     `  restore-validate-files = "all"`,
+    ...(excludesFromRestoreValidation(release, excludesFromRestoreValidationSince)
+      ? [
+          `  # But for the files an attach writes into a pod's directory, mounted at ${ATTACH_MOUNT} (src/node-agent/names.ts`,
+          "  # ATTACHED_FILES), anew for every restore by design: a process that held one open at the checkpoint would fail",
+          "  # the restore otherwise. The rest of the mount is checked, the workspace attached under it among it.",
+          `  restore-validate-files-exclude = "${ATTACHED_FILES.map((name) => posix.join(ATTACH_MOUNT, name)).join(",")}"`,
+        ]
+      : []),
     "  # The pages a sandbox writes are tracked from its first checkpoint or restore on, by write-protecting them, so",
     "  # that the node agent's next checkpoint of it saves only those (src/node-agent/agent.ts); and the pages it",
     "  # touches in its first seconds after a restore are recorded, for its next restore to read first.",

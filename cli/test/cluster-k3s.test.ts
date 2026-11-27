@@ -122,6 +122,21 @@ test("where systemd runs the machine, runsc places its sandboxes' cgroups throug
   assert.doesNotMatch(options(false), /systemd/u);
 });
 
+test("a release at or past the first that spares chosen files from a restore's checks has runsc check none of the files an attach writes, and one before it, which knows no such flag, checks every file", () => {
+  const since = "20261102.0-eaucoin.12";
+  const options = (release: string) => containerdFiles([release], { systemd: false, excludesFromRestoreValidationSince: since }).get(`${CONTAINERD}/runsc-${release.replaceAll(".", "-")}.toml`) ?? "";
+  for (const release of [since, "20261102.0-eaucoin.13", "20261109.0-eaucoin.1"]) {
+    assert.match(options(release), /\n {2}restore-validate-files = "all"\n(?: {2}# [^\n]*\n)+ {2}restore-validate-files-exclude = "\/attach\/token,\/attach\/env,\/attach\/binding\.json,\/attach\/served"\n/u, release);
+    // As the node agent reads them: the workspace attached under /attach is checked still.
+    assert.ok(runscFlags(options(release)).includes("--restore-validate-files-exclude=/attach/token,/attach/env,/attach/binding.json,/attach/served"), release);
+  }
+  for (const release of ["20261102.0-eaucoin.11", "20260921.0-eaucoin.16", "20990101.0"]) {
+    assert.doesNotMatch(options(release), /restore-validate-files-exclude/u, release);
+  }
+  // As pinned, until the fork's release that has it is known: past the releases alasio keeps.
+  assert.equal(pins.gvisor.excludesFromRestoreValidationSince, since);
+});
+
 test("the gvisor RuntimeClass runs the current release, and each release kept has one of its own, labelled as alasio's", () => {
   const labels = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
   assert.deepEqual(gvisorRuntimeClasses(["21000101.0", "20990101.0"]).map(({ apiVersion, kind, metadata, handler }) => [apiVersion, kind, metadata?.name, metadata?.labels, handler]), [

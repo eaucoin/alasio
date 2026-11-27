@@ -101,7 +101,7 @@ import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { BAYMA_CONTAINER, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { Manifest } from "./agent.ts";
-import { ATTACH_ROOT, BINDING_FILE, RESTORE_POD, WORKSPACES_ROOT } from "./names.ts";
+import { ATTACH_ROOT, ATTACHED_FILES, BINDING_FILE, RESTORE_POD, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
 
@@ -373,8 +373,6 @@ const QUOTA_HELD_WITHIN_MS = 2 * 12_000 * 1.05;
 const QUOTA_LOOK_MS = 500;
 
 /** The agent's workspaces, as the module says. */
-/** What an attach writes into a pod's directory, beside its workspace's mount point (`ws`), and a free pod's binding; and what its bayma marks there (`served`). */
-const ATTACHED_FILES: readonly string[] = ["token", "env", BINDING_FILE, "served"];
 
 /**
  * The agent's own mount namespace: the mount points at or under a directory as it has them, and
