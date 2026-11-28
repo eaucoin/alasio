@@ -8087,7 +8087,7 @@ var import_api_logs = __toESM(require_src2(), 1);
 var package_default = {
   name: "@bayma/core",
   private: true,
-  version: "0.15.9",
+  version: "0.15.10",
   type: "module",
   exports: {
     ".": "./src/index.ts",
@@ -8173,7 +8173,7 @@ async function startTelemetry(attributes, bearerTokenFile) {
 `);
   if (config.exports.length === 0)
     return;
-  const { startSdk } = await import("./sdk-m0khrzfn.js");
+  const { startSdk } = await import("./sdk-pyds1hcb.js");
   running = {
     sdk: startSdk(config.exports, attributes, bearerTokenFile),
     parent: import_api.propagation.extract(import_api.ROOT_CONTEXT, {
@@ -29499,6 +29499,97 @@ import { Buffer as Buffer4 } from "node:buffer";
 import { rmSync as rmSync8 } from "node:fs";
 import net from "node:net";
 import { getHeapStatistics } from "node:v8";
+
+// packages/core/src/mcp/restore-profile.ts
+import { Session } from "node:inspector";
+var session;
+var marks = new Map;
+function profileFromSave() {
+  if (session)
+    return;
+  marks.clear();
+  session = new Session;
+  session.connect();
+  session.post("Profiler.enable");
+  session.post("Profiler.setSamplingInterval", { interval: 100 });
+  session.post("Profiler.start");
+}
+function markRestore(name) {
+  if (session)
+    marks.set(name, process.hrtime.bigint());
+}
+function endRestoreProfile() {
+  const s = session;
+  if (!s || !marks.has("handler"))
+    return;
+  session = undefined;
+  const stopAt = process.hrtime.bigint();
+  s.post("Profiler.stop", (error, result) => {
+    s.disconnect();
+    if (error || !result)
+      return;
+    const profile = result.profile;
+    const byId = new Map(profile.nodes.map((node) => [node.id, node]));
+    const parent = new Map;
+    for (const node of profile.nodes)
+      for (const child of node.children ?? [])
+        parent.set(child, node.id);
+    const times = [];
+    let t = 0;
+    for (const delta of profile.timeDeltas)
+      times.push(t += delta);
+    const offset = profile.endTime - times[times.length - 1];
+    let gapAt = 0;
+    for (let i = 1;i < times.length; i += 1)
+      if (times[i] - times[i - 1] > times[gapAt] - (times[gapAt - 1] ?? times[0]))
+        gapAt = i;
+    const zero = times[gapAt] + offset;
+    const at = (name) => {
+      const mark = marks.get(name);
+      return mark === undefined ? null : Math.round((profile.endTime + Number(mark - stopAt) / 1000 - zero) / 100) / 10;
+    };
+    const names = ["request", "handler", "reconnected", "answered"];
+    const edges = [0, ...names.map(at).map((v) => v ?? Infinity)];
+    const label = (node) => `${node.callFrame.functionName || "(anonymous)"} ${node.callFrame.url.split("/").pop()}:${node.callFrame.lineNumber + 1}`;
+    const windows = names.map(() => ({
+      self: new Map,
+      total: new Map,
+      ms: 0
+    }));
+    for (let i = gapAt;i < profile.samples.length; i += 1) {
+      const ms = ((times[i + 1] ?? times[i]) - times[i]) / 1000;
+      const when = (times[i] + offset - zero) / 1000;
+      const w = edges.findIndex((edge, k) => k > 0 && when < edge) - 1;
+      if (w < 0)
+        continue;
+      const window2 = windows[w];
+      window2.ms += ms;
+      let node = byId.get(profile.samples[i]);
+      window2.self.set(label(node), (window2.self.get(label(node)) ?? 0) + ms);
+      const seen = new Set;
+      for (;node; node = byId.get(parent.get(node.id) ?? -1)) {
+        const name = label(node);
+        if (seen.has(name))
+          continue;
+        seen.add(name);
+        window2.total.set(name, (window2.total.get(name) ?? 0) + ms);
+      }
+    }
+    const top = (map, n) => [...map].sort((a, b) => b[1] - a[1]).slice(0, n).map(([name, ms]) => [name, Math.round(ms * 10) / 10]);
+    process.stderr.write(`bayma-restore-profile ${JSON.stringify({
+      marks: Object.fromEntries(names.map((name) => [name, at(name)])),
+      windows: windows.map((window2, k) => ({
+        to: names[k],
+        ms: Math.round(window2.ms * 10) / 10,
+        self: top(window2.self, 25),
+        total: top(window2.total, 40)
+      }))
+    })}
+`);
+  });
+}
+
+// packages/core/src/mcp/sandbox-hook.ts
 async function saveSandboxServer(manager, { hostSyncs }) {
   if (!hostSyncs)
     await manager.syncToStorage();
@@ -29591,6 +29682,7 @@ async function serveSandboxHook(stateDir, handlers) {
           await flushTelemetry(TELEMETRY_FLUSH_TIMEOUT_MS);
           disconnectTelemetry();
           handlers.ending?.();
+          profileFromSave();
         }
         savedAtMs = Date.now();
         const save = ++saves;
@@ -29607,7 +29699,9 @@ async function serveSandboxHook(stateDir, handlers) {
         return JSON.stringify(caught);
       }
       case "restore": {
+        markRestore("handler");
         reconnectTelemetry();
+        markRestore("reconnected");
         const restoredFrom = savedAtMs;
         if (restoredFrom === undefined)
           throw new Error("the server was not saved, to be restored");
@@ -29661,9 +29755,14 @@ async function serveSandboxHook(stateDir, handlers) {
         return;
       socket.removeAllListeners("data");
       sendsNothing.clear();
-      queue(() => handle(parseSandboxHookRequest(request.subarray(0, end).toString()))).then((answer) => socket.end(answer === undefined ? `ok
+      markRestore("request");
+      queue(() => handle(parseSandboxHookRequest(request.subarray(0, end).toString()))).then((answer) => {
+        socket.end(answer === undefined ? `ok
 ` : `ok ${answer}
-`), (error) => socket.end(`${failureMessage(error)}
+`);
+        markRestore("answered");
+        endRestoreProfile();
+      }, (error) => socket.end(`${failureMessage(error)}
 `));
     });
     socket.on("error", () => socket.destroy());

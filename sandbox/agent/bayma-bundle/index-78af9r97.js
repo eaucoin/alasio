@@ -10,7 +10,7 @@ import {
   buildMarkers2,
   createPromptAwareEnvelopeCollector2,
   ensureRuntimeAsset2
-} from "./main-qc1nvyfk.js";
+} from "./main-4vabrjre.js";
 
 // packages/runtime-python/src/profile.ts
 var pythonModelProfile = {

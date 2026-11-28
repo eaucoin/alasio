@@ -2,7 +2,7 @@
 import {
   __commonJS,
   require_src
-} from "./main-qc1nvyfk.js";
+} from "./main-4vabrjre.js";
 
 // node_modules/.bun/@opentelemetry+resources@2.11.0+e40b0dfdd726a224/node_modules/@opentelemetry/resources/build/src/detectors/platform/node/machine-id/getMachineId-unsupported.js
 var require_getMachineId_unsupported = __commonJS(function(exports) {

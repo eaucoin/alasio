@@ -189,14 +189,14 @@ async function main() {
     { pythonAdapter },
     { rustAdapter }
   ] = await Promise.all([
-    import("./index-hr505cvr.js"),
-    import("./index-v6k5agr5.js"),
-    import("./index-jja72ygf.js"),
-    import("./index-qwhfq0t5.js"),
-    import("./index-snmak72c.js"),
-    import("./index-3ekaryze.js"),
-    import("./index-x9fjsz8g.js"),
-    import("./index-jx5hrcnj.js")
+    import("./index-2zpjnp5b.js"),
+    import("./index-6nrc5z13.js"),
+    import("./index-0w6pgnpy.js"),
+    import("./index-hwjqvzxz.js"),
+    import("./index-kgd0q988.js"),
+    import("./index-552qs17d.js"),
+    import("./index-78af9r97.js"),
+    import("./index-aes64d5g.js")
   ]);
   return runCli([
     bunAdapter,
