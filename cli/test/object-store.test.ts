@@ -31,22 +31,36 @@ test("reads from a master's metrics whether it holds volume growth frozen, and s
   assert.match(said ?? "", /^its volume growth: frozen by alasio-seaweedfs-master-0, [^]* resume it in weed shell \(kubectl exec \.\.\. weed shell\) with volume\.growth\.resume$/u);
 });
 
-test("reads the snapshot a cut-over took of the store's volumes from its ConfigMap, what of the disk it holds of its own, and says how to restore and delete it, and when", () => {
-  const data = { path: "/srv/cut-over/object-store", taken: "2026-11-26T19:28:22Z", keepUntil: "2026-11-28T19:28:22Z", copiedBytes: "1048576", volumes: "/srv/a.dat\n/srv/b.dat\n" };
-  const snapshot = storeSnapshotOf(data);
-  assert.deepEqual(snapshot, { path: data.path, taken: data.taken, keepUntil: data.keepUntil, copiedBytes: 1_048_576, volumes: ["/srv/a.dat", "/srv/b.dat"] });
+test("reads the snapshot a cut-over took of the store's volumes from its ConfigMap, what of the disk it holds of its own, and whether its compaction is paused, and says how to delete it, when, and what its restore puts back", () => {
+  const data = { path: "/srv/cut-over/object-store", taken: "2026-11-26T19:28:22Z", keepUntil: "2026-11-28T19:28:22Z", floorBytes: String(60 * 2 ** 30), copiedBytes: "1048576", volumes: "/srv/a.dat\n/srv/b.dat\n" };
+  const unpaused = storeSnapshotOf(data);
+  assert.deepEqual(unpaused, { path: data.path, taken: data.taken, keepUntil: data.keepUntil, floorBytes: 60 * 2 ** 30, copiedBytes: 1_048_576, volumes: ["/srv/a.dat", "/srv/b.dat"], vacuumPausedAt: null });
   // A ConfigMap missing what it names, or counting no bytes, names none.
   assert.equal(storeSnapshotOf(undefined), null);
   assert.equal(storeSnapshotOf({ ...data, keepUntil: "" }), null);
   assert.equal(storeSnapshotOf({ ...data, copiedBytes: "many" }), null);
-  if (snapshot === null) return;
+  assert.equal(storeSnapshotOf({ ...data, floorBytes: "" }), null);
+  const snapshot = storeSnapshotOf({ ...data, vacuumPausedAt: "2026-11-26T19:40:00Z" });
+  if (unpaused === null || snapshot === null) return assert.fail("no snapshot read");
   // What it copied, and each data file the store no longer links: one compacted away, of 2 GiB on the disk; one shared still.
   assert.equal(storeSnapshotHolds(snapshot, [{ nlink: 1, blocks: 4 * 1024 ** 2 }, { nlink: 2, blocks: 8 }]), 1_048_576 + 2 * 1024 ** 3);
   const held = 1_048_576 + 2 * 1024 ** 3;
-  assert.equal(
-    describeStoreSnapshot(snapshot, held, new Date("2026-11-27T00:00:00Z")),
-    "its snapshot, taken 2026-11-26T19:28:22Z before its upgrade, at /srv/cut-over/object-store: holding 2.0 GiB of the disk of its own, more as the store compacts or deletes the volumes it shares with it; " +
-      "sudo /srv/cut-over/object-store/restore.sh puts the store back as it was, its parts stopped; kept until 2026-11-28T19:28:22Z, then deleted by sudo /srv/cut-over/object-store/delete.sh",
-  );
-  assert.match(describeStoreSnapshot(snapshot, { unread: "EACCES: permission denied, stat '/srv/a.dat'" }, new Date("2026-11-29T00:00:00Z")), /: what it holds of the disk not read: EACCES: permission denied, stat '\/srv\/a\.dat'; .*; kept until 2026-11-28T19:28:22Z, which has passed: delete it with sudo \/srv\/cut-over\/object-store\/delete\.sh$/u);
+  const shell = "kubectl -n alasio exec -it deployment/alasio-seaweedfs -c buckets -- weed shell";
+  const masters = [{ name: "alasio-seaweedfs-master-0", startedAt: "2026-11-26T19:35:00Z" }];
+  const [first, vacuum, deletion, restore, ...more] = describeStoreSnapshot(snapshot, held, masters, shell, new Date("2026-11-27T00:00:00Z"));
+  assert.deepEqual(more, []);
+  assert.equal(first, "its snapshot, taken 2026-11-26T19:28:22Z before its upgrade to SeaweedFS 4.54, at /srv/cut-over/object-store: holding 2.0 GiB of the disk of its own");
+  assert.equal(vacuum, "  its compaction paused since 2026-11-26T19:40:00Z, so the snapshot grows only as the store deletes what it shares");
+  // Deleted by hand alone, and before its time only by the override, and when.
+  assert.equal(deletion, "  it may be deleted from 2026-11-28T19:28:22Z, by sudo /srv/cut-over/object-store/delete.sh, run by hand; before, by sudo /srv/cut-over/object-store/delete.sh --under-floor, only while its disk has less than 60.0 GiB free and every part of the store is ready, which resumes the compaction");
+  assert.match(restore ?? "", /^ {2}sudo \/srv\/cut-over\/object-store\/restore\.sh --disaster-recovery puts back the object store alone, as it was before its upgrade, its parts stopped: Neon's safekeepers and pageservers, and workspace storage's metadata, are ahead of it then, so it stops Neon's, whose databases are recovered from their newest dump, and workspace storage's metadata from its newest JuiceFS dump, before either runs again$/u);
+  // A master started since the pause, or not running, has forgotten it: said, and how to pause it again.
+  const [, forgotten] = describeStoreSnapshot(snapshot, held, [{ name: "alasio-seaweedfs-master-0", startedAt: "2026-11-26T22:00:00Z" }, { name: "alasio-seaweedfs-master-1", startedAt: null }], shell, new Date("2026-11-27T00:00:00Z"));
+  assert.equal(forgotten, `  its compaction running again, paused at 2026-11-26T19:40:00Z and forgotten by alasio-seaweedfs-master-0, started at 2026-11-26T22:00:00Z, alasio-seaweedfs-master-1, which does not run: the snapshot grows as the store compacts the volumes it shares; pause it again in weed shell (${shell}) with lock, volume.vacuum.disable and unlock`);
+  const [, never] = describeStoreSnapshot(unpaused, held, masters, shell, new Date("2026-11-27T00:00:00Z"));
+  assert.match(never ?? "", /^ {2}its compaction not said paused on SeaweedFS 4\.54, so the snapshot may grow as the store compacts the volumes it shares: the cut-over run again pauses it, or pause it again in weed shell/u);
+  // Past its time, and its size unread.
+  const [late, , due] = describeStoreSnapshot(snapshot, { unread: "EACCES: permission denied, stat '/srv/a.dat'" }, masters, shell, new Date("2026-11-29T00:00:00Z"));
+  assert.match(late ?? "", /: what it holds of the disk not read: EACCES: permission denied, stat '\/srv\/a\.dat'$/u);
+  assert.equal(due, "  it may be deleted, since 2026-11-28T19:28:22Z: sudo /srv/cut-over/object-store/delete.sh, run by hand, deletes it, which resumes the compaction");
 });

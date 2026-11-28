@@ -100,22 +100,29 @@ export const STORE_SNAPSHOT_CONFIGMAP = "alasio-object-store-snapshot";
 
 /**
  * A snapshot of the store's volumes, as its ConfigMap says it: where it is, when it was taken
- * and until when it is kept, what it copied, and the data files of the volumes it links, each
- * shared with the store until the store compacts or deletes its volume, its own from then.
+ * and from when it may be deleted, the floor of its disk's room its deletion may be sooner
+ * under, what it copied, the data files of the volumes it links, each shared with the store
+ * until the store compacts or deletes its volume, its own from then, and since when the store's
+ * compaction is paused, null where it is said paused on none.
  */
 export interface StoreSnapshot {
   readonly path: string;
   readonly taken: string;
   readonly keepUntil: string;
+  readonly floorBytes: number;
   readonly copiedBytes: number;
   readonly volumes: readonly string[];
+  readonly vacuumPausedAt: string | null;
 }
 
 /** The snapshot the ConfigMap's `data` says, or null where it says none whole. */
 export function storeSnapshotOf(data: Readonly<Record<string, string>> | undefined): StoreSnapshot | null {
-  const { path, taken, keepUntil, copiedBytes, volumes = "" } = data ?? {};
-  if (!path || !taken || !keepUntil || !copiedBytes || !/^\d+$/u.test(copiedBytes)) return null;
-  return { path, taken, keepUntil, copiedBytes: Number(copiedBytes), volumes: volumes.split("\n").filter(Boolean) };
+  const { path, taken, keepUntil, floorBytes, copiedBytes, volumes = "", vacuumPausedAt } = data ?? {};
+  const count = (text: string | undefined) => (text !== undefined && /^\d+$/u.test(text) ? Number(text) : null);
+  const floor = count(floorBytes);
+  const copied = count(copiedBytes);
+  if (!path || !taken || !keepUntil || floor === null || copied === null) return null;
+  return { path, taken, keepUntil, floorBytes: floor, copiedBytes: copied, volumes: volumes.split("\n").filter(Boolean), vacuumPausedAt: vacuumPausedAt || null };
 }
 
 /**
@@ -127,20 +134,41 @@ export function storeSnapshotHolds(snapshot: StoreSnapshot, linked: readonly { r
   return linked.reduce((total, { nlink, blocks }) => total + (nlink === 1 ? blocks * 512 : 0), snapshot.copiedBytes);
 }
 
+/** A master of the store, by its pod, and when its master started, as its pod says, null where it does not run. */
+export interface StoreMaster {
+  readonly name: string;
+  readonly startedAt: string | null;
+}
+
 /**
  * What `status` says of `snapshot`, as of `now`: where it is and when it was taken, what of the
- * disk it holds of its own as `holds` says, or why that is not known; how to put the store back as
- * it was; and until when it is kept, and how to delete it then, or, once that has passed, now.
+ * disk it holds of its own as `holds` says, or why that is not known; whether the store's
+ * compaction is paused, which a master of `masters` started since its pause forgets, its pause
+ * held in its memory alone, and how to pause it again in weed shell as `shell` runs it; from
+ * when it may be deleted, by a deletion run by hand, and sooner by its override; and what its
+ * restore puts back, the store alone, Neon and workspace storage left to their own recovery.
  */
-export function describeStoreSnapshot(snapshot: StoreSnapshot, holds: number | { readonly unread: string }, now: Date): string {
-  const { path, taken, keepUntil } = snapshot;
+export function describeStoreSnapshot(snapshot: StoreSnapshot, holds: number | { readonly unread: string }, masters: readonly StoreMaster[], shell: string, now: Date): string[] {
+  const { path, taken, keepUntil, floorBytes, vacuumPausedAt } = snapshot;
   const held = typeof holds === "number"
-    ? `holding ${memoryText(holds)} of the disk of its own, more as the store compacts or deletes the volumes it shares with it`
+    ? `holding ${memoryText(holds)} of the disk of its own`
     : `what it holds of the disk not read: ${holds.unread}`;
-  const kept = now.getTime() < Date.parse(keepUntil)
-    ? `kept until ${keepUntil}, then deleted by sudo ${path}/delete.sh`
-    : `kept until ${keepUntil}, which has passed: delete it with sudo ${path}/delete.sh`;
-  return `its snapshot, taken ${taken} before its upgrade, at ${path}: ${held}; sudo ${path}/restore.sh puts the store back as it was, its parts stopped; ${kept}`;
+  const restarted = vacuumPausedAt === null ? [] : masters.filter(({ startedAt }) => startedAt === null || Date.parse(startedAt) > Date.parse(vacuumPausedAt));
+  const pauseAgain = `pause it again in weed shell (${shell}) with lock, volume.vacuum.disable and unlock`;
+  const vacuum = vacuumPausedAt === null
+    ? `its compaction not said paused on SeaweedFS 4.54, so the snapshot may grow as the store compacts the volumes it shares: the cut-over run again pauses it, or ${pauseAgain}`
+    : restarted.length > 0
+    ? `its compaction running again, paused at ${vacuumPausedAt} and forgotten by ${restarted.map(({ name, startedAt }) => (startedAt === null ? `${name}, which does not run` : `${name}, started at ${startedAt}`)).join(", ")}: the snapshot grows as the store compacts the volumes it shares; ${pauseAgain}`
+    : `its compaction paused since ${vacuumPausedAt}, so the snapshot grows only as the store deletes what it shares`;
+  const deletion = now.getTime() < Date.parse(keepUntil)
+    ? `it may be deleted from ${keepUntil}, by sudo ${path}/delete.sh, run by hand; before, by sudo ${path}/delete.sh --under-floor, only while its disk has less than ${memoryText(floorBytes)} free and every part of the store is ready`
+    : `it may be deleted, since ${keepUntil}: sudo ${path}/delete.sh, run by hand, deletes it`;
+  return [
+    `its snapshot, taken ${taken} before its upgrade to SeaweedFS 4.54, at ${path}: ${held}`,
+    `  ${vacuum}`,
+    `  ${deletion}, which resumes the compaction`,
+    `  sudo ${path}/restore.sh --disaster-recovery puts back the object store alone, as it was before its upgrade, its parts stopped: Neon's safekeepers and pageservers, and workspace storage's metadata, are ahead of it then, so it stops Neon's, whose databases are recovered from their newest dump, and workspace storage's metadata from its newest JuiceFS dump, before either runs again`,
+  ];
 }
 
 /** The copies of each object a replication, `000` or `00N`, keeps, as said. */

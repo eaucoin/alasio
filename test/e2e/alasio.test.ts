@@ -20,6 +20,7 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test, type TestContext } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Container, V1CronJob, V1DaemonSet, V1Deployment, V1Job, V1Node, V1ObjectMeta, V1Pod, V1PodSpec, V1PodTemplateSpec, V1RuntimeClass, V1Secret, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
@@ -787,12 +788,15 @@ if (inShard("upgrade")) {
         check: async () => {
           assert.deepEqual(await inEveryBucket(PROBE_GET), probes);
           const listed = (await inCutOverRecord("ls -1 object-store")).split("\n").filter(Boolean).sort();
-          assert.deepEqual(listed, [...STORE_CLAIMS, "claims", "counts", "delete.sh", "image", "restore.sh", "taken", "volumes"].sort());
+          assert.deepEqual(listed, [...STORE_CLAIMS, "claims", "counts", "delete.sh", "floor", "image", "restore.sh", "taken", "volumes"].sort());
           const events = await inCutOverRecord("cat events.log");
           for (const claim of STORE_CLAIMS) assert.match(events, new RegExp(`snapshotted the object store's ${claim}, \\d+ volumes' data linked and \\d+ bytes copied, in \\d+ s`, "u"), claim);
-          assert.match(events, /the object store snapshotted, to \S+: restore\.sh there puts it back, its parts stopped; delete\.sh deletes it from \S+\n[^\n]* the object store started again, each part ready, on SeaweedFS 4\.48, as it was, for the upgrade to start it on 4\.54\n[^\n]* upgrading, from the cut-over/u);
+          assert.match(events, /the object store snapshotted, to \S+: restore\.sh --disaster-recovery there puts it back, its parts stopped; delete\.sh may delete it from \S+\n[^\n]* the object store started again, each part ready, on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}\n[^\n]* the object store's compaction paused, so its snapshot holds no more of the disk\n[^\n]* upgrading, from the cut-over[^\n]*\n(?:[\s\S]*\n)?[^\n]* the object store's compaction paused on SeaweedFS 4\.54, until its snapshot is deleted\n/u);
           // Status says it, and what of the disk it holds, read by the owner.
-          assert.match(await alasioOk("status"), /^ {2}its snapshot, taken \S+ before its upgrade, at \S+\/cut-over\/object-store: holding \d+(\.\d)? [MG]iB of the disk of its own, /mu);
+          const status = await alasioOk("status");
+          assert.match(status, /^ {2}its snapshot, taken \S+ before its upgrade to SeaweedFS 4\.54, at \S+\/cut-over\/object-store: holding \d+(\.\d)? [MG]iB of the disk of its own$/mu);
+          assert.match(status, /^ {4}its compaction paused since \S+, so the snapshot grows only as the store deletes what it shares$/mu);
+          assert.match(status, /^ {4}it may be deleted from \S+, by sudo \S+\/delete\.sh, run by hand; before, by sudo \S+\/delete\.sh --under-floor, /mu);
         },
       },
     ];
@@ -854,11 +858,17 @@ if (inShard("upgrade")) {
       const [secrets, stack] = [await namespaceSecrets(), await stackSecrets()];
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* checking that the object store can be snapshotted[^\n]*\n[^\n]* the object store's snapshot links \d+ volumes' data and copies \d+ bytes[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
+      assert.match(failed.stderr, /checking that the upgrade can run [^\n]*\n[^\n]* checking that the object store can be snapshotted[^\n]*\n[^\n]* the object store's snapshot links \d+ volumes' data and copies \d+ bytes[^\n]*\n[^\n]* pulling SeaweedFS 4\.54 onto this machine[^\n]*\n[^\n]* FAILED: a failure injected before the point of no return\n$/u);
       assert.deepEqual([await namespaceSecrets(), await stackSecrets()], [secrets, stack]);
       assert.ok(!(await recorded()).includes("point-of-no-return"));
       assert.deepEqual(await alasioApplied(), applied);
       assert.ok(await runs(RELEASE), "alasio runs as it did");
+      // As a dry run of it, the SeaweedFS the upgrade starts the store's parts on pulled onto the node, all it did beside its record.
+      const pulled = /^STORE_IMAGE=(\S+)$/mu.exec(readFileSync(fileURLToPath(new URL(`../../upgrades/from-${PREVIOUS}.sh`, import.meta.url)), "utf8"))?.[1];
+      assert.ok(pulled, "the cut-over names no SeaweedFS it pulls");
+      const [node] = (await kube.list<V1Node>("Node")).map(({ metadata }) => metadata?.name ?? "");
+      assert.ok(node, "the cluster has no node");
+      await onNode(node, `k3s crictl inspecti -q ${pulled} >/dev/null`);
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
     });
@@ -5595,9 +5605,11 @@ if (inShard("upgrade")) {
         await kube.patch(ref("StatefulSet", part, NAMESPACE), { spec: { replicas: 0 } });
         await until(`the object store's ${part} stopped`, () => stopped(part), 600_000);
       }
-      const restored = await inCutOverRecordOnCluster("bash object-store/restore.sh");
+      // Refused unless told it is a disaster's recovery, changing nothing.
+      assert.match(await inCutOverRecordOnCluster("bash object-store/restore.sh || true"), /FAILED: this puts back the object store alone/u);
+      const restored = await inCutOverRecordOnCluster("bash object-store/restore.sh --disaster-recovery");
       t.diagnostic(restored);
-      assert.match(restored, /the object store restored as it was snapshotted, \S+; start it on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}, as 10\.0\.27 ran it/u);
+      assert.match(restored, /the object store restored as it was snapshotted, \S+, and it alone: start it on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}, as 10\.0\.27 ran it/u);
       // Each container of its parts and its gateways that runs SeaweedFS on the image 10.0.27 ran, each part at its count again,
       // those its peers need first, as the restore says.
       const image = (await inCutOverRecord("cat object-store/image")).trim();

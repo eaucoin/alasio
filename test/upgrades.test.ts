@@ -6,12 +6,16 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { Result } from "effect";
+
+import { installConfigOf } from "../cli/src/config.ts";
+import { imageReference } from "../cli/src/images.ts";
 import { STORE_SNAPSHOT_CONFIGMAP } from "../cli/src/object-store.ts";
 
 const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.27.sh", import.meta.url));
@@ -23,6 +27,10 @@ const pathOf = (bin: string) => [bin, "/usr/bin", "/bin"].join(delimiter);
 const STORE_PARTS = ["alasio-seaweedfs-filer", "alasio-seaweedfs-volume", "alasio-seaweedfs-master", "alasio-seaweedfs-filer-store"];
 /** The same, as the cut-over starts them again: each once those it needs are ready. */
 const STARTED = [...STORE_PARTS].reverse();
+/** Neon's parts that hold what they write to the store, by their StatefulSets, which a restore stops. */
+const NEON_WRITERS = ["alasio-neon-safekeeper", "alasio-neon-pageserver"];
+/** The SeaweedFS the cut-over pulls onto the machine before its point of no return, as it names it. */
+const STORE_IMAGE = /^STORE_IMAGE=(\S+)$/mu.exec(readFileSync(SCRIPT, "utf8"))?.[1] ?? "";
 /** The claims of the parts that keep a volume: the masters', the volume servers' and the filers' store's. */
 const MASTER = "data-alasio-seaweedfs-master-0";
 const VOLUME = "data-alasio-seaweedfs-volume-0";
@@ -55,8 +63,11 @@ const df = (avail: number, claimsOn = "/") =>
  * `namespaces` names, `<name>\t<branch label>` each, and the bundled object store's claims, each
  * a directory of the machine's, whose parts it stops and starts as it is told, saying so in
  * `stopped` and `started`, a part named in `unready` never ready, and whose pods run while
- * `running` names one; that keeps what it was asked of ConfigMaps in `configMaps`; and an UPGRADE
- * and an UPGRADE_CHECK, each saying it ran, UPGRADE failing while `upgradeFails` is there.
+ * `running` names one; that keeps what it was asked of ConfigMaps in `configMaps`, the ConfigMap's
+ * path `named` says, and what the store's shell was given in `shell`, failing while `shellFails` is
+ * there; a crictl of k3s's that keeps what it pulled in `pulled`, failing while `pullFails` is
+ * there; and an UPGRADE and an UPGRADE_CHECK, each saying it ran, UPGRADE failing while
+ * `upgradeFails` is there.
  */
 function machine() {
   const root = mkdtempSync(join(tmpdir(), "alasio-cut-over-"));
@@ -71,6 +82,12 @@ function machine() {
   const unready = join(root, "unready");
   const running = join(root, "running");
   const configMaps = join(root, "config-maps");
+  const named = join(root, "named");
+  const configMapsFail = join(root, "config-maps-fail");
+  const shell = join(root, "shell");
+  const shellFails = join(root, "shell-fails");
+  const pulled = join(root, "pulled");
+  const pullFails = join(root, "pull-fails");
   const upgradeFails = join(root, "upgrade-fails");
   const config = join(root, "config.json");
   for (const directory of [bin, volumes, counts]) mkdirSync(directory);
@@ -86,6 +103,17 @@ case "$*" in
   "get pv "*" -o jsonpath="*) printf '%s' '${volumes}'/"$3" ;;
   "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}") cat '${counts}'/"$5" 2>/dev/null || echo 1 ;;
   "-n alasio get statefulset alasio-seaweedfs-master -o jsonpath={.spec.template.spec.containers[?(@.name==\\"master\\")].image}") printf '%s' '${IMAGE}' ;;
+  "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}/{.status.replicas}")
+    count=$(cat '${counts}'/"$5" 2>/dev/null || echo 1); echo "$count/$count" ;;
+  "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}/{.status.readyReplicas}"|"-n alasio get deployment alasio-seaweedfs -o jsonpath={.spec.replicas}/{.status.readyReplicas}")
+    count=$(cat '${counts}'/"$5" 2>/dev/null || echo 1)
+    if grep -qx "$5" '${unready}' 2>/dev/null; then echo "$count/"; else echo "$count/$count"; fi ;;
+  "-n alasio get deployment alasio-seaweedfs -o jsonpath={.spec.template.spec.containers[?(@.name==\\"buckets\\")].command[2]}")
+    printf '%s' 'shell() { printf "%s\\n" "$1" | weed shell -master=alasio-seaweedfs-master-0.alasio-seaweedfs-master.alasio:9333 -filer=alasio-seaweedfs-filer:8888; }' ;;
+  "-n alasio exec -i deployment/alasio-seaweedfs -c buckets -- sh -c weed shell -master=alasio-seaweedfs-master-0.alasio-seaweedfs-master.alasio:9333 -filer=alasio-seaweedfs-filer:8888")
+    cat >>'${shell}'; [ ! -e '${shellFails}' ] || echo "error: the shell fails, as the test asks" ;;
+  "-n alasio get configmap ${STORE_SNAPSHOT_CONFIGMAP} -o jsonpath={.data.path} --ignore-not-found") cat '${named}' 2>/dev/null || true ;;
+  "-n alasio patch configmap ${STORE_SNAPSHOT_CONFIGMAP} --type merge -p "*) echo "$*" >>'${configMaps}' ;;
   "-n alasio scale statefulset "*" --replicas="*)
     count=\${6#--replicas=}
     echo "$count" >'${counts}'/"$5"
@@ -93,9 +121,13 @@ case "$*" in
   "-n alasio rollout status statefulset "*" --timeout="*) ! grep -qx "$6" '${unready}' 2>/dev/null ;;
   "-n alasio get pod -l app.kubernetes.io/component in ("*") -o name") cat '${running}' 2>/dev/null || true ;;
   "-n alasio get pod -l "*" -o name") ;;
-  "-n alasio delete configmap "*" --ignore-not-found"|"-n alasio create configmap "*) echo "$*" >>'${configMaps}' ;;
+  "-n alasio delete configmap "*" --ignore-not-found") [ ! -e '${configMapsFail}' ] && echo "$*" >>'${configMaps}' ;;
+  "-n alasio create configmap "*) echo "$*" >>'${configMaps}' ;;
   *) echo "kubectl $* is not the cut-over's" >&2; exit 2 ;;
 esac
+`, { mode: 0o755 });
+  writeFileSync(join(bin, "k3s"), `#!/bin/sh
+[ "$1 $2" = "crictl pull" ] && [ ! -e '${pullFails}' ] && echo "$3" >>'${pulled}'
 `, { mode: 0o755 });
   const out = join(root, "out");
   const snapshot = join(out, "object-store");
@@ -117,8 +149,8 @@ esac
     return { code: run.status, said: run.stderr };
   };
   /** The script `name` the snapshot carries, run as the machine's root runs it: what it came to. */
-  const carried = (name: "restore.sh" | "delete.sh") => {
-    const run = spawnSync("bash", [join(snapshot, name)], { encoding: "utf8", env: { PATH: pathOf(bin) } });
+  const carried = (name: "restore.sh" | "delete.sh", ...args: string[]) => {
+    const run = spawnSync("bash", [join(snapshot, name), ...args], { encoding: "utf8", env: { PATH: pathOf(bin) } });
     return { code: run.status, said: run.stderr };
   };
   /** The directory of `claim`'s volume. */
@@ -143,7 +175,11 @@ esac
      */
     store: () => {
       writeFileSync(claims, [...CLAIMS.map((claim) => `${claim}\tpv-${claim}`), "data-alasio-log-0\tpv-log", ""].join("\n"));
-      for (const claim of CLAIMS) mkdirSync(volume(claim), { recursive: true });
+      // Each made by anyone to write, as local-path makes a volume's directory.
+      for (const claim of CLAIMS) {
+        mkdirSync(volume(claim), { recursive: true });
+        chmodSync(volume(claim), 0o777);
+      }
       for (const [id, length] of [[1, 10_000], [2, 3000], [3, 500]] as const) {
         writeFileSync(join(volume(VOLUME), `neon_${id}.dat`), bytesOf(length, id));
         writeFileSync(join(volume(VOLUME), `neon_${id}.idx`), bytesOf(16 * id, 100 + id));
@@ -169,8 +205,19 @@ esac
     configMaps: since(configMaps),
     /** The counts the cut-over kept of the object store's parts as it stopped them, a `<part>\t<count>` each. */
     replicas: () => readFileSync(join(out, "object-store-replicas"), "utf8").split("\n").filter(Boolean),
-    restore: () => carried("restore.sh"),
-    deleteSnapshot: () => carried("delete.sh"),
+    restore: (...args: string[]) => carried("restore.sh", ...args),
+    deleteSnapshot: (...args: string[]) => carried("delete.sh", ...args),
+    /** Stops each part of the store `parts` names, as one would by hand: its StatefulSet at none. */
+    stop: (parts: readonly string[]) => { for (const part of parts) writeFileSync(join(counts, part), "0\n"); },
+    configMapsFail: (fails: boolean) => (fails ? writeFileSync(configMapsFail, "") : rmSync(configMapsFail, { force: true })),
+    /** Makes the ConfigMap name the snapshot at `path`, or none. */
+    named: (path?: string) => (path === undefined ? rmSync(named, { force: true }) : writeFileSync(named, path)),
+    /** What the store's shell was given, since the last time it was asked, a line each. */
+    shell: since(shell),
+    shellFails: (fails: boolean) => (fails ? writeFileSync(shellFails, "") : rmSync(shellFails, { force: true })),
+    /** The images pulled onto the machine, since the last time it was asked. */
+    pulled: since(pulled),
+    pullFails: (fails: boolean) => (fails ? writeFileSync(pullFails, "") : rmSync(pullFails, { force: true })),
     bin,
     upgradeFails: (fails: boolean) => (fails ? writeFileSync(upgradeFails, "") : rmSync(upgradeFails, { force: true })),
     remove: () => rmSync(root, { recursive: true, force: true }),
@@ -192,7 +239,7 @@ test("the cut-over checks, upgrades past its point of no return, and says it is 
   }
 });
 
-test("the cut-over stops the bundled object store past its point of no return, writers first, snapshots it, each volume's data linked, its size and its head kept, every other file copied, and starts it again, each part once its peers are ready, before the upgrade, once", () => {
+test("the cut-over stops the bundled object store past its point of no return, writers first, snapshots it, each volume's data linked, its size and its head kept, every other file copied, every directory of it root's to write, and starts it again, each part once its peers are ready, its compaction paused, before the upgrade and after it, once", () => {
   const at = machine();
   try {
     at.store();
@@ -202,6 +249,8 @@ test("the cut-over stops the bundled object store past its point of no return, w
     assert.deepEqual(at.ran(), ["check", "upgrade"]);
     assert.deepEqual(at.stopped(), STORE_PARTS);
     assert.deepEqual(at.started(), STARTED);
+    // SeaweedFS 4.54 pulled onto the machine before the point of no return, as the release pins it.
+    assert.deepEqual(at.pulled(), [STORE_IMAGE]);
     // Each claim's files as they were: each volume's data the very file the store keeps, every other file a copy.
     for (const claim of CLAIMS) {
       const files = join(at.snapshot, claim, "files");
@@ -218,26 +267,83 @@ test("the cut-over stops the bundled object store past its point of no return, w
     assert.equal(readFileSync(join(at.snapshot, "image"), "utf8"), IMAGE);
     assert.deepEqual(readFileSync(join(at.snapshot, "counts"), "utf8").split("\n").filter(Boolean), STORE_PARTS.map((part) => `${part}\t1`));
     assert.deepEqual(readFileSync(join(at.snapshot, "claims"), "utf8").split("\n").filter(Boolean).map((line) => line.split("\t")[0]).sort(), [...CLAIMS].sort());
+    assert.equal(readFileSync(join(at.snapshot, "floor"), "utf8"), "0\n");
     for (const name of ["restore.sh", "delete.sh"]) assert.equal(statSync(join(at.snapshot, name)).mode & 0o777, 0o700, name);
+    // Every directory of it written by its owner alone, the claims' own made 0777 among them.
+    for (const [path, held] of Object.entries(tree(at.snapshot))) if (held === null) assert.equal(statSync(join(at.snapshot, path)).mode & 0o022, 0, path);
     // The ConfigMap alasio status reads, made anew: the files the snapshot links, and what it copied, the volumes' indexes and
-    // infos, the masters' log and the filers' store's dump.
+    // infos, the masters' log and the filers' store's dump; and, once the upgrade is through, from when the compaction is paused.
     assert.deepEqual(readFileSync(join(at.snapshot, "volumes"), "utf8").split("\n").filter(Boolean).sort(), [1, 2, 3].map((id) => join(at.snapshot, VOLUME, "files", `neon_${id}.dat`)));
     const taken = readFileSync(join(at.snapshot, "taken"), "utf8").trim();
     const keepUntil = new Date(Date.parse(taken) + 48 * 3600_000).toISOString().replace(/\.000Z$/u, "Z");
     const copied = 16 * (1 + 2 + 3) + [1, 2, 3].reduce((total, id) => total + `{"version":3,"id":${id}}`.length, 0) + 700 + 900;
-    assert.deepEqual(at.configMaps(), [
+    const [deleted, made, patched, ...more] = at.configMaps();
+    assert.deepEqual([deleted, made, more], [
       `-n alasio delete configmap ${STORE_SNAPSHOT_CONFIGMAP} --ignore-not-found`,
-      `-n alasio create configmap ${STORE_SNAPSHOT_CONFIGMAP} --from-literal=path=${at.snapshot} --from-literal=taken=${taken} --from-literal=keepUntil=${keepUntil} --from-literal=copiedBytes=${copied} --from-file=volumes=${join(at.snapshot, "volumes")}`,
+      `-n alasio create configmap ${STORE_SNAPSHOT_CONFIGMAP} --from-literal=path=${at.snapshot} --from-literal=taken=${taken} --from-literal=keepUntil=${keepUntil} --from-literal=floorBytes=0 --from-literal=copiedBytes=${copied} --from-file=volumes=${join(at.snapshot, "volumes")}`,
+      [],
     ]);
+    assert.match(patched ?? "", new RegExp(`^-n alasio patch configmap ${STORE_SNAPSHOT_CONFIGMAP} --type merge -p \\{"data":\\{"vacuumPausedAt":"\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ"\\}\\}$`, "u"));
+    // The compaction paused once the store started again on 4.48, and again on 4.54, the upgrade's masters knowing nothing of it.
+    assert.deepEqual(at.shell(), ["lock", "volume.vacuum.disable", "unlock", "lock", "volume.vacuum.disable", "unlock"]);
     // Searchable by the owner as alasio status runs, down to the data files, none listable.
     for (const directory of [join(at.snapshot, ".."), at.snapshot, join(at.snapshot, VOLUME)]) assert.equal(statSync(directory).mode & 0o077, 0o011, directory);
-    assert.match(run.said, /checking that the upgrade can run[^\n]*\n[^\n]* checking that the object store can be snapshotted, to \S+\/object-store\n[^\n]* the object store's snapshot links 3 volumes' data and copies 26332 bytes, leaving \d+ free on \S+, of \d+\n[^\n]* past the point of no return[^\n]*\n[^\n]* stopping the object store[^\n]*\n/u);
-    assert.match(run.said, /(snapshotted the object store's data-alasio-seaweedfs-[a-z-]+-0, \d volumes' data linked and \d+ bytes copied, in \d+ s, to \S+\n[^\n]* ){3}the object store snapshotted, to \S+: restore\.sh there puts it back, its parts stopped; delete\.sh deletes it from \S+\n[^\n]* the object store started again, each part ready, on SeaweedFS 4\.48, as it was, for the upgrade to start it on 4\.54\n[^\n]* upgrading, from the cut-over/u);
-    // Once: a run again snapshots, stops and starts nothing.
+    assert.match(run.said, /checking that the upgrade can run[^\n]*\n[^\n]* checking that the object store can be snapshotted, to \S+\/object-store\n[^\n]* the object store's snapshot links 3 volumes' data and copies 26332 bytes, leaving \d+ free on \S+, of \d+\n[^\n]* pulling SeaweedFS 4\.54 onto this machine \(chrislusf\/seaweedfs:4\.54@sha256:[0-9a-f]{64}\), for the store's parts to start on it at once\n[^\n]* past the point of no return[^\n]*\n[^\n]* stopping the object store[^\n]*\n/u);
+    assert.match(run.said, new RegExp(`(snapshotted the object store's data-alasio-seaweedfs-[a-z-]+-0, \\d volumes' data linked and \\d+ bytes copied, in \\d+ s, to \\S+\\n[^\\n]* ){3}the object store snapshotted, to \\S+: restore\\.sh --disaster-recovery there puts it back, its parts stopped; delete\\.sh may delete it from \\S+\\n[^\\n]* the object store started again, each part ready, on ${IMAGE.replaceAll(".", "\\.")}\\n[^\\n]* the object store's compaction paused, so its snapshot holds no more of the disk\\n[^\\n]* upgrading, from the cut-over[^\\n]*\\n[^\\n]* the object store's compaction paused on SeaweedFS 4\\.54, until its snapshot is deleted\\n`, "u"));
+    // Once: a run again snapshots, stops and starts nothing, and pauses the compaction again, which a master started anew forgets.
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
-    assert.deepEqual([at.stopped(), at.started(), at.configMaps()], [[], [], []]);
+    assert.deepEqual([at.stopped(), at.started(), at.pulled()], [[], [], []]);
     assert.doesNotMatch(again.said, /snapshotted/u);
+    assert.deepEqual(at.shell(), ["lock", "volume.vacuum.disable", "unlock"]);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the cut-over pulls onto the machine the SeaweedFS its release pins, and refuses one it cannot pull before its point of no return, stopping nothing", () => {
+  const config = installConfigOf({}, { claude: false, target: "host" });
+  assert.ok(Result.isSuccess(config));
+  assert.equal(STORE_IMAGE, imageReference(config.success.objectStore.bundled.image));
+  const at = machine();
+  try {
+    at.store();
+    at.pullFails(true);
+    const refused = at.cutOver();
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.said, /FAILED: SeaweedFS 4\.54 \(chrislusf\/seaweedfs:4\.54@sha256:[0-9a-f]{64}\) could not be pulled onto this machine \(k3s crictl pull\), which the upgrade starts the object store's parts on: nothing is changed, and the cut-over run again pulls it again\n$/u);
+    assert.deepEqual([at.marks(), at.stopped(), at.ran()], [[], [], ["check"]]);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the cut-over whose snapshot of a claim fails at any step, or is not whole, fails before it is renamed whole or said taken, and a run again snapshots it again", () => {
+  const at = machine();
+  try {
+    at.store();
+    // A file it cannot read, as of a copy that fails: set -e holds no step of a function its caller tests.
+    chmodSync(join(at.volume(VOLUME), "neon_2.idx"), 0o000);
+    const unread = at.cutOver();
+    chmodSync(join(at.volume(VOLUME), "neon_2.idx"), 0o644);
+    assert.notEqual(unread.code, 0);
+    assert.match(unread.said, /FAILED: the claim data-alasio-seaweedfs-volume-0 could not be snapshotted whole from \S+, and its snapshot is not taken: the cut-over run again snapshots it again\n$/u);
+    // Failed by the copy itself, which says why, the snapshot never checked.
+    assert.match(unread.said, /cp: [^\n]*neon_2\.idx[^\n]*Permission denied/u);
+    assert.doesNotMatch(unread.said, /the snapshot of /u);
+    assert.equal(existsSync(join(at.snapshot, VOLUME)), false);
+    assert.equal(existsSync(join(at.snapshot, "..", "object-store-snapshotted")), false);
+    assert.deepEqual(at.configMaps(), []);
+    // A copy that says it copied, and did not, leaving the index linked to the store's own: not whole.
+    writeFileSync(join(at.bin, "cp"), `#!/bin/sh\ncase "$*" in *--remove-destination*neon_2.idx*) exit 0 ;; esac\nexec /bin/cp "$@"\n`, { mode: 0o755 });
+    const linked = at.cutOver();
+    assert.notEqual(linked.code, 0);
+    assert.match(linked.said, /the snapshot of \S+\/neon_2\.idx is linked to it, not a copy\n[^\n]* FAILED: the claim data-alasio-seaweedfs-volume-0 could not be snapshotted whole/u);
+    assert.equal(existsSync(join(at.snapshot, VOLUME)), false);
+    rmSync(join(at.bin, "cp"));
+    const again = at.cutOver();
+    assert.equal(again.code, 0, again.said);
+    assert.deepEqual(tree(join(at.snapshot, VOLUME, "files")), tree(at.volume(VOLUME)));
   } finally {
     at.remove();
   }
@@ -273,14 +379,14 @@ test("the cut-over refuses an object store's volume it cannot snapshot, one on a
     assert.match(unfloored.said, new RegExp(`FAILED: the snapshot of the object store [^\\n]* under the ${FLOOR_BYTES} kept free`, "u"));
     writeFileSync(join(at.bin, "df"), df(FLOOR_BYTES + needed), { mode: 0o755 });
     const floored = at.cutOver("before-the-point-of-no-return", { STORE_FLOOR_BYTES: "" });
-    assert.match(floored.said, new RegExp(`leaving ${FLOOR_BYTES} free on /, of ${FLOOR_BYTES + needed}\\n[^\\n]* FAILED: a failure injected before the point of no return\\n$`, "u"));
+    assert.match(floored.said, new RegExp(`leaving ${FLOOR_BYTES} free on /, of ${FLOOR_BYTES + needed}\\n[^\\n]* pulling SeaweedFS 4\\.54[^\\n]*\\n[^\\n]* FAILED: a failure injected before the point of no return\\n$`, "u"));
     assert.deepEqual([at.marks(), at.stopped()], [[], []]);
   } finally {
     at.remove();
   }
 });
 
-test("the cut-over whose object store's part is not ready again fails, and a run again starts it again, snapshotting nothing again; an upgrade failing leaves the store running as before", () => {
+test("the cut-over whose object store's part is not ready again fails, and a run again starts it again, snapshotting nothing again; an upgrade failing leaves the store running as its StatefulSets say, which it says, with its snapshot", () => {
   const at = machine();
   try {
     at.store();
@@ -294,24 +400,30 @@ test("the cut-over whose object store's part is not ready again fails, and a run
     at.upgradeFails(true);
     const failed = at.cutOver();
     assert.notEqual(failed.code, 0);
-    assert.match(failed.said, /FAILED: the upgrade failed \(upgrade\.log\): the cut-over run again goes on with it\n$/u);
+    assert.ok(failed.said.endsWith(`FAILED: the upgrade failed (upgrade.log), the object store running as its StatefulSets say, its masters on ${IMAGE}, its snapshot kept in ${at.snapshot}: the cut-over run again goes on with it\n`), failed.said);
     assert.doesNotMatch(failed.said, /snapshotted/u);
     assert.deepEqual([at.ran(), at.stopped(), at.started()], [["upgrade"], [], STARTED]);
     at.upgradeFails(false);
     const again = at.cutOver();
     assert.equal(again.code, 0, again.said);
     assert.deepEqual([at.ran(), at.stopped(), at.started()], [["upgrade"], [], STARTED]);
+    // The compaction that cannot be paused once the upgrade is through fails the run, which a run again pauses.
+    at.shellFails(true);
+    const unpaused = at.cutOver();
+    assert.notEqual(unpaused.code, 0);
+    assert.match(unpaused.said, /FAILED: the object store's compaction could not be paused on SeaweedFS 4\.54 \(volume\.vacuum\.disable, in weed shell\): the cut-over run again pauses it\n$/u);
   } finally {
     at.remove();
   }
 });
 
-test("the snapshot's restore, refused while the store runs, puts each claim back as it was snapshotted: what the store made since removed, each file but a volume's data copied back, each volume's data linked back where it was replaced, cut to its size and its head written back", () => {
+test("the snapshot's restore refuses unless told it is a disaster's recovery, while a part of the store is not stopped or runs, or as a symbolic link is in either tree, changing nothing; then stops Neon's writers and puts each claim back as it was snapshotted, saying it put back the store alone, and how Neon and workspace storage recover", () => {
   const at = machine();
   try {
     at.store();
     const before = Object.fromEntries(CLAIMS.map((claim) => [claim, tree(at.volume(claim))]));
     assert.equal(at.cutOver().code, 0);
+    at.stopped();
     const volume = at.volume(VOLUME);
     // What SeaweedFS 4.54 does to the volumes after. It appends to a volume's data, and to its index.
     appendFileSync(join(volume, "neon_1.dat"), bytesOf(4000, 50));
@@ -333,48 +445,137 @@ test("the snapshot's restore, refused while the store runs, puts each claim back
     // Its masters and its filers' store write their own state, a directory of it removed.
     rmSync(join(at.volume(MASTER), "m"), { recursive: true });
     writeFileSync(join(at.volume(FILER_STORE), "dump.rdb"), bytesOf(800, 80));
-    for (const claim of CLAIMS) assert.notDeepEqual(tree(at.volume(claim)), before[claim], claim);
-    // Refused while a part of the store runs, changing nothing.
+    const changed = Object.fromEntries(CLAIMS.map((claim) => [claim, tree(at.volume(claim))]));
+    for (const claim of CLAIMS) assert.notDeepEqual(changed[claim], before[claim], claim);
+    const unchanged = (said: string) => {
+      for (const claim of CLAIMS) assert.deepEqual(tree(at.volume(claim)), changed[claim], `${claim}: ${said}`);
+      assert.deepEqual(at.stopped(), [], said);
+    };
+    // Not told it is a disaster's recovery.
+    const untold = at.restore();
+    assert.notEqual(untold.code, 0);
+    assert.match(untold.said, /FAILED: this puts back the object store alone, as it was before its upgrade \(\S+\), dropping all it took since: Neon's safekeepers and pageservers, and workspace storage's metadata, would be ahead of it[^\n]*; run it as \S+\/restore\.sh --disaster-recovery where that is what the store's loss calls for\n$/u);
+    unchanged(untold.said);
+    // A part of the store not stopped, its StatefulSet at its count.
+    const counted = at.restore("--disaster-recovery");
+    assert.notEqual(counted.code, 0);
+    assert.match(counted.said, /FAILED: the object store's alasio-seaweedfs-filer is at 1 replicas: stop each of its parts first/u);
+    unchanged(counted.said);
+    // Each at none, but a pod of one runs still.
+    at.stop(STORE_PARTS);
     at.running("alasio-seaweedfs-volume-0");
-    const refused = at.restore();
+    const refused = at.restore("--disaster-recovery");
     assert.notEqual(refused.code, 0);
-    assert.match(refused.said, /FAILED: the object store runs \(pod\/alasio-seaweedfs-volume-0 \): stop each of its parts first/u);
-    assert.equal(statSync(join(volume, "neon_1.dat")).size, 14_000);
+    assert.match(refused.said, /FAILED: the object store runs \(pod\/alasio-seaweedfs-volume-0 \): wait until none of its parts' pods is left/u);
+    unchanged(refused.said);
     at.running();
-    const restored = at.restore();
+    // A symbolic link in a claim's directory, or in its snapshot, which it would write through.
+    for (const link of [join(volume, "neon_9.dat"), join(at.snapshot, VOLUME, "heads", "neon_9.dat")]) {
+      symlinkSync("/etc/hostname", link);
+      const linked = at.restore("--disaster-recovery");
+      rmSync(link);
+      assert.notEqual(linked.code, 0);
+      assert.match(linked.said, /FAILED: the claim data-alasio-seaweedfs-volume-0's snapshot \(\S+\) or its directory \(\S+\) holds a symbolic link, which the restore would write through: nothing is changed\n$/u);
+      unchanged(linked.said);
+    }
+    const restored = at.restore("--disaster-recovery");
     assert.equal(restored.code, 0, restored.said);
     for (const claim of CLAIMS) assert.deepEqual(tree(at.volume(claim)), before[claim], claim);
     // Each volume's data the snapshot's file again, as linked.
     for (const id of [1, 2, 3]) assert.equal(statSync(join(volume, `neon_${id}.dat`)).ino, statSync(join(at.snapshot, VOLUME, "files", `neon_${id}.dat`)).ino, `neon_${id}.dat`);
-    assert.ok(restored.said.includes(`the object store restored as it was snapshotted, ${readFileSync(join(at.snapshot, "taken"), "utf8").trim()}; start it on ${IMAGE}, as 10.0.27 ran it`), restored.said);
+    // Neon's writers stopped first, their counts kept.
+    assert.deepEqual(at.stopped(), NEON_WRITERS);
+    assert.equal(readFileSync(join(at.snapshot, "neon-counts"), "utf8"), NEON_WRITERS.map((part) => `${part}\t1\n`).join(""));
+    const said = restored.said;
+    assert.ok(said.includes(`the object store restored as it was snapshotted, ${readFileSync(join(at.snapshot, "taken"), "utf8").trim()}, and it alone: start it on ${IMAGE}, as 10.0.27 ran it`), said);
+    assert.ok(said.includes("its masters, started anew, compact it again"), said);
+    assert.ok(said.includes("Neon's safekeepers and pageservers are stopped (alasio-neon-safekeeper=1 alasio-neon-pageserver=1 ): what they hold is ahead of the store, so recover Neon's databases from their newest dump"), said);
+    assert.ok(said.includes("workspace storage's metadata, in its Valkey, is ahead of the store too: load its newest JuiceFS dump"), said);
   } finally {
     at.remove();
   }
 });
 
-test("the snapshot's deletion refuses until it has been kept 48 hours, then deletes it and its ConfigMap, and nothing of the store's", () => {
+test("the snapshot's deletion refuses until it has been kept 48 hours, but told --under-floor while its disk is under the floor and the store is ready, or as its ConfigMap names another; then resumes the compaction, deletes it, and its ConfigMap last, and nothing of the store's", () => {
   const at = machine();
   try {
     at.store();
-    assert.equal(at.cutOver().code, 0);
+    assert.equal(at.cutOver(undefined, { STORE_FLOOR_BYTES: "5000000" }).code, 0);
     at.configMaps();
+    at.shell();
+    const kept = () => {
+      assert.ok(existsSync(join(at.snapshot, VOLUME, "files", "neon_1.dat")));
+      assert.deepEqual([at.configMaps(), at.shell()], [[], []]);
+    };
     const early = at.deleteSnapshot();
     assert.notEqual(early.code, 0);
-    assert.match(early.said, /FAILED: the snapshot \S+ is kept until \S+, for the store to be seen well on SeaweedFS 4\.54 first: run this again then\n$/u);
+    assert.match(early.said, /FAILED: the snapshot \S+ is kept until \S+, for the store to be seen well on SeaweedFS 4\.54 first: run this again then, or sooner as \S+\/delete\.sh --under-floor, which deletes it only while its disk has less than 5000000 free and every part of the store is ready\n$/u);
+    kept();
+    // Told --under-floor: refused while its disk has room above the floor, and while a part of the store is not ready.
+    writeFileSync(join(at.bin, "df"), df(5_000_000), { mode: 0o755 });
+    const roomy = at.deleteSnapshot("--under-floor");
+    assert.notEqual(roomy.code, 0);
+    assert.match(roomy.said, /FAILED: --under-floor, but its disk has 5000000 free, not under the floor of 5000000: it is kept until \S+\n$/u);
+    kept();
+    writeFileSync(join(at.bin, "df"), df(4_999_999), { mode: 0o755 });
+    at.unready("alasio-seaweedfs-volume");
+    const unready = at.deleteSnapshot("--under-floor");
+    assert.notEqual(unready.code, 0);
+    assert.match(unready.said, /alasio-seaweedfs-volume has 1\/ of its replicas ready\nFAILED: --under-floor, but the object store is not ready, which its snapshot may yet be needed for: it is kept\n$/u);
+    kept();
+    at.unready();
+    // Its ConfigMap naming another snapshot.
+    at.named("/elsewhere/object-store");
+    const other = at.deleteSnapshot("--under-floor");
+    assert.notEqual(other.code, 0);
+    assert.match(other.said, /FAILED: the ConfigMap alasio-object-store-snapshot names the snapshot \/elsewhere\/object-store, not \S+: nothing is deleted\n$/u);
+    kept();
+    at.named(at.snapshot);
+    // The compaction not resumed, as the store does not answer: kept.
+    at.shellFails(true);
+    const unanswered = at.deleteSnapshot("--under-floor");
+    assert.notEqual(unanswered.code, 0);
+    assert.match(unanswered.said, /FAILED: the object store's compaction could not be resumed \(volume\.vacuum\.enable, in weed shell\), so the snapshot is kept: run this again once the store answers\n$/u);
     assert.ok(existsSync(join(at.snapshot, VOLUME, "files", "neon_1.dat")));
     assert.deepEqual(at.configMaps(), []);
-    // Taken 47 hours ago, refused still; 49 hours ago, deleted.
-    const ago = (hours: number) => writeFileSync(join(at.snapshot, "taken"), `${new Date(Date.now() - hours * 3600_000).toISOString()}\n`);
-    ago(47);
-    assert.notEqual(at.deleteSnapshot().code, 0);
-    ago(49);
-    const deleted = at.deleteSnapshot();
+    at.shell();
+    at.shellFails(false);
+    const deleted = at.deleteSnapshot("--under-floor");
     assert.equal(deleted.code, 0, deleted.said);
     assert.equal(existsSync(at.snapshot), false);
-    assert.deepEqual(at.configMaps(), [`-n alasio delete configmap ${STORE_SNAPSHOT_CONFIGMAP} --ignore-not-found`]);
+    assert.deepEqual([at.shell(), at.configMaps()], [["lock", "volume.vacuum.enable", "unlock"], [`-n alasio delete configmap ${STORE_SNAPSHOT_CONFIGMAP} --ignore-not-found`]]);
     assert.deepEqual(readFileSync(join(at.volume(VOLUME), "neon_1.dat")), bytesOf(10_000, 1));
   } finally {
     at.remove();
+  }
+});
+
+test("the snapshot's deletion, once it has been kept 48 hours, needs no word of the floor; and deletes the snapshot before its ConfigMap, which names it while it is there", () => {
+  for (const configMapFails of [false, true]) {
+    const at = machine();
+    try {
+      at.store();
+      assert.equal(at.cutOver().code, 0);
+      at.configMaps();
+      // Taken 47 hours ago, refused still; 49 hours ago, deleted.
+      const ago = (hours: number) => writeFileSync(join(at.snapshot, "taken"), `${new Date(Date.now() - hours * 3600_000).toISOString()}\n`);
+      ago(47);
+      assert.notEqual(at.deleteSnapshot().code, 0);
+      ago(49);
+      at.configMapsFail(configMapFails);
+      const deleted = at.deleteSnapshot();
+      assert.equal(existsSync(at.snapshot), false);
+      if (configMapFails) {
+        assert.notEqual(deleted.code, 0);
+        assert.match(deleted.said, /FAILED: the snapshot \S+ is deleted, but its ConfigMap alasio-object-store-snapshot could not be: delete it \(kubectl -n alasio delete configmap alasio-object-store-snapshot\)\n$/u);
+        assert.deepEqual(at.configMaps(), []);
+      } else {
+        assert.equal(deleted.code, 0, deleted.said);
+        assert.deepEqual(at.configMaps(), [`-n alasio delete configmap ${STORE_SNAPSHOT_CONFIGMAP} --ignore-not-found`]);
+      }
+    } finally {
+      at.remove();
+    }
   }
 });
 

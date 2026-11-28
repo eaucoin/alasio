@@ -180,7 +180,12 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
       try: () => storeSnapshotHolds(snapshot, snapshot.volumes.map((path) => statSync(path))),
       catch: (error) => ({ unread: error instanceof Error ? error.message : String(error) }),
     }).pipe(Effect.catch((unread) => Effect.succeed(unread)));
-    const snapshotSaid = snapshot === null || holds === null ? [] : [describeStoreSnapshot(snapshot, holds, new Date())];
+    // Each master, and when its master started, which forgets the compaction's pause as it does.
+    const started = Option.getOrElse(masters, () => []).map((pod) => ({
+      name: pod.metadata?.name ?? "",
+      startedAt: pod.status?.containerStatuses?.find(({ name }) => name === "master")?.state?.running?.startedAt?.toString() ?? null,
+    }));
+    const snapshotSaid = snapshot === null || holds === null ? [] : describeStoreSnapshot(snapshot, holds, started, shell, new Date());
     return [describeReplication(replication), ...[...disks, ...describeGrowthFrozen(frozen.flat().sort(), shell), ...snapshotSaid].map((line) => `  ${line}`)];
   });
 

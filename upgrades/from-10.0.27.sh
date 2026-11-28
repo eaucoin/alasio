@@ -73,56 +73,81 @@ accepted() { bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1; }
 # whole through a rename or an unlink, and its size and its first HEAD_BYTES are kept beside;
 # every other file, each volume's index and its info among them, and the masters' and the filers'
 # store's volumes whole, is copied. The restore cuts each data file back to its size and writes
-# its head back. The snapshot holds more of the disk as 4.54 compacts or deletes the volumes it
-# shares, each then its own, up to what they held, within days as the store compacts them all.
+# its head back. The snapshot would hold more of the disk as the store compacted or deleted the
+# volumes it shares, each then its own, up to what they held: so the store's compaction, which
+# its masters ask of the volume servers, deleting what is empty with it, is paused from as the
+# snapshot is taken (volume.vacuum.disable), on 4.48 and again once the upgrade has started the
+# masters on 4.54, until the snapshot is deleted or restored. A master that restarts meanwhile
+# forgets it, its pause held in its memory alone: `alasio status` says so, and how to pause it
+# again.
 #
-# Before the point of no return, changing nothing but making STORE_SNAPSHOT: each claim of the
-# parts that keep a volume, the masters', the volume servers' and the filers' store's, a
-# directory of this machine, as local-path keeps a volume, on the filesystem STORE_SNAPSHOT is
-# on, as a hard link is made on its own; and that filesystem's room for what the snapshot copies
-# and a tenth more, leaving STORE_FLOOR_BYTES (60 GiB, the floor this machine's owner keeps free)
-# free. A claim kept otherwise, or elsewhere, or too little room, fails the run there, saying
-# which. A store not bundled is neither stopped nor snapshotted.
+# Before the point of no return, changing nothing but making STORE_SNAPSHOT and pulling SeaweedFS
+# 4.54 (STORE_IMAGE) onto this machine, as the upgrade would, so that none of the store's parts
+# waits on the pull once it is stopped, nor an image that cannot be pulled fails it there: each
+# claim of the parts that keep a volume, the masters', the volume servers' and the filers'
+# store's, a directory of this machine, as local-path keeps a volume, on the filesystem
+# STORE_SNAPSHOT is on, as a hard link is made on its own; and that filesystem's room for what the
+# snapshot copies and a tenth more, leaving STORE_FLOOR_BYTES (60 GiB, the floor this machine's
+# owner keeps free) free. A claim kept otherwise, or elsewhere, too little room, or an image not
+# pulled, fails the run there, saying which. A store not bundled is neither stopped nor
+# snapshotted.
 #
 # Past it: the filers stopped first, which write to the other parts, then the volume servers, the
 # masters and the filers' store, each its pods gone, so that each volume is snapshotted as its
 # part left it; the image the masters ran kept (STORE_SNAPSHOT/image), and the count of each part
 # (OUT/object-store-replicas, as first read); each claim snapshotted to STORE_SNAPSHOT/<claim>,
-# into STORE_SNAPSHOT/<claim>.partial while it is, renamed once whole, how much it linked and
+# into STORE_SNAPSHOT/<claim>.partial while it is, each step of it failing it, and checked whole
+# against the claim before it is renamed: every file there, of its size, each volume's data the
+# very file and every other a copy, each data file's size and head kept. How much it linked and
 # copied and how long it took said: its files (files/), the size of each data file (sizes) and its
-# head (heads/). Then the restore and the deletion written beside (restore.sh, delete.sh), and the
-# ConfigMap STORE_SNAPSHOT_CONFIGMAP made, of where the snapshot is, when it was taken, until when
-# it is kept, what it copied and the data files it links, by which `alasio status` says it and how
-# much of the disk it holds of its own, as the owner, for which OUT, STORE_SNAPSHOT and each
-# claim's snapshot are made searchable by others, none listable; OUT/object-store-snapshotted
-# says it all was. Then each part started again, still on 4.48, at its count, in the order its
-# peers need: the filers' store, the masters, the volume servers, the filers, each ready before
-# the next starts. So the upgrade
-# finds the store answering, as it reads what it does of it before it changes it, the snapshots
-# the sandbox gateway names among them, and then starts each part again on 4.54, as its
-# StatefulSet says. The gateways run on, failing each request while the parts behind them are
-# stopped. Meanwhile Neon's safekeepers and pageservers keep on their own volumes what they would
-# upload, and upload it once the store answers; what else would write the store fails, and writes
-# again: workspace storage's JuiceFS, the node agents' snapshots, the lake's loads; and a read
-# fails, a Neon compute's of a layer its pageserver no longer holds among them. Run in a quiet
-# hour, nothing is lost. The snapshot is of the store as it was stopped: what is written once it
-# started again is in none, and a restore drops it, Neon's uploads among it. A run again
-# snapshots again what was not snapshotted whole, and once OUT/object-store-snapshotted says it
-# was, nothing, but starts each part again as above, which a part running at its count already
-# is; should the upgrade fail, the store runs on 4.48 as before.
+# head (heads/). Then the restore and the deletion written beside (restore.sh, delete.sh), every
+# directory of the snapshot written by root alone, and the ConfigMap STORE_SNAPSHOT_CONFIGMAP
+# made, of where the snapshot is, when it was taken, from when it may be deleted, the floor, what
+# it copied and the data files it links, by which `alasio status` says it and how much of the disk
+# it holds of its own, as the owner, for which OUT, STORE_SNAPSHOT and each claim's snapshot are
+# made searchable by others, none listable; OUT/object-store-snapshotted says it all was. Then
+# each part started again, at its count, in the order its peers need: the filers' store, the
+# masters, the volume servers, the filers, each ready, at the image its StatefulSet says, before
+# the next starts, and the compaction paused. So the upgrade finds the store answering, as it
+# reads what it does of it before it changes it, the snapshots the sandbox gateway names among
+# them, and then starts each part again on 4.54, as its StatefulSet says; once it is through, the
+# compaction paused again, and the ConfigMap says from when. The gateways run on, failing each
+# request while the parts behind them are stopped. Meanwhile Neon's safekeepers and pageservers
+# keep on their own volumes what they would upload, and upload it once the store answers; what
+# else would write the store fails, and writes again: workspace storage's JuiceFS, the node
+# agents' snapshots, the lake's loads; and a read fails, a Neon compute's of a layer its
+# pageserver no longer holds among them. Run in a quiet hour, nothing is lost. The snapshot is of
+# the store as it was stopped: what is written once it started again is in none, and a restore
+# drops it, Neon's uploads among it. A run again snapshots again what was not snapshotted whole,
+# and once OUT/object-store-snapshotted says it was, nothing, but starts each part again as above,
+# which a part running at its count already is, at the image it runs then, 4.54's where an upgrade
+# that failed got so far; should the upgrade fail, the store runs on what it ran when it did.
+#
+# The restore (restore.sh --disaster-recovery) puts back the object store alone: Neon's
+# safekeepers and pageservers, and workspace storage's metadata, in its Valkey, are ahead of it
+# then, holding what the store no longer does. So it refuses unless told it is a disaster's
+# recovery, and unless every part of the store is stopped, its StatefulSets at none; it refuses a
+# symbolic link in the snapshot or in a claim's directory, which it would write through; and it
+# stops Neon's safekeepers and pageservers, before it changes anything, keeping their counts
+# beside (neon-counts), for their recovery, which its last words say, before they run again.
 #
 # It takes as long as the stop, the parts' grace, 30 s, at most; the snapshot, seconds and the
 # copy of what is not a volume's data, the filers' store's the most; and the parts' start, a minute
 # or so. The snapshot is kept STORE_KEEP_SECONDS (48 h), for the store to be seen well on 4.54:
-# delete.sh deletes it then, and its ConfigMap, and refuses to before. Its pods' end, and each
-# part's being ready, is waited for STOP_WAIT_SECONDS (10 min) at most, the end looked for every
-# POLL_SECONDS (5).
+# delete.sh deletes it then, and its ConfigMap, resuming the compaction, and refuses to before,
+# but where told (--under-floor) as its filesystem has less free than the floor and every part of
+# the store is ready. Its pods' end, and each part's being ready, is waited for STOP_WAIT_SECONDS
+# (10 min) at most, the end looked for every POLL_SECONDS (5).
 
 NS=alasio
 STORE_SNAPSHOT=${STORE_SNAPSHOT:-$OUT/object-store}
 STORE_FLOOR_BYTES=${STORE_FLOOR_BYTES:-$((60 * 1024 * 1024 * 1024))}
 STORE_KEEP_SECONDS=$((48 * 60 * 60))
 STORE_SNAPSHOT_CONFIGMAP=alasio-object-store-snapshot
+# The image of SeaweedFS this release runs the store on, as its configuration pins it (cli/src/manifests/config.ts).
+STORE_IMAGE=chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15
+# What pulls an image onto this machine, as the node's container runtime keeps it: k3s's crictl.
+CRICTL=${CRICTL:-k3s crictl}
 HEAD_BYTES=8192
 STOP_WAIT_SECONDS=${STOP_WAIT_SECONDS:-600}
 POLL_SECONDS=${POLL_SECONDS:-5}
@@ -130,6 +155,10 @@ POLL_SECONDS=${POLL_SECONDS:-5}
 STORE_PARTS="alasio-seaweedfs-filer alasio-seaweedfs-volume alasio-seaweedfs-master alasio-seaweedfs-filer-store"
 # Their pods' components, as a selector's set.
 STORE_COMPONENTS="seaweedfs-filer,seaweedfs-volume,seaweedfs-master,seaweedfs-filer-store"
+# The gateways' Deployment, in whose buckets container weed shell runs.
+GATEWAYS=alasio-seaweedfs
+# Neon's parts that hold what they write to the store, by their StatefulSets, which a restore stops.
+NEON_WRITERS="alasio-neon-safekeeper alasio-neon-pageserver"
 k() { kubectl -n "$NS" "$@"; }
 # What the restore and the deletion say, and how they fail: on stderr, as they run on their own.
 say() { printf '%s\n' "$*" >&2; }
@@ -150,6 +179,16 @@ gone() {
 }
 # The filesystem the path '$1' is on, by where it is mounted.
 mounted_at() { df --output=target "$1" | tail -n 1; }
+# Runs the store's shell commands '$1', locked, in a gateway's buckets container, as its own shell reaches the masters and the
+# filers; fails where it cannot, or the shell says an error.
+store_shell() {
+  local made reach said
+  made=$(kubectl -n "$NS" get deployment "$GATEWAYS" -o jsonpath='{.spec.template.spec.containers[?(@.name=="buckets")].command[2]}') || return 1
+  reach=$(printf '%s\n' "$made" | grep -o -- '-master=[^ ]* -filer=[^ ;]*' | head -n 1)
+  [ -n "$reach" ] || return 1
+  said=$(printf 'lock\n%s\nunlock\n' "$1" | kubectl -n "$NS" exec -i "deployment/$GATEWAYS" -c buckets -- sh -c "weed shell $reach" 2>&1) || return 1
+  ! printf '%s\n' "$said" | grep -qi 'error'
+}
 # Each claim of the store's parts that keep a volume, and the directory of this machine it is, '<claim>\t<directory>' a line:
 # the claim of each pod of their StatefulSets, data-<StatefulSet>-<ordinal>; none where the store is not bundled.
 store_claims() {
@@ -190,25 +229,53 @@ store_snapshot_checked() {
   [ $((room - needed)) -ge "$STORE_FLOOR_BYTES" ] ||
     fail "the snapshot of the object store copies $needed bytes with a tenth more, which would leave $((room - needed)) of the $room free on $at, under the $STORE_FLOOR_BYTES kept free (STORE_FLOOR_BYTES): make room there"
   log "the object store's snapshot links $volumes volumes' data and copies $copies bytes, leaving $((room - needed)) free on $at, of $room"
+  log "pulling SeaweedFS 4.54 onto this machine ($STORE_IMAGE), for the store's parts to start on it at once"
+  $CRICTL pull "$STORE_IMAGE" >/dev/null ||
+    fail "SeaweedFS 4.54 ($STORE_IMAGE) could not be pulled onto this machine ($CRICTL pull), which the upgrade starts the object store's parts on: nothing is changed, and the cut-over run again pulls it again"
 }
 # The claim's directory '$1' snapshotted into '$2': its files (files/), each volume's data linked, every other file copied; the
-# size of each volume's data (sizes, '<path>\t<bytes>' a line, its path under the directory) and its first HEAD_BYTES (heads/).
+# size of each volume's data (sizes, '<path>\t<bytes>' a line, its path under the directory) and its first HEAD_BYTES (heads/);
+# each step failing it, and checked whole once done (store_snapshot_whole).
 store_snapshot_claim() {
-  local directory=$1 into=$2 path
-  mkdir -p "$into/heads"
+  local directory=$1 into=$2 path size
+  mkdir -p "$into/heads" || return 1
   # Every file linked, each directory made as it is; then every file but a volume's data copied over its link.
-  cp -al "$directory" "$into/files"
-  : >"$into/sizes"
+  cp -al "$directory" "$into/files" || return 1
+  : >"$into/sizes" || return 1
   while IFS= read -r -d '' path; do
     case "$path" in
       *.dat)
-        printf '%s\t%s\n' "$path" "$(stat -c %s "$directory/$path")" >>"$into/sizes"
-        mkdir -p "$(dirname "$into/heads/$path")"
-        head -c "$HEAD_BYTES" "$directory/$path" >"$into/heads/$path"
+        size=$(stat -c %s "$directory/$path") || return 1
+        printf '%s\t%s\n' "$path" "$size" >>"$into/sizes" || return 1
+        mkdir -p "$(dirname "$into/heads/$path")" || return 1
+        head -c "$HEAD_BYTES" "$directory/$path" >"$into/heads/$path" || return 1
         ;;
-      *) cp -a --remove-destination "$directory/$path" "$into/files/$path" ;;
+      *) cp -a --remove-destination "$directory/$path" "$into/files/$path" || return 1 ;;
     esac
   done < <(cd "$directory" && find . ! -type d -printf '%P\0')
+  store_snapshot_whole "$directory" "$into"
+}
+# Whether the snapshot '$2' of the claim's directory '$1' is whole: every file of the directory there, of its size, and no
+# other; each volume's data the very file, its size and its head kept; every other file a copy. Saying what is not.
+store_snapshot_whole() {
+  local directory=$1 into=$2 listed path size kept volumes=0
+  listed=$(cd "$directory" && find . ! -type d -printf '%P\t%s\n' | LC_ALL=C sort) || return 1
+  [ "$listed" = "$(cd "$into/files" && find . ! -type d -printf '%P\t%s\n' | LC_ALL=C sort)" ] ||
+    { log "the snapshot of $directory does not hold its files, each of its size, and no other"; return 1; }
+  while IFS=$'\t' read -r path size; do
+    [ -n "$path" ] || continue
+    case "$path" in
+      *.dat)
+        volumes=$((volumes + 1))
+        [ "$into/files/$path" -ef "$directory/$path" ] || { log "the snapshot of $directory/$path is not linked to it"; return 1; }
+        kept=$(awk -F '\t' -v path="$path" '$1 == path { print $2 }' "$into/sizes")
+        [ "$kept" = "$size" ] || { log "the snapshot of $directory/$path keeps its size as '$kept', not $size"; return 1; }
+        head -c "$HEAD_BYTES" "$directory/$path" | cmp -s - "$into/heads/$path" || { log "the snapshot of $directory/$path does not keep its head"; return 1; }
+        ;;
+      *) [ ! "$into/files/$path" -ef "$directory/$path" ] || { log "the snapshot of $directory/$path is linked to it, not a copy"; return 1; } ;;
+    esac
+  done <<<"$listed"
+  [ "$(wc -l <"$into/sizes")" -eq "$volumes" ] || { log "the snapshot of $directory keeps the sizes of other volumes than its $volumes"; return 1; }
 }
 store_snapshotted_past() {
   local listed
@@ -216,6 +283,8 @@ store_snapshotted_past() {
   [ -n "$listed" ] || return 0
   [ -e "$OUT/object-store-snapshotted" ] || store_snapshotted "$listed"
   store_started
+  store_shell volume.vacuum.disable || fail "the object store's compaction could not be paused (volume.vacuum.disable, in weed shell): the cut-over run again pauses it"
+  log "the object store's compaction paused, so its snapshot holds no more of the disk"
 }
 store_snapshotted() {
   local listed=$1 part count claim directory started linked copied taken
@@ -230,7 +299,7 @@ store_snapshotted() {
     mv "$OUT/object-store-replicas.read" "$OUT/object-store-replicas"
   fi
   mkdir -p "$STORE_SNAPSHOT"
-  k get statefulset alasio-seaweedfs-master -o jsonpath='{.spec.template.spec.containers[?(@.name=="master")].image}' >"$STORE_SNAPSHOT/image" ||
+  [ -s "$STORE_SNAPSHOT/image" ] || k get statefulset alasio-seaweedfs-master -o jsonpath='{.spec.template.spec.containers[?(@.name=="master")].image}' >"$STORE_SNAPSHOT/image" ||
     fail "the image of the object store's masters could not be read"
   for part in $STORE_PARTS; do
     k scale statefulset "$part" --replicas=0 >/dev/null || fail "the object store's $part could not be stopped"
@@ -240,7 +309,8 @@ store_snapshotted() {
     [ ! -d "$STORE_SNAPSHOT/$claim" ] || continue
     rm -rf "$STORE_SNAPSHOT/$claim.partial"
     started=$(date +%s)
-    store_snapshot_claim "$directory" "$STORE_SNAPSHOT/$claim.partial" || fail "the claim $claim could not be snapshotted from $directory: the cut-over run again snapshots it again"
+    store_snapshot_claim "$directory" "$STORE_SNAPSHOT/$claim.partial" ||
+      fail "the claim $claim could not be snapshotted whole from $directory, and its snapshot is not taken: the cut-over run again snapshots it again"
     mv "$STORE_SNAPSHOT/$claim.partial" "$STORE_SNAPSHOT/$claim"
     linked=$(wc -l <"$STORE_SNAPSHOT/$claim/sizes")
     copied=$(find "$STORE_SNAPSHOT/$claim/files" -type f ! -name '*.dat' -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')
@@ -248,6 +318,7 @@ store_snapshotted() {
   done <<<"$listed"
   printf '%s\n' "$listed" >"$STORE_SNAPSHOT/claims"
   cp "$OUT/object-store-replicas" "$STORE_SNAPSHOT/counts"
+  printf '%s\n' "$STORE_FLOOR_BYTES" >"$STORE_SNAPSHOT/floor"
   taken=$(date -u +%FT%TZ)
   printf '%s\n' "$taken" >"$STORE_SNAPSHOT/taken"
   store_snapshot_scripts
@@ -258,16 +329,27 @@ store_snapshotted() {
     awk -F '\t' -v files="$STORE_SNAPSHOT/$claim/files/" '{ print files $1 }' "$STORE_SNAPSHOT/$claim/sizes" >>"$STORE_SNAPSHOT/volumes"
     copied=$((copied + $(find "$STORE_SNAPSHOT/$claim/files" -type f ! -name '*.dat' -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')))
   done <<<"$listed"
-  # Stat-able by the owner, as `alasio status` runs: each directory down to the data files searchable, none listable.
+  # Every directory of it written by root alone; stat-able by the owner, as `alasio status` runs: each directory down to the
+  # data files searchable, none listable.
+  find "$STORE_SNAPSHOT" -type d -exec chmod go-w {} +
   chmod o+x,g+x "$OUT" "$STORE_SNAPSHOT"
   while IFS=$'\t' read -r claim directory; do chmod o+x,g+x "$STORE_SNAPSHOT/$claim"; done <<<"$listed"
   k delete configmap "$STORE_SNAPSHOT_CONFIGMAP" --ignore-not-found >/dev/null || fail "the ConfigMap $STORE_SNAPSHOT_CONFIGMAP could not be deleted to be made anew"
   k create configmap "$STORE_SNAPSHOT_CONFIGMAP" --from-literal=path="$STORE_SNAPSHOT" --from-literal=taken="$taken" \
     --from-literal=keepUntil="$(date -u -d "@$(($(date -d "$taken" +%s) + STORE_KEEP_SECONDS))" +%FT%TZ)" \
-    --from-literal=copiedBytes="$copied" --from-file=volumes="$STORE_SNAPSHOT/volumes" >/dev/null ||
+    --from-literal=floorBytes="$STORE_FLOOR_BYTES" --from-literal=copiedBytes="$copied" --from-file=volumes="$STORE_SNAPSHOT/volumes" >/dev/null ||
     fail "the ConfigMap $STORE_SNAPSHOT_CONFIGMAP, by which alasio status says the snapshot, could not be made"
   date -u +%FT%TZ >"$OUT/object-store-snapshotted"
-  log "the object store snapshotted, to $STORE_SNAPSHOT: restore.sh there puts it back, its parts stopped; delete.sh deletes it from $(date -u -d "@$(($(date -d "$taken" +%s) + STORE_KEEP_SECONDS))" +%FT%TZ)"
+  log "the object store snapshotted, to $STORE_SNAPSHOT: restore.sh --disaster-recovery there puts it back, its parts stopped; delete.sh may delete it from $(date -u -d "@$(($(date -d "$taken" +%s) + STORE_KEEP_SECONDS))" +%FT%TZ)"
+}
+# Once the upgrade is through: the compaction, which the masters it started on 4.54 do not know is paused, paused again, and the
+# ConfigMap told from when, which `alasio status` reads it by.
+store_vacuum_paused_after() {
+  [ -n "$(store_claims)" ] || return 0
+  store_shell volume.vacuum.disable || fail "the object store's compaction could not be paused on SeaweedFS 4.54 (volume.vacuum.disable, in weed shell): the cut-over run again pauses it"
+  k patch configmap "$STORE_SNAPSHOT_CONFIGMAP" --type merge -p "{\"data\":{\"vacuumPausedAt\":\"$(date -u +%FT%TZ)\"}}" >/dev/null ||
+    fail "the ConfigMap $STORE_SNAPSHOT_CONFIGMAP could not be told the compaction is paused: the cut-over run again tells it"
+  log "the object store's compaction paused on SeaweedFS 4.54, until its snapshot is deleted"
 }
 # The restore and the deletion, written into the snapshot, each a script of its own of what it needs of this one.
 store_snapshot_scripts() {
@@ -281,29 +363,70 @@ store_snapshot_scripts() {
       printf '#!/usr/bin/env bash\n'
       printf '# %s\n' "Written by the cut-over from 10.0.27 (upgrades/from-10.0.27.sh), which says what it does: run as root on the host, kubectl reaching the cluster."
       printf 'set -euo pipefail\n'
-      declare -p NS STORE_PARTS STORE_COMPONENTS STORE_KEEP_SECONDS STORE_SNAPSHOT_CONFIGMAP
-      declare -f say refuse store_restore store_snapshot_delete
-      printf '%s "$(dirname "$(readlink -f "$0")")"\n' "$run"
+      declare -p NS STORE_PARTS STORE_COMPONENTS STORE_KEEP_SECONDS STORE_SNAPSHOT_CONFIGMAP GATEWAYS NEON_WRITERS POLL_SECONDS STOP_WAIT_SECONDS
+      declare -f say refuse store_shell store_stopped_parts store_ready store_restore store_snapshot_delete
+      printf '%s "$(dirname "$(readlink -f "$0")")" "$@"\n' "$run"
     } >"$STORE_SNAPSHOT/$name.sh"
     chmod 0700 "$STORE_SNAPSHOT/$name.sh"
   done
 }
-# The store's volumes put back as the snapshot '$1' holds them, its parts stopped: what the store made since, in no snapshot,
-# removed, the volumes 4.54 made among them, of which the masters as they were know nothing; every file but a volume's data copied
-# back; and each volume's data, its file linked back where a compaction replaced it or a deletion removed it, cut to its size,
-# past which the store appended, and its head written back.
+# Whether each of the StatefulSets '$@' is stopped, at none and its pods gone, within STOP_WAIT_SECONDS; saying which is not.
+store_stopped_parts() {
+  local part waited
+  for part in "$@"; do
+    waited=0
+    # Its status's count of pods left out where it has none.
+    until case "$(kubectl -n "$NS" get statefulset "$part" -o jsonpath='{.spec.replicas}/{.status.replicas}')" in 0/ | 0/0) true ;; *) false ;; esac do
+      [ "$waited" -lt "$STOP_WAIT_SECONDS" ] || { say "$part is not stopped within $STOP_WAIT_SECONDS s"; return 1; }
+      sleep "$POLL_SECONDS"
+      waited=$((waited + POLL_SECONDS))
+    done
+  done
+}
+# Whether every part of the store is ready, each StatefulSet's and the gateways' replicas ready; saying which is not.
+store_ready() {
+  local part counts
+  for part in $STORE_PARTS; do
+    counts=$(kubectl -n "$NS" get statefulset "$part" -o jsonpath='{.spec.replicas}/{.status.readyReplicas}') || { say "$part could not be read"; return 1; }
+    [ "${counts%/*}" -gt 0 ] && [ "${counts%/*}" = "${counts#*/}" ] || { say "$part has $counts of its replicas ready"; return 1; }
+  done
+  counts=$(kubectl -n "$NS" get deployment "$GATEWAYS" -o jsonpath='{.spec.replicas}/{.status.readyReplicas}') || { say "$GATEWAYS could not be read"; return 1; }
+  [ "${counts%/*}" -gt 0 ] && [ "${counts%/*}" = "${counts#*/}" ] || { say "$GATEWAYS has $counts of its replicas ready"; return 1; }
+}
+# The store's volumes put back as the snapshot '$1' holds them, told '$2' --disaster-recovery, its parts stopped: Neon's writers
+# stopped first, their counts kept; what the store made since, in no snapshot, removed, the volumes 4.54 made among them, of which
+# the masters as they were know nothing; every file but a volume's data copied back; and each volume's data, its file linked back
+# where a compaction replaced it or a deletion removed it, cut to its size, past which the store appended, and its head written back.
 store_restore() {
-  local snapshot=$1 running claim directory files path size
+  local snapshot=$1 told=${2:-} part replicas running claim directory files path size count
   [ -r "$snapshot/claims" ] || refuse "$snapshot holds no snapshot of the object store"
+  [ "$told" = --disaster-recovery ] ||
+    refuse "this puts back the object store alone, as it was before its upgrade ($(cat "$snapshot/taken")), dropping all it took since: Neon's safekeepers and pageservers, and workspace storage's metadata, would be ahead of it, holding what it no longer does, so it stops Neon's for their recovery from their backups, and workspace storage's must be recovered too, before either runs again; run it as $0 --disaster-recovery where that is what the store's loss calls for"
+  for part in $STORE_PARTS; do
+    replicas=$(kubectl -n "$NS" get statefulset "$part" -o jsonpath='{.spec.replicas}') ||
+      refuse "the object store's $part could not be read, so whether it is stopped cannot be told: give kubectl k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
+    [ "$replicas" = 0 ] || refuse "the object store's $part is at $replicas replicas: stop each of its parts first, $STORE_PARTS (kubectl -n $NS scale statefulset <part> --replicas=0), until none of their pods is left"
+  done
   running=$(kubectl -n "$NS" get pod -l "app.kubernetes.io/component in ($STORE_COMPONENTS)" -o name) ||
-    refuse "the object store's pods could not be listed, so whether it is stopped cannot be told: give kubectl k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
-  [ -z "$running" ] ||
-    refuse "the object store runs ($(printf '%s ' $running)): stop each of its parts first, $STORE_PARTS (kubectl -n $NS scale statefulset <part> --replicas=0), until none of their pods is left"
+    refuse "the object store's pods could not be listed, so whether it is stopped cannot be told"
+  [ -z "$running" ] || refuse "the object store runs ($(printf '%s ' $running)): wait until none of its parts' pods is left"
   while IFS=$'\t' read -r claim directory; do
     files=$snapshot/$claim/files
     [ -d "$files" ] && [ -d "$directory" ] || refuse "the claim $claim's snapshot ($files) or its directory ($directory) is missing"
+    [ ! -L "$directory" ] && [ -z "$(find "$snapshot/$claim" "$directory" -type l -print -quit)" ] ||
+      refuse "the claim $claim's snapshot ($snapshot/$claim) or its directory ($directory) holds a symbolic link, which the restore would write through: nothing is changed"
+  done <"$snapshot/claims"
+  # Neon's writers stopped, as what they hold is ahead of the store once it is put back; their counts kept as first read.
+  [ -s "$snapshot/neon-counts" ] || for part in $NEON_WRITERS; do
+    count=$(kubectl -n "$NS" get statefulset "$part" -o jsonpath='{.spec.replicas}') || refuse "Neon's $part could not be read"
+    printf '%s\t%s\n' "$part" "$count" >>"$snapshot/neon-counts"
+  done
+  for part in $NEON_WRITERS; do kubectl -n "$NS" scale statefulset "$part" --replicas=0 >/dev/null || refuse "Neon's $part could not be stopped: nothing of the store is changed"; done
+  store_stopped_parts $NEON_WRITERS || refuse "Neon's writers did not stop: nothing of the store is changed"
+  while IFS=$'\t' read -r claim directory; do
+    files=$snapshot/$claim/files
     while IFS= read -r -d '' path; do
-      [ -e "$files/$path" ] || [ -L "$files/$path" ] || rm -rf -- "${directory:?}/$path"
+      [ -e "$files/$path" ] || rm -rf -- "${directory:?}/$path"
     done < <(cd "$directory" && find . -mindepth 1 -depth -printf '%P\0')
     while IFS= read -r -d '' path; do
       [ -d "$directory/$path" ] || { mkdir "$directory/$path" && chown --reference="$files/$path" "$directory/$path" && chmod --reference="$files/$path" "$directory/$path"; }
@@ -318,24 +441,36 @@ store_restore() {
     done <"$snapshot/$claim/sizes"
     say "restored the object store's $claim, in $directory"
   done <"$snapshot/claims"
-  say "the object store restored as it was snapshotted, $(cat "$snapshot/taken"); start it on $(cat "$snapshot/image"), as 10.0.27 ran it: each container of its StatefulSets and of its gateways' Deployment (alasio-seaweedfs) that runs SeaweedFS set to that image (kubectl -n $NS set image), then each part scaled back to its count ($(tr '\t\n' '= ' <"$snapshot/counts")), the filers' store, the masters, the volume servers, the filers in that order"
+  say "the object store restored as it was snapshotted, $(cat "$snapshot/taken"), and it alone: start it on $(cat "$snapshot/image"), as 10.0.27 ran it, each container of its StatefulSets and of its gateways' Deployment ($GATEWAYS) that runs SeaweedFS set to that image (kubectl -n $NS set image), then each part scaled back to its count ($(tr '\t\n' '= ' <"$snapshot/counts")), the filers' store, the masters, the volume servers, the filers in that order; its masters, started anew, compact it again. Neon's safekeepers and pageservers are stopped ($(tr '\t\n' '= ' <"$snapshot/neon-counts")): what they hold is ahead of the store, so recover Neon's databases from their newest dump, the backups claim's alasio.dump, newer than any the store holds, before they run again; and workspace storage's metadata, in its Valkey, is ahead of the store too: load its newest JuiceFS dump that the store holds (the backups bucket's) before workspaces are mounted again"
 }
-# The snapshot '$1' deleted, and its ConfigMap, once it has been kept STORE_KEEP_SECONDS; refused before.
+# The snapshot '$1' deleted, and its ConfigMap, the store's compaction resumed, once it has been kept STORE_KEEP_SECONDS; before,
+# only told '$2' --under-floor, as its filesystem has less free than the floor and every part of the store is ready.
 store_snapshot_delete() {
-  local snapshot=$1 taken kept
+  local snapshot=$1 told=${2:-} named taken kept free floor
   [ -r "$snapshot/taken" ] || refuse "$snapshot holds no snapshot of the object store"
+  named=$(kubectl -n "$NS" get configmap "$STORE_SNAPSHOT_CONFIGMAP" -o jsonpath='{.data.path}' --ignore-not-found) ||
+    refuse "the ConfigMap $STORE_SNAPSHOT_CONFIGMAP could not be read: give kubectl k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
+  [ -z "$named" ] || [ "$named" = "$snapshot" ] || refuse "the ConfigMap $STORE_SNAPSHOT_CONFIGMAP names the snapshot $named, not $snapshot: nothing is deleted"
   taken=$(date -d "$(cat "$snapshot/taken")" +%s)
   kept=$((taken + STORE_KEEP_SECONDS))
-  [ "$(date +%s)" -ge "$kept" ] ||
-    refuse "the snapshot $snapshot is kept until $(date -u -d "@$kept" +%FT%TZ), for the store to be seen well on SeaweedFS 4.54 first: run this again then"
+  if [ "$(date +%s)" -lt "$kept" ]; then
+    floor=$(cat "$snapshot/floor")
+    [ "$told" = --under-floor ] ||
+      refuse "the snapshot $snapshot is kept until $(date -u -d "@$kept" +%FT%TZ), for the store to be seen well on SeaweedFS 4.54 first: run this again then, or sooner as $0 --under-floor, which deletes it only while its disk has less than $floor free and every part of the store is ready"
+    free=$(df --output=avail -B1 "$snapshot" | tail -n 1)
+    [ "$free" -lt "$floor" ] || refuse "--under-floor, but its disk has $free free, not under the floor of $floor: it is kept until $(date -u -d "@$kept" +%FT%TZ)"
+    store_ready || refuse "--under-floor, but the object store is not ready, which its snapshot may yet be needed for: it is kept"
+  fi
+  store_shell volume.vacuum.enable || refuse "the object store's compaction could not be resumed (volume.vacuum.enable, in weed shell), so the snapshot is kept: run this again once the store answers"
+  rm -rf -- "$snapshot" || refuse "$snapshot could not be deleted whole"
   kubectl -n "$NS" delete configmap "$STORE_SNAPSHOT_CONFIGMAP" --ignore-not-found >/dev/null ||
-    refuse "the ConfigMap $STORE_SNAPSHOT_CONFIGMAP could not be deleted: give kubectl k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
-  rm -rf -- "$snapshot"
-  say "deleted the object store's snapshot $snapshot, taken $(date -u -d "@$taken" +%FT%TZ)"
+    refuse "the snapshot $snapshot is deleted, but its ConfigMap $STORE_SNAPSHOT_CONFIGMAP could not be: delete it (kubectl -n $NS delete configmap $STORE_SNAPSHOT_CONFIGMAP)"
+  say "deleted the object store's snapshot $snapshot, taken $(date -u -d "@$taken" +%FT%TZ), its compaction resumed"
 }
-# Each part started again at the count kept of it, those its peers need first: the reverse of the order they are stopped in.
+# Each part started again at the count kept of it, those its peers need first: the reverse of the order they are stopped in; each
+# waited on as its StatefulSet says it runs, at the image it says, 4.54's where an upgrade that failed got so far.
 store_started() {
-  local part count
+  local part count image
   for part in $(printf '%s\n' $STORE_PARTS | tac); do
     count=$(awk -F '\t' -v part="$part" '$1 == part { print $2 }' "$OUT/object-store-replicas")
     [ -n "$count" ] || fail "$OUT/object-store-replicas keeps no count of the object store's $part"
@@ -343,7 +478,14 @@ store_started() {
     k rollout status statefulset "$part" --timeout="${STOP_WAIT_SECONDS}s" >/dev/null ||
       fail "the object store's $part was not ready within ${STOP_WAIT_SECONDS} s of its start (kubectl -n $NS describe statefulset $part): the cut-over run again starts it"
   done
-  log "the object store started again, each part ready, on SeaweedFS 4.48, as it was, for the upgrade to start it on 4.54"
+  image=$(k get statefulset alasio-seaweedfs-master -o jsonpath='{.spec.template.spec.containers[?(@.name=="master")].image}') ||
+    fail "the image of the object store's masters could not be read"
+  log "the object store started again, each part ready, on $image"
+}
+# What an upgrade that failed leaves of the bundled store: the image its masters run, as their StatefulSet says, and its snapshot.
+store_said() {
+  [ -e "$OUT/object-store-snapshotted" ] || return 0
+  printf ', the object store running as its StatefulSets say, its masters on %s, its snapshot kept in %s' "$(k get statefulset alasio-seaweedfs-master -o jsonpath='{.spec.template.spec.containers[?(@.name=="master")].image}' 2>/dev/null || echo 'what could not be read')" "$STORE_SNAPSHOT"
 }
 # END the object store snapshotted before SeaweedFS 4.54.
 
@@ -374,10 +516,11 @@ if [ ! -e "$OUT/upgraded" ]; then
   store_snapshotted_past
   log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
   printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
-  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it"
+  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" || fail "the upgrade failed (upgrade.log)$(store_said): the cut-over run again goes on with it"
   date -u +%FT%TZ >"$OUT/upgraded"
 fi
 [ "${FAIL_AT:-}" != after-the-upgrade ] || fail "a failure injected once the upgrade was through"
+store_vacuum_paused_after
 
 log "upgraded at $(cat "$OUT/upgraded")"
 log "through"
