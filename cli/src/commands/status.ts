@@ -185,7 +185,7 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
       name: pod.metadata?.name ?? "",
       startedAt: pod.status?.containerStatuses?.find(({ name }) => name === "master")?.state?.running?.startedAt?.toString() ?? null,
     }));
-    const snapshotSaid = snapshot === null || holds === null ? [] : describeStoreSnapshot(snapshot, holds, started, shell, new Date());
+    const snapshotSaid = snapshot === null || holds === null ? [] : describeStoreSnapshot(snapshot, holds, started, new Date());
     return [describeReplication(replication), ...[...disks, ...describeGrowthFrozen(frozen.flat().sort(), shell), ...snapshotSaid].map((line) => `  ${line}`)];
   });
 

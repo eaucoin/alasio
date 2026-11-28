@@ -144,19 +144,19 @@ export interface StoreMaster {
  * What `status` says of `snapshot`, as of `now`: where it is and when it was taken, what of the
  * disk it holds of its own as `holds` says, or why that is not known; whether the store's
  * compaction is paused, which a master of `masters` started since its pause forgets, its pause
- * held in its memory alone, and how to pause it again in weed shell as `shell` runs it; from
+ * held in its memory alone, and how to pause it again, telling its ConfigMap so; from
  * when it may be deleted, by a deletion run by hand, and sooner by its override; and what its
  * restore puts back, the store alone, Neon and workspace storage left to their own recovery.
  */
-export function describeStoreSnapshot(snapshot: StoreSnapshot, holds: number | { readonly unread: string }, masters: readonly StoreMaster[], shell: string, now: Date): string[] {
+export function describeStoreSnapshot(snapshot: StoreSnapshot, holds: number | { readonly unread: string }, masters: readonly StoreMaster[], now: Date): string[] {
   const { path, taken, keepUntil, floorBytes, vacuumPausedAt } = snapshot;
   const held = typeof holds === "number"
     ? `holding ${memoryText(holds)} of the disk of its own`
     : `what it holds of the disk not read: ${holds.unread}`;
   const restarted = vacuumPausedAt === null ? [] : masters.filter(({ startedAt }) => startedAt === null || Date.parse(startedAt) > Date.parse(vacuumPausedAt));
-  const pauseAgain = `pause it again in weed shell (${shell}) with lock, volume.vacuum.disable and unlock`;
+  const pauseAgain = `pause it again with sudo ${path}/pause.sh, which tells this status so`;
   const vacuum = vacuumPausedAt === null
-    ? `its compaction not said paused on SeaweedFS 4.54, so the snapshot may grow as the store compacts the volumes it shares: the cut-over run again pauses it, or ${pauseAgain}`
+    ? `its compaction not said paused on SeaweedFS 4.54, so the snapshot may grow as the store compacts the volumes it shares: ${pauseAgain}`
     : restarted.length > 0
     ? `its compaction running again, paused at ${vacuumPausedAt} and forgotten by ${restarted.map(({ name, startedAt }) => (startedAt === null ? `${name}, which does not run` : `${name}, started at ${startedAt}`)).join(", ")}: the snapshot grows as the store compacts the volumes it shares; ${pauseAgain}`
     : `its compaction paused since ${vacuumPausedAt}, so the snapshot grows only as the store deletes what it shares`;

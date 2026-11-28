@@ -45,9 +45,8 @@ test("reads the snapshot a cut-over took of the store's volumes from its ConfigM
   // What it copied, and each data file the store no longer links: one compacted away, of 2 GiB on the disk; one shared still.
   assert.equal(storeSnapshotHolds(snapshot, [{ nlink: 1, blocks: 4 * 1024 ** 2 }, { nlink: 2, blocks: 8 }]), 1_048_576 + 2 * 1024 ** 3);
   const held = 1_048_576 + 2 * 1024 ** 3;
-  const shell = "kubectl -n alasio exec -it deployment/alasio-seaweedfs -c buckets -- weed shell";
   const masters = [{ name: "alasio-seaweedfs-master-0", startedAt: "2026-11-26T19:35:00Z" }];
-  const [first, vacuum, deletion, restore, ...more] = describeStoreSnapshot(snapshot, held, masters, shell, new Date("2026-11-27T00:00:00Z"));
+  const [first, vacuum, deletion, restore, ...more] = describeStoreSnapshot(snapshot, held, masters, new Date("2026-11-27T00:00:00Z"));
   assert.deepEqual(more, []);
   assert.equal(first, "its snapshot, taken 2026-11-26T19:28:22Z before its upgrade to SeaweedFS 4.54, at /srv/cut-over/object-store: holding 2.0 GiB of the disk of its own");
   assert.equal(vacuum, "  its compaction paused since 2026-11-26T19:40:00Z, so the snapshot grows only as the store deletes what it shares");
@@ -55,12 +54,12 @@ test("reads the snapshot a cut-over took of the store's volumes from its ConfigM
   assert.equal(deletion, "  it may be deleted from 2026-11-28T19:28:22Z, by sudo /srv/cut-over/object-store/delete.sh, run by hand; before, by sudo /srv/cut-over/object-store/delete.sh --under-floor, only while its disk has less than 60.0 GiB free and every part of the store is ready, which resumes the compaction");
   assert.match(restore ?? "", /^ {2}sudo \/srv\/cut-over\/object-store\/restore\.sh --disaster-recovery puts back the object store alone, as it was before its upgrade, its parts stopped: Neon's safekeepers and pageservers, and workspace storage's metadata, are ahead of it then, so it stops Neon's, whose databases are recovered from their newest dump, and workspace storage's metadata from its newest JuiceFS dump, before either runs again$/u);
   // A master started since the pause, or not running, has forgotten it: said, and how to pause it again.
-  const [, forgotten] = describeStoreSnapshot(snapshot, held, [{ name: "alasio-seaweedfs-master-0", startedAt: "2026-11-26T22:00:00Z" }, { name: "alasio-seaweedfs-master-1", startedAt: null }], shell, new Date("2026-11-27T00:00:00Z"));
-  assert.equal(forgotten, `  its compaction running again, paused at 2026-11-26T19:40:00Z and forgotten by alasio-seaweedfs-master-0, started at 2026-11-26T22:00:00Z, alasio-seaweedfs-master-1, which does not run: the snapshot grows as the store compacts the volumes it shares; pause it again in weed shell (${shell}) with lock, volume.vacuum.disable and unlock`);
-  const [, never] = describeStoreSnapshot(unpaused, held, masters, shell, new Date("2026-11-27T00:00:00Z"));
-  assert.match(never ?? "", /^ {2}its compaction not said paused on SeaweedFS 4\.54, so the snapshot may grow as the store compacts the volumes it shares: the cut-over run again pauses it, or pause it again in weed shell/u);
+  const [, forgotten] = describeStoreSnapshot(snapshot, held, [{ name: "alasio-seaweedfs-master-0", startedAt: "2026-11-26T22:00:00Z" }, { name: "alasio-seaweedfs-master-1", startedAt: null }], new Date("2026-11-27T00:00:00Z"));
+  assert.equal(forgotten, `  its compaction running again, paused at 2026-11-26T19:40:00Z and forgotten by alasio-seaweedfs-master-0, started at 2026-11-26T22:00:00Z, alasio-seaweedfs-master-1, which does not run: the snapshot grows as the store compacts the volumes it shares; pause it again with sudo /srv/cut-over/object-store/pause.sh, which tells this status so`);
+  const [, never] = describeStoreSnapshot(unpaused, held, masters, new Date("2026-11-27T00:00:00Z"));
+  assert.match(never ?? "", /^ {2}its compaction not said paused on SeaweedFS 4\.54, so the snapshot may grow as the store compacts the volumes it shares: pause it again with sudo \/srv\/cut-over\/object-store\/pause\.sh, which tells this status so$/u);
   // Past its time, and its size unread.
-  const [late, , due] = describeStoreSnapshot(snapshot, { unread: "EACCES: permission denied, stat '/srv/a.dat'" }, masters, shell, new Date("2026-11-29T00:00:00Z"));
+  const [late, , due] = describeStoreSnapshot(snapshot, { unread: "EACCES: permission denied, stat '/srv/a.dat'" }, masters, new Date("2026-11-29T00:00:00Z"));
   assert.match(late ?? "", /: what it holds of the disk not read: EACCES: permission denied, stat '\/srv\/a\.dat'$/u);
   assert.equal(due, "  it may be deleted, since 2026-11-28T19:28:22Z: sudo /srv/cut-over/object-store/delete.sh, run by hand, deletes it, which resumes the compaction");
 });

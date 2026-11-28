@@ -788,7 +788,7 @@ if (inShard("upgrade")) {
         check: async () => {
           assert.deepEqual(await inEveryBucket(PROBE_GET), probes);
           const listed = (await inCutOverRecord("ls -1 object-store")).split("\n").filter(Boolean).sort();
-          assert.deepEqual(listed, [...STORE_CLAIMS, "claims", "counts", "delete.sh", "floor", "image", "restore.sh", "taken", "volumes"].sort());
+          assert.deepEqual(listed, [...STORE_CLAIMS, "claims", "counts", "delete.sh", "floor", "image", "pause.sh", "restore.sh", "taken", "volumes"].sort());
           const events = await inCutOverRecord("cat events.log");
           for (const claim of STORE_CLAIMS) assert.match(events, new RegExp(`snapshotted the object store's ${claim}, \\d+ volumes' data linked and \\d+ bytes copied, in \\d+ s`, "u"), claim);
           assert.match(events, /the object store snapshotted, to \S+: restore\.sh --disaster-recovery there puts it back, its parts stopped; delete\.sh may delete it from \S+\n[^\n]* the object store started again, each part ready, on chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}\n[^\n]* the object store's compaction paused, so its snapshot holds no more of the disk\n[^\n]* upgrading, from the cut-over[^\n]*\n(?:[\s\S]*\n)?[^\n]* the object store's compaction paused on SeaweedFS 4\.54, until its snapshot is deleted\n/u);

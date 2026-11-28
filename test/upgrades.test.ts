@@ -16,6 +16,7 @@ import { Result } from "effect";
 
 import { installConfigOf } from "../cli/src/config.ts";
 import { imageReference } from "../cli/src/images.ts";
+import { componentName, neonName } from "../cli/src/manifests/common.ts";
 import { STORE_SNAPSHOT_CONFIGMAP } from "../cli/src/object-store.ts";
 
 const SCRIPT = fileURLToPath(new URL("../upgrades/from-10.0.27.sh", import.meta.url));
@@ -84,13 +85,16 @@ function machine() {
   const configMaps = join(root, "config-maps");
   const named = join(root, "named");
   const configMapsFail = join(root, "config-maps-fail");
+  const changes = join(root, "changes");
+  const unreadable = join(root, "unreadable");
+  const active = join(root, "active");
   const shell = join(root, "shell");
   const shellFails = join(root, "shell-fails");
   const pulled = join(root, "pulled");
   const pullFails = join(root, "pull-fails");
   const upgradeFails = join(root, "upgrade-fails");
   const config = join(root, "config.json");
-  for (const directory of [bin, volumes, counts]) mkdirSync(directory);
+  for (const directory of [bin, volumes, counts, active]) mkdirSync(directory);
   writeFileSync(namespaces, "");
   writeFileSync(claims, "");
   writeFileSync(config, JSON.stringify({ target: { host: {} }, install: { host: { enabled: true } } }), { mode: 0o600 });
@@ -101,7 +105,9 @@ case "$*" in
   "get namespace -l alasio.dev/branch -o jsonpath="*) cat '${namespaces}' ;;
   "-n alasio get pvc -o jsonpath="*) cat '${claims}' ;;
   "get pv "*" -o jsonpath="*) printf '%s' '${volumes}'/"$3" ;;
-  "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}") cat '${counts}'/"$5" 2>/dev/null || echo 1 ;;
+  "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}") ! grep -qx "$5" '${unreadable}' 2>/dev/null && { cat '${counts}'/"$5" 2>/dev/null || echo 1; } ;;
+  "-n alasio patch cronjob "*" --type merge -p "*|"-n alasio delete job "*" --cascade=foreground --wait") echo "$*" >>'${changes}' ;;
+  "-n alasio get cronjob "*" -o jsonpath={range .status.active"*) cat '${active}'/"$5" 2>/dev/null || true ;;
   "-n alasio get statefulset alasio-seaweedfs-master -o jsonpath={.spec.template.spec.containers[?(@.name==\\"master\\")].image}") printf '%s' '${IMAGE}' ;;
   "-n alasio get statefulset "*" -o jsonpath={.spec.replicas}/{.status.replicas}")
     count=$(cat '${counts}'/"$5" 2>/dev/null || echo 1); echo "$count/$count" ;;
@@ -117,6 +123,7 @@ case "$*" in
   "-n alasio scale statefulset "*" --replicas="*)
     count=\${6#--replicas=}
     echo "$count" >'${counts}'/"$5"
+    echo "$*" >>'${changes}'
     if [ "$count" = 0 ]; then echo "$5" >>'${stopped}'; else echo "$5" >>'${started}'; fi ;;
   "-n alasio rollout status statefulset "*" --timeout="*) ! grep -qx "$6" '${unready}' 2>/dev/null ;;
   "-n alasio get pod -l app.kubernetes.io/component in ("*") -o name") cat '${running}' 2>/dev/null || true ;;
@@ -149,7 +156,7 @@ esac
     return { code: run.status, said: run.stderr };
   };
   /** The script `name` the snapshot carries, run as the machine's root runs it: what it came to. */
-  const carried = (name: "restore.sh" | "delete.sh", ...args: string[]) => {
+  const carried = (name: "restore.sh" | "delete.sh" | "pause.sh", ...args: string[]) => {
     const run = spawnSync("bash", [join(snapshot, name), ...args], { encoding: "utf8", env: { PATH: pathOf(bin) } });
     return { code: run.status, said: run.stderr };
   };
@@ -207,6 +214,13 @@ esac
     replicas: () => readFileSync(join(out, "object-store-replicas"), "utf8").split("\n").filter(Boolean),
     restore: (...args: string[]) => carried("restore.sh", ...args),
     deleteSnapshot: (...args: string[]) => carried("delete.sh", ...args),
+    pause: () => carried("pause.sh"),
+    /** What kubectl was asked to change of the store's and Neon's StatefulSets, the CronJobs and their Jobs, in order, since the last time it was asked. */
+    changes: since(changes),
+    /** Makes the count of the StatefulSet `part` unreadable, or, given none, every one readable. */
+    unreadable: (part?: string) => (part === undefined ? rmSync(unreadable, { force: true }) : writeFileSync(unreadable, `${part}\n`)),
+    /** Makes the Jobs `jobs` of the CronJob `cronJob` run. */
+    active: (cronJob: string, jobs: readonly string[]) => writeFileSync(join(active, cronJob), jobs.map((job) => `${job}\n`).join("")),
     /** Stops each part of the store `parts` names, as one would by hand: its StatefulSet at none. */
     stop: (parts: readonly string[]) => { for (const part of parts) writeFileSync(join(counts, part), "0\n"); },
     configMapsFail: (fails: boolean) => (fails ? writeFileSync(configMapsFail, "") : rmSync(configMapsFail, { force: true })),
@@ -268,9 +282,20 @@ test("the cut-over stops the bundled object store past its point of no return, w
     assert.deepEqual(readFileSync(join(at.snapshot, "counts"), "utf8").split("\n").filter(Boolean), STORE_PARTS.map((part) => `${part}\t1`));
     assert.deepEqual(readFileSync(join(at.snapshot, "claims"), "utf8").split("\n").filter(Boolean).map((line) => line.split("\t")[0]).sort(), [...CLAIMS].sort());
     assert.equal(readFileSync(join(at.snapshot, "floor"), "utf8"), "0\n");
-    for (const name of ["restore.sh", "delete.sh"]) assert.equal(statSync(join(at.snapshot, name)).mode & 0o777, 0o700, name);
-    // Every directory of it written by its owner alone, the claims' own made 0777 among them.
-    for (const [path, held] of Object.entries(tree(at.snapshot))) if (held === null) assert.equal(statSync(join(at.snapshot, path)).mode & 0o022, 0, path);
+    for (const name of ["restore.sh", "delete.sh", "pause.sh"]) assert.equal(statSync(join(at.snapshot, name)).mode & 0o777, 0o700, name);
+    // Every directory of it, and OUT, written by its owner alone, the claims' own made 0777 among them, and searchable by the
+    // configuration owner's group alone; no file it copied read by any other account; each volume's data, which it shares with
+    // the store, as the store keeps it.
+    for (const [path, held] of Object.entries({ "..": null, ...tree(at.snapshot) })) {
+      const { mode, gid } = statSync(join(at.snapshot, path));
+      if (held === null) {
+        assert.deepEqual([mode & 0o077, gid], [0o010, process.getgid?.()], path);
+      } else if (/(^|\/)files\/[^/]*\.dat$/u.test(path)) {
+        assert.equal(mode & 0o777, 0o644, path);
+      } else {
+        assert.equal(mode & 0o007, 0, path);
+      }
+    }
     // The ConfigMap alasio status reads, made anew: the files the snapshot links, and what it copied, the volumes' indexes and
     // infos, the masters' log and the filers' store's dump; and, once the upgrade is through, from when the compaction is paused.
     assert.deepEqual(readFileSync(join(at.snapshot, "volumes"), "utf8").split("\n").filter(Boolean).sort(), [1, 2, 3].map((id) => join(at.snapshot, VOLUME, "files", `neon_${id}.dat`)));
@@ -286,8 +311,6 @@ test("the cut-over stops the bundled object store past its point of no return, w
     assert.match(patched ?? "", new RegExp(`^-n alasio patch configmap ${STORE_SNAPSHOT_CONFIGMAP} --type merge -p \\{"data":\\{"vacuumPausedAt":"\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ"\\}\\}$`, "u"));
     // The compaction paused once the store started again on 4.48, and again on 4.54, the upgrade's masters knowing nothing of it.
     assert.deepEqual(at.shell(), ["lock", "volume.vacuum.disable", "unlock", "lock", "volume.vacuum.disable", "unlock"]);
-    // Searchable by the owner as alasio status runs, down to the data files, none listable.
-    for (const directory of [join(at.snapshot, ".."), at.snapshot, join(at.snapshot, VOLUME)]) assert.equal(statSync(directory).mode & 0o077, 0o011, directory);
     assert.match(run.said, /checking that the upgrade can run[^\n]*\n[^\n]* checking that the object store can be snapshotted, to \S+\/object-store\n[^\n]* the object store's snapshot links 3 volumes' data and copies 26332 bytes, leaving \d+ free on \S+, of \d+\n[^\n]* pulling SeaweedFS 4\.54 onto this machine \(chrislusf\/seaweedfs:4\.54@sha256:[0-9a-f]{64}\), for the store's parts to start on it at once\n[^\n]* past the point of no return[^\n]*\n[^\n]* stopping the object store[^\n]*\n/u);
     assert.match(run.said, new RegExp(`(snapshotted the object store's data-alasio-seaweedfs-[a-z-]+-0, \\d volumes' data linked and \\d+ bytes copied, in \\d+ s, to \\S+\\n[^\\n]* ){3}the object store snapshotted, to \\S+: restore\\.sh --disaster-recovery there puts it back, its parts stopped; delete\\.sh may delete it from \\S+\\n[^\\n]* the object store started again, each part ready, on ${IMAGE.replaceAll(".", "\\.")}\\n[^\\n]* the object store's compaction paused, so its snapshot holds no more of the disk\\n[^\\n]* upgrading, from the cut-over[^\\n]*\\n[^\\n]* the object store's compaction paused on SeaweedFS 4\\.54, until its snapshot is deleted\\n`, "u"));
     // Once: a run again snapshots, stops and starts nothing, and pauses the compaction again, which a master started anew forgets.
@@ -411,7 +434,7 @@ test("the cut-over whose object store's part is not ready again fails, and a run
     at.shellFails(true);
     const unpaused = at.cutOver();
     assert.notEqual(unpaused.code, 0);
-    assert.match(unpaused.said, /FAILED: the object store's compaction could not be paused on SeaweedFS 4\.54 \(volume\.vacuum\.disable, in weed shell\): the cut-over run again pauses it\n$/u);
+    assert.match(unpaused.said, /the store's shell did not pause its compaction \(volume\.vacuum\.disable\)\n[^\n]* FAILED: the object store's compaction could not be paused on SeaweedFS 4\.54: the cut-over run again pauses it\n$/u);
   } finally {
     at.remove();
   }
@@ -576,6 +599,65 @@ test("the snapshot's deletion, once it has been kept 48 hours, needs no word of 
     } finally {
       at.remove();
     }
+  }
+});
+
+test("the snapshot's pause, for a master that restarted and forgot the compaction's pause, pauses it again and tells the ConfigMap from when; failing as the store does not answer", () => {
+  const at = machine();
+  try {
+    at.store();
+    assert.equal(at.cutOver().code, 0);
+    at.shell();
+    at.configMaps();
+    const paused = at.pause();
+    assert.equal(paused.code, 0, paused.said);
+    assert.match(paused.said, /^the object store's compaction paused again, until its snapshot \S+ is deleted\n$/u);
+    assert.deepEqual(at.shell(), ["lock", "volume.vacuum.disable", "unlock"]);
+    const [patched, ...more] = at.configMaps();
+    assert.deepEqual(more, []);
+    assert.match(patched ?? "", new RegExp(`^-n alasio patch configmap ${STORE_SNAPSHOT_CONFIGMAP} --type merge -p \\{"data":\\{"vacuumPausedAt":"\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ"\\}\\}$`, "u"));
+    at.shellFails(true);
+    const unanswered = at.pause();
+    assert.notEqual(unanswered.code, 0);
+    assert.match(unanswered.said, /the store's shell did not pause its compaction \(volume\.vacuum\.disable\)\nFAILED: the object store's compaction could not be paused: run this again once the store answers\n$/u);
+    assert.deepEqual(at.configMaps(), []);
+  } finally {
+    at.remove();
+  }
+});
+
+test("the snapshot's restore suspends the CronJobs that make the dumps its recovery reads, ending a Job of theirs that runs, before it stops Neon; keeps Neon's counts whole or not at all; and says how to resume the CronJobs", () => {
+  assert.equal(/^DUMP_WRITERS="([^"]*)"$/mu.exec(readFileSync(SCRIPT, "utf8"))?.[1], `${neonName("backup")} ${componentName("juicefs-dump")}`);
+  const at = machine();
+  try {
+    at.store();
+    assert.equal(at.cutOver().code, 0);
+    at.stop(STORE_PARTS);
+    at.stopped();
+    at.changes();
+    // A count of Neon's it cannot read, the second: nothing of the store changed, no count kept, none in part.
+    at.unreadable("alasio-neon-pageserver");
+    const unread = at.restore("--disaster-recovery");
+    assert.notEqual(unread.code, 0);
+    assert.match(unread.said, /FAILED: Neon's alasio-neon-pageserver could not be read: nothing of the store is changed\n$/u);
+    assert.equal(existsSync(join(at.snapshot, "neon-counts")), false);
+    assert.deepEqual(at.stopped(), []);
+    at.changes();
+    at.unreadable();
+    at.active("alasio-neon-backup", ["alasio-neon-backup-29400000"]);
+    const restored = at.restore("--disaster-recovery");
+    assert.equal(restored.code, 0, restored.said);
+    const suspend = (job: string) => `-n alasio patch cronjob ${job} --type merge -p {"spec":{"suspend":true}}`;
+    assert.deepEqual(at.changes(), [
+      suspend("alasio-neon-backup"),
+      "-n alasio delete job alasio-neon-backup-29400000 --cascade=foreground --wait",
+      suspend("alasio-juicefs-dump"),
+      ...NEON_WRITERS.map((part) => `-n alasio scale statefulset ${part} --replicas=0`),
+    ]);
+    assert.equal(readFileSync(join(at.snapshot, "neon-counts"), "utf8"), NEON_WRITERS.map((part) => `${part}\t1\n`).join(""));
+    assert.ok(restored.said.includes(`The CronJobs that make those dumps (alasio-neon-backup alasio-juicefs-dump) are suspended, so none replaces what the recovery reads: once it is through, resume each (kubectl -n alasio patch cronjob <name> --type merge -p '{"spec":{"suspend":false}}')`), restored.said);
+  } finally {
+    at.remove();
   }
 });
 
