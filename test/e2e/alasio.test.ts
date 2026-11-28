@@ -893,7 +893,8 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
-      assert.match(again.stderr, /^[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
+      // The store's compaction paused again, which a master started anew since forgets.
+      assert.match(again.stderr, /^[^\n]* the object store's compaction paused on SeaweedFS 4\.54, until its snapshot is deleted\n[^\n]* upgraded at \S+\n[^\n]* through\n$/u);
       assert.deepEqual(await alasioApplied(), applied);
       upgraded = Date.now();
     });
