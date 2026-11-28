@@ -8087,7 +8087,7 @@ var import_api_logs = __toESM(require_src2(), 1);
 var package_default = {
   name: "@bayma/core",
   private: true,
-  version: "0.15.9",
+  version: "0.15.10",
   type: "module",
   exports: {
     ".": "./src/index.ts",
@@ -8173,7 +8173,7 @@ async function startTelemetry(attributes, bearerTokenFile) {
 `);
   if (config.exports.length === 0)
     return;
-  const { startSdk } = await import("./sdk-m0khrzfn.js");
+  const { startSdk } = await import("./sdk-h9qph8v3.js");
   running = {
     sdk: startSdk(config.exports, attributes, bearerTokenFile),
     parent: import_api.propagation.extract(import_api.ROOT_CONTEXT, {
@@ -29513,6 +29513,43 @@ var MAX_REQUEST_BYTES = 16 + MAX_STOP_REASON_BYTES;
 var REQUEST_TIMEOUT_MS = 5000;
 var SAVE_EXPIRY_MS = 10 * 60000;
 var TELEMETRY_FLUSH_TIMEOUT_MS = 1000;
+var HOOK_SECONDS = [
+  0.005,
+  0.01,
+  0.025,
+  0.05,
+  0.1,
+  0.25,
+  0.5,
+  1,
+  2.5,
+  5,
+  10,
+  30
+];
+var liveSaveDuration = histogram("bayma.sandbox.save.duration", {
+  unit: "s",
+  description: "How long the server took to ready a save that left its sandbox running, by outcome.",
+  advice: { explicitBucketBoundaries: HOOK_SECONDS }
+});
+var resumeDuration = histogram("bayma.sandbox.resume.duration", {
+  unit: "s",
+  description: "How long the server took to run on after a save that left its sandbox running, by outcome.",
+  advice: { explicitBucketBoundaries: HOOK_SECONDS }
+});
+async function timed2(duration, work) {
+  const start = performance.now();
+  let outcome = "failed";
+  try {
+    const done = await work();
+    outcome = "ok";
+    return done;
+  } finally {
+    duration.record((performance.now() - start) / 1000, {
+      "bayma.sandbox.outcome": outcome
+    });
+  }
+}
 async function serveSandboxHook(stateDir, handlers) {
   const path = sandboxHookSocket(stateDir);
   if (Buffer4.byteLength(path) > MAX_SOCKET_PATH_BYTES) {
@@ -29523,6 +29560,7 @@ async function serveSandboxHook(stateDir, handlers) {
   }
   let savedAtMs;
   let saves = 0;
+  let leftRunning = false;
   let outlived = false;
   let stopAsked = false;
   let tail = Promise.resolve();
@@ -29571,10 +29609,7 @@ async function serveSandboxHook(stateDir, handlers) {
         markSandboxSaved();
         let caught;
         try {
-          caught = await inSpan("bayma.sandbox.save", {
-            "bayma.sandbox.save.leaves_running": request.leavesRunning,
-            "bayma.sandbox.save.host_syncs": request.hostSyncs
-          }, async () => {
+          const readying = async () => {
             await filesClosed();
             const saving = await handlers.save({
               hostSyncs: request.hostSyncs
@@ -29582,7 +29617,12 @@ async function serveSandboxHook(stateDir, handlers) {
             if (!request.leavesRunning)
               await collectGarbage();
             return saving;
-          });
+          };
+          leftRunning = request.leavesRunning;
+          caught = request.leavesRunning ? await timed2(liveSaveDuration, readying) : await inSpan("bayma.sandbox.save", {
+            "bayma.sandbox.save.leaves_running": false,
+            "bayma.sandbox.save.host_syncs": request.hostSyncs
+          }, readying);
         } catch (error) {
           runOn();
           throw error;
@@ -29632,7 +29672,10 @@ async function serveSandboxHook(stateDir, handlers) {
         return;
       }
       case "resume":
-        await inSpan("bayma.sandbox.resume", {}, async () => runOn());
+        if (leftRunning)
+          await timed2(resumeDuration, async () => runOn());
+        else
+          await inSpan("bayma.sandbox.resume", {}, async () => runOn());
         return;
       case "stop":
         if (savedAtMs !== undefined)
@@ -30655,7 +30698,13 @@ ${MEMORY_KILLS_APART_MS / 1000} s, which quarantines its session.
 
 OpenTelemetry traces, metrics, and logs of bayma's work are exported over
 OTLP to wherever OTEL_EXPORTER_OTLP_ENDPOINT and OpenTelemetry's other
-standard variables say; with none set, nothing is exported.`);
+standard variables say; with none set, nothing is exported. A save of the
+sandbox that leaves it running, and the resume after it, are timed as the
+histograms bayma.sandbox.save.duration and bayma.sandbox.resume.duration,
+by bayma.sandbox.outcome (ok or failed), exported on the metrics' interval,
+rather than as spans, whose export soon after each save the next save would
+hold: a save that ends the sandbox, the restore from it, and execs are
+spans.`);
 }
 async function startCommandTelemetry(bearerTokenFile) {
   await startTelemetry({
